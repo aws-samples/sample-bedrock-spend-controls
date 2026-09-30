@@ -1,0 +1,5 @@
+boto3==1.43.47
+botocore==1.43.47
+fastapi==0.115.14
+uvicorn==0.34.3
+PyJWT[crypto]==2.15.0

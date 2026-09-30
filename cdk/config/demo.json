@@ -1,0 +1,32 @@
+{
+  "alert_email": "",
+  "admin_ui": true,
+  "admin_jwt_claim": "cognito:groups",
+  "admin_jwt_value": "quota-admins",
+  "auto_provision_users": true,
+  "default_limits": {
+    "daily": {
+      "usd": 1.0,
+      "input_tokens": 1000000,
+      "output_tokens": 200000
+    },
+    "weekly": null,
+    "monthly": null
+  },
+  "warn_threshold": 0.8,
+  "usage_retention_days": 35,
+  "retain_tables_on_delete": false,
+  "vended_ttl_seconds": 3600,
+  "permission_lease_seconds": 60,
+  "refresh_overlap_seconds": 40,
+  "refresh_jitter_seconds": 5,
+  "vend_rate_limit_per_minute": 6,
+  "revocation_policy_shards": 19,
+  "revocation_reconcile_minutes": 5,
+  "manage_invocation_logging": true,
+  "invoker_principal_arns": [],
+  "allowed_model_arns": [
+    "*"
+  ],
+  "model_config": "model-pricing.json"
+}

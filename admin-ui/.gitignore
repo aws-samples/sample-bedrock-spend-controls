@@ -1,0 +1,8 @@
+node_modules/
+# Built SPA bundle is a generated artifact — never committed. Run
+# `npm install && npm run build` before `cdk deploy -c admin_ui=true`.
+dist/
+# TypeScript incremental build cache.
+tsconfig.tsbuildinfo
+# Vite dependency cache
+.vite/

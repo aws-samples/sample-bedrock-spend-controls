@@ -1,0 +1,15 @@
+# Deployment-specific files (real account IDs, role ARNs, alert addresses).
+# Commit the *.example.json / production.json templates instead.
+cdk/config/workloads.json
+cdk/config/*.local.json
+
+# Build and tool output
+cdk/cdk.out/
+admin-ui/dist/
+admin-ui/tsconfig.tsbuildinfo
+node_modules/
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+.DS_Store
