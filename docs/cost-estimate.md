@@ -16,6 +16,7 @@ allowance beyond the always-free items noted per line.
 | Active quota subjects (users) | 100 | 1 000 |
 | Metered Bedrock invocations / month | 10 000 | 1 000 000 |
 | Hours per day a user is actively calling Bedrock | 1 | 4 |
+| Clock hours per day in which a user's metrics receive data | 2 | 5 |
 | Permission lease (runtime dial) | 60 s (demo.json default) → one broker vend per active user every minute | 300 s → one broker vend per active user every ~5 min |
 | Admin API calls / month (UI + CLI) | 2 000 | 20 000 |
 | Invocation-log records per subscription batch | 1 | 3 |
@@ -44,6 +45,15 @@ Query (≤ 37 rows) and 1 RRU per GetItem; each vend performs three
 strongly consistent users-row reads, a ledger Query, and four small writes
 (vend-rate counter, lease, `SESSION#` map, `source_identity`).
 
+CloudWatch custom metrics are prorated by the hour: each (metric,
+dimension-set) stream is billed only for the hours in which it receives at
+least one data point, and a stream with data in every hour of the month is
+one full metric-month. A user's per-user streams receive data only in the
+clock hours in which that user calls Bedrock, counted here as one more than
+the active hours because a session rarely starts on the hour. Shared streams
+(per model, service-wide, and the scheduled operational metrics) are counted
+as a full month, which is an upper bound.
+
 
 ### Demo: 100 users, 10 000 invocations / month
 
@@ -66,7 +76,7 @@ strongly consistent users-row reads, a ledger Query, and four small writes
 | CloudWatch Logs ingest: Bedrock invocation logs — 0.01 GB | 0.00 | 700 B/record (vended log) |
 | CloudWatch Logs storage: invocation logs — 0.00 GB-mo | 0.00 | 14-day retention (stack default) |
 | CloudWatch Logs ingest: Lambda/EMF logs — 0.08 GB | 0.04 | 900 B per EMF record |
-| CloudWatch custom metrics — 1,205 metric-months | 361.50 | EMF; per-UserId dimensions dominate |
+| CloudWatch custom metrics — 197 metric-months | 59.00 | EMF, prorated hourly: 11 per-user streams × 100 users × 2/24 h, plus 105 shared streams |
 | CloudWatch alarms — 8 | 0.80 | standard resolution |
 | CloudWatch dashboard — 1 | 0.00 | first 3 dashboards free |
 | CloudWatch GetMetricData — 18,000 metrics | 0.18 | Operations/Overview tabs |
@@ -79,10 +89,10 @@ strongly consistent users-row reads, a ledger Query, and four small writes
 | CloudFront — 4,500 HTTPS requests | 0.00 | admin UI static assets; data transfer negligible |
 | S3 — admin UI bucket | 0.01 | <1 GB |
 | Cognito user pool — demo IdP | 0.00 | <10 k MAU free |
-| **Total** | **365.25** | |
-
+| **Total** | **62.75** | |
 
 ### Production: 1 000 users, 1 000 000 invocations / month, 300 s lease
+
 | Line item | USD / month | Basis |
 |---|---:|---|
 | Lambda: Broker vends (BrokerApiFn) — 1,440,000 inv | 7.49 | 1,440,000 × (1024 MB, 300 ms) |
@@ -102,7 +112,7 @@ strongly consistent users-row reads, a ledger Query, and four small writes
 | CloudWatch Logs ingest: Bedrock invocation logs — 0.70 GB | 0.35 | 700 B/record (vended log) |
 | CloudWatch Logs storage: invocation logs — 0.33 GB-mo | 0.01 | 14-day retention (stack default) |
 | CloudWatch Logs ingest: Lambda/EMF logs — 1.48 GB | 0.74 | 900 B per EMF record |
-| CloudWatch custom metrics — 11,175 metric-months | 3,117.50 | EMF; per-UserId dimensions dominate |
+| CloudWatch custom metrics — 2,467 metric-months | 740.00 | EMF, prorated hourly: 11 per-user streams × 1,000 users × 5/24 h, plus 175 shared streams |
 | CloudWatch alarms — 10 | 1.00 | standard resolution |
 | CloudWatch dashboard — 1 | 0.00 | first 3 dashboards free |
 | CloudWatch GetMetricData — 180,000 metrics | 1.80 | Operations/Overview tabs |
@@ -115,18 +125,23 @@ strongly consistent users-row reads, a ledger Query, and four small writes
 | CloudFront — 45,000 HTTPS requests | 0.04 | admin UI static assets; data transfer negligible |
 | S3 — admin UI bucket | 0.01 | <1 GB |
 | Cognito user pool — demo IdP | 0.00 | <10 k MAU free |
-| **Total** | **3,142.07** | |
+| **Total** | **764.57** | |
 
 ## What dominates and how to reduce it
 
-**CloudWatch custom metrics are the cost of this design — roughly 90 % of
-the total in both scenarios.** Every EMF metric is billed per distinct
-*(metric, dimension-set)* stream that receives data in a month. The usage
-processor publishes six quota metrics on three dimension sets
-(`[UserId]`, `[Model]`, `[]`) and the broker publishes five lease metrics
-on `[UserId]` and `[]`, so **each active user adds ~11 metric-streams per
-month** (about $3.30 at the first-10 000 tier, $1.10 beyond it). The
-per-`Model` and service-wide streams are a fixed few dozen. Everything else
+**CloudWatch custom metrics are the cost of this design — over 90 % of the
+total in both scenarios.** Every EMF metric is billed per distinct
+*(metric, dimension-set)* stream, prorated by the hours in which the stream
+receives data. The usage processor publishes six quota metrics on three
+dimension sets (`[UserId]`, `[Model]`, `[]`) and the broker publishes five
+lease metrics on `[UserId]` and `[]`, so **each active user adds ~11
+metric-streams**, billed for the hours in which that user calls Bedrock:
+about $0.69 per user per month at the production assumption of 5 clock hours
+a day, and $0.28 at the demo's 2. A subject whose metrics receive data in
+every hour of the month, such as a tenant backend calling around the clock,
+is billed the full 11 metric-months: $3.30 at the first-10 000 tier, $1.10
+beyond it. The per-`Model`, service-wide, and operational streams are a
+fixed 105 to 175 in these scenarios ($32 to $53/month). Everything else
 combined — Lambda, DynamoDB, logs, alarms, secrets — is under $25/month for
 1 000 users and 1 M invocations.
 
@@ -134,14 +149,14 @@ Options, in order of impact:
 
 1. **Drop the `UserId` dimension from the metering metrics.** The DynamoDB
    ledger, not CloudWatch, is the canonical per-user quota source; the
-   Overview tab's *top users by spend* is the only consumer of per-user
-   EMF, and `GET /admin/users?include_usage=true` can serve it from DynamoDB
-   instead. Removing `["UserId"]` from `_emit_emf` in
-   `usage_processor/handler.py` and from `gateway/app/emf.py` cuts the
-   production estimate from ~$3 100 to ~$50/month. The dashboard's
+   Overview tab's *top users by spend* and three dashboard widgets are the
+   only consumers of per-user EMF, and `GET /admin/users?include_usage=true`
+   can serve the top users from DynamoDB instead. Removing `["UserId"]` from
+   `_emit_emf` in `usage_processor/handler.py` and from `gateway/app/emf.py`
+   cuts the production estimate from ~$765 to ~$77/month. The dashboard's
    `SEARCH('{BedrockSpendControls,UserId} ...')` widgets would need to
-   switch to the `Model` dimension. This is the single change worth making
-   before running at hundreds of users.
+   switch to the `Model` dimension. This is the largest single reduction,
+   and it matters most when subjects call Bedrock many hours a day.
 2. **Emit per-user metrics only for the top N spenders or on state change**
    (warn/block events), keeping per-user *event* visibility without a
    continuous stream per user.

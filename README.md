@@ -248,11 +248,15 @@ Route-by-route reference: [docs/admin-api.md](docs/admin-api.md).
 ## Cost
 
 Per-user CloudWatch metrics dominate the solution's own running cost: every
-active user adds about eleven metric streams per month. The estimate is about
-$365/month for the demo scenario (100 users) and about $3,100/month at 1,000
-users, of which everything other than custom metrics is under $25. Dropping
-the `UserId` dimension from the EMF metrics is the single change that
-matters before running at hundreds of users. Assumptions, line items, and
+active user adds about eleven metric streams, and CloudWatch bills each
+stream only for the hours in which it receives data. The estimate is about
+$63/month for the demo scenario (100 users, active about an hour a day) and
+about $765/month at 1,000 users active about four hours a day, of which
+everything other than custom metrics is under $25. The per-user metrics of a
+subject that calls Bedrock around the clock are billed for the full month,
+about $3.30. Dropping
+the `UserId` dimension from the EMF metrics is the largest single reduction
+(about $77/month at 1,000 users). Assumptions, line items, and
 reduction options: [docs/cost-estimate.md](docs/cost-estimate.md). Bedrock
 inference spend itself is what the solution meters and is not included.
 

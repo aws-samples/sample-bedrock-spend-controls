@@ -89,19 +89,32 @@ def scenario(name: str, a: dict, p: dict) -> list[tuple[str, float, str]]:
     rows.append((f"CloudWatch Logs storage: invocation logs — {log_gb * 14/30:,.2f} GB-mo", log_gb * 14 / 30 * p["cw_logs_storage_gb"], "14-day retention (stack default)"))
     emf_gb = inv * a["emf_bytes"] / 1e9 + vends * 400 / 1e9
     rows.append((f"CloudWatch Logs ingest: Lambda/EMF logs — {emf_gb:,.2f} GB", emf_gb * p["cw_logs_ingest_gb"], f"{a['emf_bytes']} B per EMF record"))
-    # Custom metrics = distinct (metric, dimension-set) streams that received
-    # data in the month. Usage processor: 6 metrics on [UserId], [Model], []
-    # plus 4 pricing-observability metrics on [Model], [] only. Broker:
-    # CredentialsVended, Throttles, LeaseStarted/Refreshed/Retried on
-    # [UserId], []. Per-UserId streams scale with active users and dominate.
-    metrics = (
-        6 * (users + a["distinct_models"] + 1)
+    # Custom metrics are billed per distinct (metric, dimension-set) stream
+    # and prorated by the hour: a stream is charged only for the hours in
+    # which it receives at least one data point, so a full metric-month is a
+    # stream with data in every hour of the month. Usage processor: 6 metrics
+    # on [UserId], [Model], [] plus 4 pricing-observability metrics on
+    # [Model], [] only. Broker: CredentialsVended, Throttles,
+    # LeaseStarted/Refreshed/Retried on [UserId], []. Per-UserId streams
+    # scale with active users and dominate; each is billed for the clock
+    # hours in which that user calls Bedrock. Shared streams (per model,
+    # service-wide, scheduled operational metrics) are counted as a full
+    # month, which is an upper bound.
+    per_user_streams = 6 + 5
+    user_hours = a["user_metric_hours_per_day"]
+    shared_streams = (
+        6 * (a["distinct_models"] + 1)
         + 4 * (a["distinct_models"] + 1)
-        + 5 * (users + 1)
+        + 5
         + a["operational_metrics"]
     )
+    metrics = per_user_streams * users * user_hours / 24 + shared_streams
     tiered = min(metrics, 10_000) * p["cw_metric_first_10k"] + max(0, metrics - 10_000) * p["cw_metric_next_240k"]
-    rows.append((f"CloudWatch custom metrics — {metrics:,.0f} metric-months", tiered, "EMF; per-UserId dimensions dominate"))
+    rows.append((
+        f"CloudWatch custom metrics — {metrics:,.0f} metric-months",
+        tiered,
+        f"EMF, prorated hourly: {per_user_streams} per-user streams × {users:,} users × {user_hours}/24 h, plus {shared_streams} shared streams",
+    ))
     rows.append((f"CloudWatch alarms — {a['alarms']}", a["alarms"] * p["cw_alarm"], "standard resolution"))
     rows.append(("CloudWatch dashboard — 1", 0.0 if a["dashboards_free_tier"] else 3.0, "first 3 dashboards free"))
     gmd = a["admin_ui_page_loads_per_month"] * a["gmd_metrics_per_page_load"]
