@@ -1,0 +1,7 @@
+{
+  "name": "bedrock-spend-controls-cdk",
+  "private": true,
+  "devDependencies": {
+    "aws-cdk": "2.1137.0"
+  }
+}

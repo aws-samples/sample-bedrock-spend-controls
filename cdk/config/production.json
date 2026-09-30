@@ -1,0 +1,39 @@
+{
+  "alert_email": "platform-alerts@example.com",
+  "jwt_issuer": "https://idp.example.com",
+  "jwt_audience": "bedrock-spend-controls",
+  "jwt_user_claim": "custom:tenant_id",
+  "admin_ui": false,
+  "admin_jwt_claim": "",
+  "admin_jwt_value": "",
+  "auto_provision_users": false,
+  "default_limits": {
+    "daily": {
+      "usd": 25.0,
+      "input_tokens": 10000000,
+      "output_tokens": 2000000
+    },
+    "weekly": null,
+    "monthly": null
+  },
+  "warn_threshold": 0.75,
+  "usage_retention_days": 90,
+  "retain_tables_on_delete": true,
+  "vended_ttl_seconds": 900,
+  "permission_lease_seconds": 300,
+  "refresh_overlap_seconds": 10,
+  "refresh_jitter_seconds": 5,
+  "vend_rate_limit_per_minute": 6,
+  "revocation_policy_shards": 19,
+  "revocation_reconcile_minutes": 5,
+  "manage_invocation_logging": false,
+  "invocation_log_group_name": "/aws/bedrock/modelinvocations",
+  "invoker_principal_arns": [
+    "arn:aws:iam::111122223333:role/BedrockSpendControlsInvoker"
+  ],
+  "allowed_model_arns": [
+    "arn:aws:bedrock:us-east-1::foundation-model/openai.gpt-oss-120b-1:0",
+    "arn:aws:bedrock:us-east-1::foundation-model/anthropic.claude-opus-4-7"
+  ],
+  "model_config": "model-pricing.json"
+}

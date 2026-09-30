@@ -1,0 +1,164 @@
+{
+  "catalog_models": {
+    "gpt-oss-20b": [
+      "openai.gpt-oss-20b",
+      "openai.gpt-oss-20b-1:0"
+    ],
+    "gpt-oss-120b": [
+      "openai.gpt-oss-120b",
+      "openai.gpt-oss-120b-1:0"
+    ],
+    "Nova Micro": [
+      "amazon.nova-micro-v1:0"
+    ],
+    "Nova Lite": [
+      "amazon.nova-lite-v1:0"
+    ],
+    "Nova Pro": [
+      "amazon.nova-pro-v1:0"
+    ],
+    "Nova Premier": [
+      "us.amazon.nova-premier-v1:0"
+    ],
+    "Llama 3.3 70B": [
+      "meta.llama3-3-70b-instruct-v1:0"
+    ],
+    "Llama 4 Maverick 17B": [
+      "meta.llama4-maverick-17b-instruct-v1:0"
+    ],
+    "Llama 4 Scout 17B": [
+      "meta.llama4-scout-17b-instruct-v1:0"
+    ],
+    "Mistral Large 3": [
+      "mistral.mistral-large-3-675b-instruct"
+    ],
+    "DeepSeek v3.2": [
+      "deepseek.v3.2"
+    ],
+    "Nova Canvas": [
+      "amazon.nova-canvas-v1:0"
+    ]
+  },
+  "price_overrides": {
+    "anthropic.claude-opus-4-7": {
+      "input_per_mtok": 5.0,
+      "output_per_mtok": 25.0,
+      "cache_read_per_mtok": 0.5,
+      "cache_write_per_mtok": 6.25,
+      "reason": "Not in the AWS Price List API as of 2026-09-01; taken from the Amazon Bedrock pricing page. Cache read is 10 % and cache write 125 % of the input rate."
+    },
+    "global.anthropic.claude-opus-4-7": {
+      "input_per_mtok": 5.0,
+      "output_per_mtok": 25.0,
+      "cache_read_per_mtok": 0.5,
+      "cache_write_per_mtok": 6.25,
+      "reason": "Not in the AWS Price List API as of 2026-09-01; taken from the Amazon Bedrock pricing page. Cache read is 10 % and cache write 125 % of the input rate."
+    },
+    "us.anthropic.claude-opus-4-7": {
+      "input_per_mtok": 5.5,
+      "output_per_mtok": 27.5,
+      "cache_read_per_mtok": 0.55,
+      "cache_write_per_mtok": 6.875,
+      "reason": "Not in the AWS Price List API as of 2026-09-01; taken from the Amazon Bedrock pricing page. Cache read is 10 % and cache write 125 % of the input rate."
+    },
+    "anthropic.claude-fable-5": {
+      "input_per_mtok": 10.0,
+      "output_per_mtok": 50.0,
+      "reason": "Not in the AWS Price List API as of 2026-09-01; taken from the Amazon Bedrock pricing page."
+    },
+    "us.anthropic.claude-fable-5": {
+      "input_per_mtok": 11.0,
+      "output_per_mtok": 55.0,
+      "reason": "Not in the AWS Price List API as of 2026-09-01; taken from the Amazon Bedrock pricing page."
+    },
+    "anthropic.claude-fable-5-1": {
+      "input_per_mtok": 10.0,
+      "output_per_mtok": 50.0,
+      "reason": "Not in the AWS Price List API as of 2026-09-01; taken from the Amazon Bedrock pricing page."
+    },
+    "us.anthropic.claude-fable-5-1": {
+      "input_per_mtok": 11.0,
+      "output_per_mtok": 55.0,
+      "reason": "Not in the AWS Price List API as of 2026-09-01; taken from the Amazon Bedrock pricing page."
+    },
+    "anthropic.claude-sonnet-4-6": {
+      "input_per_mtok": 3.0,
+      "output_per_mtok": 15.0,
+      "reason": "Not in the AWS Price List API as of 2026-09-01; taken from the Amazon Bedrock pricing page."
+    },
+    "us.anthropic.claude-sonnet-4-6": {
+      "input_per_mtok": 3.3,
+      "output_per_mtok": 16.5,
+      "reason": "Not in the AWS Price List API as of 2026-09-01; taken from the Amazon Bedrock pricing page."
+    },
+    "anthropic.claude-sonnet-5": {
+      "input_per_mtok": 2.0,
+      "output_per_mtok": 10.0,
+      "reason": "Not in the AWS Price List API as of 2026-09-01; taken from the Amazon Bedrock pricing page."
+    },
+    "us.anthropic.claude-sonnet-5": {
+      "input_per_mtok": 2.2,
+      "output_per_mtok": 11.0,
+      "reason": "Not in the AWS Price List API as of 2026-09-01; taken from the Amazon Bedrock pricing page."
+    },
+    "anthropic.claude-haiku-4-5-20251001-v1:0": {
+      "input_per_mtok": 1.0,
+      "output_per_mtok": 5.0,
+      "reason": "Not in the AWS Price List API as of 2026-09-01; taken from the Amazon Bedrock pricing page."
+    },
+    "us.anthropic.claude-haiku-4-5-20251001-v1:0": {
+      "input_per_mtok": 1.1,
+      "output_per_mtok": 5.5,
+      "reason": "Not in the AWS Price List API as of 2026-09-01; taken from the Amazon Bedrock pricing page."
+    },
+    "anthropic.claude-opus-4-8": {
+      "input_per_mtok": 5.0,
+      "output_per_mtok": 25.0,
+      "reason": "Not in the AWS Price List API as of 2026-09-01; taken from the Amazon Bedrock pricing page."
+    },
+    "us.anthropic.claude-opus-4-8": {
+      "input_per_mtok": 5.5,
+      "output_per_mtok": 27.5,
+      "reason": "Not in the AWS Price List API as of 2026-09-01; taken from the Amazon Bedrock pricing page."
+    },
+    "anthropic.claude-opus-5": {
+      "input_per_mtok": 5.0,
+      "output_per_mtok": 25.0,
+      "reason": "Not in the AWS Price List API as of 2026-09-01; taken from the Amazon Bedrock pricing page."
+    },
+    "us.anthropic.claude-opus-5": {
+      "input_per_mtok": 5.5,
+      "output_per_mtok": 27.5,
+      "reason": "Not in the AWS Price List API as of 2026-09-01; taken from the Amazon Bedrock pricing page."
+    },
+    "openai.gpt-5.6-sol": {
+      "input_per_mtok": 4.4,
+      "output_per_mtok": 22.0,
+      "reason": "Not in the AWS Price List API; taken from the Amazon Bedrock model card (docs.aws.amazon.com), 2026-09-04."
+    },
+    "openai.gpt-5.6-terra": {
+      "input_per_mtok": 2.2,
+      "output_per_mtok": 13.2,
+      "reason": "Not in the AWS Price List API; taken from the Amazon Bedrock model card (docs.aws.amazon.com), 2026-09-04."
+    },
+    "openai.gpt-5.6-luna": {
+      "input_per_mtok": 0.22,
+      "output_per_mtok": 1.32,
+      "reason": "Not in the AWS Price List API; taken from the Amazon Bedrock model card (docs.aws.amazon.com), 2026-09-04."
+    },
+    "xai.grok-4.6": {
+      "input_per_mtok": 2.2,
+      "output_per_mtok": 6.6,
+      "reason": "Not in the AWS Price List API; taken from the Amazon Bedrock model card (docs.aws.amazon.com), 2026-09-04."
+    },
+    "amazon.nova-2-lite-v1:0": {
+      "input_per_mtok": 0.33,
+      "output_per_mtok": 2.75,
+      "reason": "Price List publishes several rates for this model; the in-Region rate is pinned (2026-09-01)."
+    }
+  },
+  "fallback_price": {
+    "input_per_mtok": 15.0,
+    "output_per_mtok": 75.0
+  }
+}

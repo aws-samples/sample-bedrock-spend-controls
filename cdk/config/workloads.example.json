@@ -1,0 +1,13 @@
+{
+  "workloads": [
+    {
+      "name": "payments-batch",
+      "model": "us.anthropic.claude-opus-4-7",
+      "role_arn": "arn:aws:iam::111122223333:role/payments-batch-app"
+    },
+    {
+      "name": "reports-generator",
+      "model": "anthropic.claude-haiku-4-5-20251001-v1:0"
+    }
+  ]
+}
