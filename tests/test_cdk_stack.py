@@ -91,7 +91,9 @@ def test_stack_is_event_driven_with_iam_authenticated_function_url():
     # Exactly two users-table stream consumers: the emergency processor and
     # the enforcement dispatcher (DynamoDB Streams supports at most two).
     template.resource_count_is("AWS::Lambda::EventSourceMapping", 2)
-    template.resource_count_is("AWS::SQS::Queue", 2)
+    # Dead-letter queues: emergency processor, enforcement dispatcher, and
+    # the usage processor's async on-failure destination.
+    template.resource_count_is("AWS::SQS::Queue", 3)
     template.has_resource_properties(
         "AWS::Lambda::Url",
         {"AuthType": "AWS_IAM", "InvokeMode": "BUFFERED"},
@@ -204,6 +206,11 @@ def test_defaults_are_injected_and_tables_are_destroyable_for_demo():
     )
     for table in template.find_resources("AWS::DynamoDB::Table").values():
         assert table["DeletionPolicy"] == "Delete"
+        # PITR always; deletion protection follows retain_tables_on_delete.
+        assert table["Properties"]["PointInTimeRecoverySpecification"] == {
+            "PointInTimeRecoveryEnabled": True
+        }
+        assert table["Properties"]["DeletionProtectionEnabled"] is False
 
 
 def test_production_values_and_table_retention():
@@ -245,6 +252,10 @@ def test_production_values_and_table_retention():
     for table in template.find_resources("AWS::DynamoDB::Table").values():
         assert table["DeletionPolicy"] == "Retain"
         assert table["UpdateReplacePolicy"] == "Retain"
+        assert table["Properties"]["DeletionProtectionEnabled"] is True
+        assert table["Properties"]["PointInTimeRecoverySpecification"] == {
+            "PointInTimeRecoveryEnabled": True
+        }
 
 
 @pytest.mark.parametrize("lease_seconds", [60, 300, 900])
@@ -281,7 +292,7 @@ def test_revocation_layer_is_always_deployed():
     # Emergency reconcile, revocation reconcile, daily price refresh, and
     # the nightly auto-block sweep.
     template.resource_count_is("AWS::Events::Rule", 4)
-    template.resource_count_is("AWS::SQS::Queue", 2)
+    template.resource_count_is("AWS::SQS::Queue", 3)
 
     template.has_resource_properties(
         "AWS::Lambda::Function",
@@ -492,7 +503,11 @@ def test_invoker_principals_and_deny_policy_are_preserved():
         },
     )
     rendered = json.dumps(template.to_json())
-    assert "deny-direct-bedrock-invocation" in rendered
+    # Region-suffixed: managed policy names are account-global.
+    template.has_resource_properties(
+        "AWS::IAM::ManagedPolicy",
+        {"ManagedPolicyName": "deny-direct-bedrock-invocation-us-east-1"},
+    )
     assert "bedrock:CallWithBearerToken" in rendered
     assert "__emergency_stop_inactive__" in rendered
     assert "EmergencyStopFailure" in rendered
@@ -616,16 +631,89 @@ def test_admin_ui_rejects_unsupported_or_unauthorized_identity_setup():
         ("allowed_model_arns", [], "must not be empty"),
         ("allowed_model_arns", ["openai.model"], "resource ARN"),
         ("invoker_principal_arns", ["not-an-arn"], "principal ARNs"),
+        # Wildcards would open the Function URL to every AWS account.
+        ("invoker_principal_arns", ["arn:aws:iam::111122223333:role/*"], "without wildcards"),
+        ("invoker_principal_arns", ["arn:aws:iam::*:root"], "without wildcards"),
+        ("invoker_principal_arns", ["*"], "without wildcards"),
+        ("invoker_principal_arns", ["arn:aws:iam::111122223333:policy/x"], "without wildcards"),
         ("reconciliation_enabled", "yes", "must be true or false"),
         ("reconcile_lag_days", 0, "positive integer"),
         ("reconcile_lag_days", 15, "at most 14"),
         ("reconciliation_alarm_percent", 0, "positive number"),
         ("reconciliation_alarm_percent", 101, "at most 100"),
+        ("reconciliation_service_names", [], "at least one Cost Explorer"),
+        ("reserve_enforcement_concurrency", "maybe", "must be true or false"),
+        ("log_retention_days", 0, "positive integer"),
+        ("log_retention_days", 45, "one of the CloudWatch Logs retention"),
+        ("jwt_jwks_url", "https://idp.example.com/jwks", "requires jwt_issuer"),
     ],
 )
 def test_invalid_deployment_values_fail_synth(key, value, message):
     with pytest.raises(ValueError, match=message):
         _template({"manage_invocation_logging": True, key: value})
+
+
+@pytest.mark.parametrize(
+    "principal",
+    [
+        "arn:aws:iam::111122223333:root",
+        "arn:aws:iam::111122223333:role/path/to/BrokerInvoker",
+        "arn:aws:iam::111122223333:user/alice",
+        "arn:aws:sts::111122223333:assumed-role/AppRole/session",
+        "arn:aws-cn:iam::111122223333:role/BrokerInvoker",
+    ],
+)
+def test_valid_invoker_principals_are_granted(principal):
+    template = _template(
+        {
+            "manage_invocation_logging": True,
+            "invoker_principal_arns": [principal],
+        }
+    )
+    template.has_resource_properties(
+        "AWS::Lambda::Permission",
+        {"Action": "lambda:InvokeFunctionUrl", "Principal": principal},
+    )
+
+
+def test_byo_issuer_requires_https_and_an_audience():
+    """M-6: an issuer without an audience disables 'aud' verification and a
+    plain-http issuer would fetch JWKS over the wire unauthenticated."""
+    with pytest.raises(ValueError, match="jwt_audience is required"):
+        _template(
+            {
+                "manage_invocation_logging": True,
+                "jwt_issuer": "https://idp.example.com",
+            }
+        )
+    with pytest.raises(ValueError, match="jwt_issuer must be an https"):
+        _template(
+            {
+                "manage_invocation_logging": True,
+                "jwt_issuer": "http://idp.example.com",
+                "jwt_audience": "client",
+            }
+        )
+    with pytest.raises(ValueError, match="jwt_jwks_url must be an https"):
+        _template(
+            {
+                "manage_invocation_logging": True,
+                "jwt_issuer": "https://idp.example.com",
+                "jwt_audience": "client",
+                "jwt_jwks_url": "http://idp.example.com/jwks",
+            }
+        )
+    template = _template(
+        {
+            "manage_invocation_logging": True,
+            "jwt_issuer": "https://idp.example.com",
+            "jwt_audience": "client",
+            "jwt_jwks_url": "https://keys.example.com/jwks.json",
+        }
+    )
+    broker_env = _environment_with(template, "JWT_AUDIENCE")
+    assert broker_env["JWT_AUDIENCE"] == "client"
+    assert broker_env["JWT_JWKS_URL"] == "https://keys.example.com/jwks.json"
 
 @pytest.mark.parametrize(
     ("limits", "message"),
@@ -1205,6 +1293,104 @@ def test_admin_managed_login_reuses_demo_client_with_oauth():
     assert "DemoUserPool1AB98549" in json.dumps(providers[0]["ProviderName"])
 
 
+def _role_attachment(template: Template) -> dict:
+    return next(
+        iter(
+            template.find_resources(
+                "AWS::Cognito::IdentityPoolRoleAttachment"
+            ).values()
+        )
+    )["Properties"]
+
+
+def test_identity_pool_grants_credentials_only_to_the_admin_group():
+    """H-6: the authenticated role carries lambda:InvokeFunctionUrl, so
+    every console user who received it could vend raw Bedrock credentials.
+    A rules mapping on the admin claim with Deny resolution hands the role
+    to group members only."""
+    template = _template(
+        {
+            "manage_invocation_logging": True,
+            "admin_ui": True,
+            "admin_jwt_claim": "cognito:groups",
+            "admin_jwt_value": "quota-admins",
+        }
+    )
+    attachment = _role_attachment(template)
+    mappings = attachment["RoleMappings"]
+    assert list(mappings) == ["cognito-user-pool"]
+    mapping = mappings["cognito-user-pool"]
+    assert mapping["Type"] == "Rules"
+    assert mapping["AmbiguousRoleResolution"] == "Deny"
+    # Keyed by the user pool provider name and the console client id.
+    provider = json.dumps(mapping["IdentityProvider"])
+    assert "DemoUserPool1AB98549" in provider
+    assert "DemoUserPoolDemoAppClientB5870BCA" in provider
+    rules = mapping["RulesConfiguration"]["Rules"]
+    assert len(rules) == 1
+    (rule,) = rules
+    assert rule["Claim"] == "cognito:groups"
+    assert rule["MatchType"] == "Contains"
+    assert rule["Value"] == "quota-admins"
+    admin_role_id = rule["RoleARN"]["Fn::GetAtt"][0]
+    assert admin_role_id.startswith("AdminConsoleRole")
+    # The same role is the pool's authenticated role and the only IAM role
+    # granted InvokeFunctionUrl (identity policy); the Function URL's
+    # resource policy itself only names the account root.
+    assert attachment["Roles"]["authenticated"]["Fn::GetAtt"][0] == admin_role_id
+    invoke_policies = [
+        policy["Properties"]["Roles"]
+        for policy in template.find_resources("AWS::IAM::Policy").values()
+        if "lambda:InvokeFunctionUrl" in json.dumps(policy)
+    ]
+    assert invoke_policies == [[{"Ref": admin_role_id}]]
+    for permission in template.find_resources("AWS::Lambda::Permission").values():
+        if permission["Properties"]["Action"] == "lambda:InvokeFunctionUrl":
+            # AccountRootPrincipal renders as the bare account ID.
+            assert permission["Properties"]["Principal"] == "111122223333"
+    # Trust: only this Identity Pool's authenticated identities.
+    role = template.to_json()["Resources"][admin_role_id]["Properties"]
+    (statement,) = role["AssumeRolePolicyDocument"]["Statement"]
+    assert statement["Principal"] == {"Federated": "cognito-identity.amazonaws.com"}
+    assert statement["Action"] == "sts:AssumeRoleWithWebIdentity"
+    identity_pool_id = next(iter(template.find_resources("AWS::Cognito::IdentityPool")))
+    assert statement["Condition"]["StringEquals"] == {
+        "cognito-identity.amazonaws.com:aud": {"Ref": identity_pool_id}
+    }
+    assert statement["Condition"]["ForAnyValue:StringLike"] == {
+        "cognito-identity.amazonaws.com:amr": "authenticated"
+    }
+
+
+def test_byo_issuer_identity_pool_maps_roles_by_oidc_provider_arn():
+    template = _template(
+        {
+            "manage_invocation_logging": True,
+            "admin_ui": True,
+            "jwt_issuer": "https://idp.example.com",
+            "jwt_audience": "data-plane-client",
+            "admin_ui_client_id": "spa-client",
+            "admin_jwt_claim": "groups",
+            "admin_jwt_value": "quota-admins",
+            "auto_provision_users": False,
+        }
+    )
+    mapping = _role_attachment(template)["RoleMappings"]["oidc-provider"]
+    assert mapping["Type"] == "Rules"
+    assert mapping["AmbiguousRoleResolution"] == "Deny"
+    oidc_provider_id = next(
+        iter(template.find_resources("Custom::AWSCDKOpenIdConnectProvider"))
+    )
+    assert mapping["IdentityProvider"] == {"Ref": oidc_provider_id}
+    (rule,) = mapping["RulesConfiguration"]["Rules"]
+    assert rule == {
+        "Claim": "groups",
+        "MatchType": "Contains",
+        "Value": "quota-admins",
+        "RoleARN": rule["RoleARN"],
+    }
+
+
 def test_admin_runtime_config_security_headers_and_cors_have_no_secrets_or_cycle():
     template = _template(
         {
@@ -1313,19 +1499,30 @@ def test_demo_client_without_admin_ui_keeps_explicit_auth_and_disables_oauth():
 def test_price_refresh_schedule_parameter_and_fallback_alarm():
     template = _template({"manage_invocation_logging": True})
 
-    # The deployment snapshot seeds a runtime SSM parameter combining the
-    # resolved model prices and the conservative fallback (the other
-    # parameter is the workload roster the admin API reads).
+    # The price table is NOT a CloudFormation-managed parameter: the
+    # resolver Lambda writes it to a deterministic name (so the response to
+    # CloudFormation stays far under the 4,096-byte cap) and the daily
+    # refresh overwrites the same name. The only template-managed parameter
+    # is the workload roster the admin API reads.
     parameters = template.find_resources("AWS::SSM::Parameter")
-    assert len(parameters) == 2
-    parameter = next(
-        resource["Properties"]
-        for logical_id, resource in parameters.items()
-        if logical_id.startswith("ModelPricesParameter")
+    assert len(parameters) == 1
+    assert next(iter(parameters)).startswith("WorkloadRosterParameter")
+    parameter_name = "/bedrock-spend-controls/TestStack/model-prices"
+    template.has_resource_properties(
+        "Custom::BedrockModelPriceSnapshot",
+        Match.object_like({"ParameterName": parameter_name}),
     )
-    joined = parameter["Value"]["Fn::Join"][1]
-    assert joined[0] == '{"models":'
-    assert joined[2] == ',"fallback":'
+    policies = json.dumps(template.find_resources("AWS::IAM::Policy"))
+    assert "ssm:PutParameter" in policies
+    assert "ssm:DeleteParameter" in policies
+    assert "ssm:GetParameter" in policies
+    assert f":parameter{parameter_name}" in policies
+    outputs = template.to_json()["Outputs"]
+    assert outputs["ModelPricesParameterName"]["Value"] == parameter_name
+    snapshot_output = json.dumps(outputs["ModelPriceSnapshot"]["Value"])
+    assert "SnapshotDigest" in snapshot_output
+    assert "ModelCount" in snapshot_output
+    assert "ModelPricesJson" not in json.dumps(template.to_json())
 
     # A daily EventBridge rule targets the scheduled resolver entrypoint and
     # carries the pricing config in the event, mirroring the custom
@@ -1348,14 +1545,14 @@ def test_price_refresh_schedule_parameter_and_fallback_alarm():
         if name.startswith("PriceRefreshFn")
     )
     assert refresher["Handler"] == "handler.scheduled_handler"
-    assert list(refresher["Environment"]["Variables"]) == [
-        "PRICES_PARAMETER_NAME"
-    ]
+    assert refresher["Environment"]["Variables"] == {
+        "PRICES_PARAMETER_NAME": parameter_name
+    }
 
-    # Metering reads the parameter; the snapshot is not duplicated into the
-    # (4 KB-capped) environment.
+    # Metering reads the parameter by the same name; the snapshot is not
+    # duplicated into the (4 KB-capped) environment.
     processor_env = _environment_with(template, "BEDROCK_USER_ROLE_NAME")
-    assert "PRICES_PARAMETER_NAME" in processor_env
+    assert processor_env["PRICES_PARAMETER_NAME"] == parameter_name
     assert "MODEL_PRICES_JSON" not in processor_env
 
     # Fallback-priced requests are an alarmed operational event.
@@ -1592,7 +1789,10 @@ def test_enforcer_wiring_least_privilege_and_schedules():
     # enforcement dispatcher, never a third event source mapping.
     template.resource_count_is("AWS::Lambda::EventSourceMapping", 2)
     env = _environment_with(template, "WORKLOADS_JSON")
-    assert env["DENY_POLICY_NAME"] == "bedrock-spend-controls-workload-deny"
+    # The handler derives a Region- and stack-scoped inline policy name from
+    # STACK_NAME; the legacy fixed DENY_POLICY_NAME is no longer passed.
+    assert env["STACK_NAME"] == {"Ref": "AWS::StackName"}
+    assert "DENY_POLICY_NAME" not in env
 
     rendered = template.to_json()
     enforcer_policies = [
@@ -1670,6 +1870,79 @@ def test_workloads_config_validation_errors():
                 ),
             }
         )
+
+
+def _workloads_with_roles(*role_arns: str) -> dict:
+    return {
+        "manage_invocation_logging": True,
+        "workloads": json.dumps(
+            {
+                "workloads": [
+                    {"name": f"w{index}", "model": "m", "role_arn": role_arn}
+                    for index, role_arn in enumerate(role_arns)
+                ]
+            }
+        ),
+    }
+
+
+@pytest.mark.parametrize(
+    ("role_arn", "message"),
+    [
+        ("arn:aws:iam::111122223333:role/*", "without wildcards"),
+        ("arn:aws:iam::111122223333:role/app-?", "without wildcards"),
+        ("arn:aws:iam::111122223333:role/team/*", "without wildcards"),
+        ("arn:aws:iam::111122223333:role/", "IAM role ARN"),
+        # Another account: the enforcer's PutRolePolicy grant would be
+        # useless there and the ARN would widen the IAM resource list.
+        ("arn:aws:iam::999988887777:role/app", "belongs to account 999988887777"),
+    ],
+)
+def test_workload_role_arn_must_be_concrete_and_same_account(role_arn, message):
+    """H-7: role_arn is the resource of iam:PutRolePolicy; wildcards or a
+    foreign account must fail synth, not silently broaden the grant."""
+    with pytest.raises(ValueError, match=message):
+        _template(_workloads_with_roles(role_arn))
+
+
+def test_workload_role_arn_with_path_is_accepted_and_scoped():
+    template = _template(
+        _workloads_with_roles("arn:aws:iam::111122223333:role/team/app-role")
+    )
+    rendered = json.dumps(template.to_json())
+    assert "arn:aws:iam::111122223333:role/team/app-role" in rendered
+
+
+def test_duplicate_workload_role_arn_is_rejected():
+    """Two workloads on one role would fight over the same inline Deny."""
+    with pytest.raises(ValueError, match="already enrolled by workload 'w0'"):
+        _template(
+            _workloads_with_roles(
+                "arn:aws:iam::111122223333:role/shared",
+                "arn:aws:iam::111122223333:role/shared",
+            )
+        )
+
+
+def test_workload_role_account_is_only_checked_when_account_is_known():
+    from cdk.stacks.configuration import _workloads
+    from pathlib import Path
+
+    document = {
+        "workloads": [
+            {
+                "name": "a",
+                "model": "m",
+                "role_arn": "arn:aws:iam::999988887777:role/app",
+            }
+        ]
+    }
+    # Environment-agnostic synth: format-only validation.
+    assert _workloads(document, Path("."), account=None)[0].role_arn == (
+        "arn:aws:iam::999988887777:role/app"
+    )
+    with pytest.raises(ValueError, match="belongs to account"):
+        _workloads(document, Path("."), account="111122223333")
 
 
 def test_gateway_local_bundling_avoids_container_runtime(
@@ -2073,4 +2346,445 @@ def test_auto_block_sweeper_is_always_deployed_with_nightly_cron_and_no_iam_actu
     broker_env = _environment_with(template, "BEDROCK_USER_ROLE_ARN")
     assert "auto_block_sweep_failure" in json.dumps(
         broker_env["OPERATIONS_ALARM_NAMES_JSON"]
+    )
+
+
+# ---------------------------------------------------------------------------
+# Pre-publication review fixes: resilience alarms, isolation, hygiene
+# ---------------------------------------------------------------------------
+
+_BASE_ALARM_KEYS = {
+    "broker_api_errors",
+    "usage_processor_dlq",
+    "usage_processor_errors",
+    "emergency_failure",
+    "emergency_dlq",
+    "emergency_processor_errors",
+    "revocation_failure",
+    "revocation_overflow",
+    "revocation_processor_errors",
+    "auto_block_sweep_failure",
+    "auto_block_sweeper_errors",
+    "enforcement_dispatch_dlq",
+    "enforcement_dispatch_iterator_age",
+    "enforcement_dispatcher_errors",
+    "pricing_fallback",
+}
+_WORKLOAD_ALARM_KEYS = {
+    "workload_enforcement_failure",
+    "workload_enforcer_errors",
+}
+_RECONCILIATION_ALARM_KEYS = {
+    "reconciliation_delta",
+    "reconciliation_errors",
+    "reconciliation_timeout",
+}
+
+
+def _alarm_names(template: Template) -> dict:
+    broker_env = _environment_with(template, "BEDROCK_USER_ROLE_ARN")
+    return json.loads(broker_env["OPERATIONS_ALARM_NAMES_JSON"])
+
+
+def test_alarm_inventory_base_and_full():
+    """Fifteen alarms in every deployment; twenty with workloads and
+    reconciliation. Every alarm notifies the QuotaAlerts topic, has a fixed
+    stack-scoped name, and is listed for the console."""
+    base = _template({"manage_invocation_logging": True})
+    base.resource_count_is("AWS::CloudWatch::Alarm", 15)
+    base_names = _alarm_names(base)
+    assert set(base_names) == _BASE_ALARM_KEYS
+    full = _template({**_WORKLOADS_CONTEXT, "reconciliation_enabled": True})
+    full.resource_count_is("AWS::CloudWatch::Alarm", 20)
+    assert set(_alarm_names(full)) == (
+        _BASE_ALARM_KEYS | _WORKLOAD_ALARM_KEYS | _RECONCILIATION_ALARM_KEYS
+    )
+    for template, names in ((base, base_names), (full, _alarm_names(full))):
+        alarms = template.find_resources("AWS::CloudWatch::Alarm")
+        topic_id = next(iter(template.find_resources("AWS::SNS::Topic")))
+        physical_names = set()
+        for alarm in alarms.values():
+            assert alarm["Properties"]["AlarmActions"] == [{"Ref": topic_id}]
+            physical_names.add(alarm["Properties"]["AlarmName"])
+        # Names are literals (no Ref) so the broker env stays small and the
+        # broker's own Errors alarm does not form a template cycle.
+        assert set(names.values()) == physical_names
+        assert all(name.startswith("TestStack-") for name in physical_names)
+
+
+def test_every_worker_has_a_lambda_errors_alarm():
+    template = _template({**_WORKLOADS_CONTEXT, "reconciliation_enabled": True})
+    functions = template.find_resources("AWS::Lambda::Function")
+    alarmed = {
+        alarm["Properties"]["Dimensions"][0]["Value"]["Ref"]
+        for alarm in template.find_resources("AWS::CloudWatch::Alarm").values()
+        if alarm["Properties"].get("MetricName") == "Errors"
+        and alarm["Properties"].get("Namespace") == "AWS/Lambda"
+    }
+    expected = {
+        logical_id
+        for logical_id in functions
+        if logical_id.startswith(
+            (
+                "BrokerApiFn",
+                "UsageProcessorFn",
+                "RevocationProcessorFn",
+                "EmergencyStopProcessorFn",
+                "WorkloadEnforcerFn",
+                "AutoBlockSweeperFn",
+                "EnforcementDispatcherFn",
+                "SpendReconciliationFn",
+            )
+        )
+    }
+    assert len(expected) == 8
+    assert alarmed == expected
+    template.has_resource_properties(
+        "AWS::CloudWatch::Alarm",
+        {
+            "MetricName": "Errors",
+            "Namespace": "AWS/Lambda",
+            "Statistic": "Sum",
+            "Period": 300,
+            "Threshold": 1,
+            "EvaluationPeriods": 1,
+            "ComparisonOperator": "GreaterThanOrEqualToThreshold",
+            "TreatMissingData": "notBreaching",
+        },
+    )
+
+
+def test_usage_processor_failures_land_in_an_alarmed_queue():
+    """H-3: the Logs subscription invokes the processor asynchronously; a
+    batch that fails twice must be captured, not dropped."""
+    template = _template({"manage_invocation_logging": True})
+    functions = template.find_resources("AWS::Lambda::Function")
+    processor_id = next(
+        logical_id for logical_id in functions
+        if logical_id.startswith("UsageProcessorFn")
+    )
+    queue_id = next(
+        logical_id
+        for logical_id in template.find_resources("AWS::SQS::Queue")
+        if logical_id.startswith("UsageProcessorDeadLetterQueue")
+    )
+    template.has_resource_properties(
+        "AWS::Lambda::EventInvokeConfig",
+        {
+            "FunctionName": {"Ref": processor_id},
+            "Qualifier": "$LATEST",
+            "MaximumRetryAttempts": 2,
+            "DestinationConfig": {
+                "OnFailure": {
+                    "Destination": {"Fn::GetAtt": [queue_id, "Arn"]}
+                }
+            },
+        },
+    )
+    template.has_resource_properties(
+        "AWS::CloudWatch::Alarm",
+        {
+            "AlarmName": "TestStack-usage-processor-dlq",
+            "MetricName": "ApproximateNumberOfMessagesVisible",
+            "Namespace": "AWS/SQS",
+            "Dimensions": [
+                {"Name": "QueueName", "Value": {"Fn::GetAtt": [queue_id, "QueueName"]}}
+            ],
+            "Threshold": 1,
+            "TreatMissingData": "notBreaching",
+        },
+    )
+    template.has_resource_properties(
+        "AWS::CloudWatch::Alarm",
+        {
+            "AlarmName": "TestStack-usage-processor-errors",
+            "MetricName": "Errors",
+            "Dimensions": [
+                {"Name": "FunctionName", "Value": {"Ref": processor_id}}
+            ],
+        },
+    )
+    # Every queue and the alert topic refuse plaintext transport.
+    for queue_policy in template.find_resources("AWS::SQS::QueuePolicy").values():
+        statement = queue_policy["Properties"]["PolicyDocument"]["Statement"][0]
+        assert statement["Effect"] == "Deny"
+        assert statement["Condition"] == {"Bool": {"aws:SecureTransport": "false"}}
+    template.resource_count_is("AWS::SQS::QueuePolicy", 3)
+    topic_policy = next(
+        iter(template.find_resources("AWS::SNS::TopicPolicy").values())
+    )["Properties"]["PolicyDocument"]["Statement"]
+    assert any(
+        statement["Effect"] == "Deny"
+        and statement["Condition"] == {"Bool": {"aws:SecureTransport": "false"}}
+        for statement in topic_policy
+    )
+
+
+def test_invocation_logging_is_repaired_on_every_update():
+    template = _template({"manage_invocation_logging": True})
+    logging_config = next(
+        resource["Properties"]
+        for resource in template.find_resources("Custom::AWS").values()
+        if "putModelInvocationLoggingConfiguration" in json.dumps(resource)
+    )
+    assert "Create" in logging_config
+    assert "Update" in logging_config
+    assert json.dumps(logging_config["Create"]) == json.dumps(
+        logging_config["Update"]
+    )
+    # Region-suffixed retained log group (second-Region deploys).
+    template.has_resource_properties(
+        "AWS::Logs::LogGroup",
+        {"LogGroupName": "/bedrock/spend-controls/model-invocations"},
+    )
+
+
+def test_reconciliation_timeout_alarm_uses_started_minus_finished():
+    template = _template(
+        {**_WORKLOADS_CONTEXT, "reconciliation_enabled": True}
+    )
+    alarm = next(
+        resource["Properties"]
+        for resource in template.find_resources("AWS::CloudWatch::Alarm").values()
+        if resource["Properties"]["AlarmName"] == "TestStack-reconciliation-timeout"
+    )
+    assert alarm["Threshold"] == 0
+    assert alarm["ComparisonOperator"] == "GreaterThanThreshold"
+    assert alarm["TreatMissingData"] == "notBreaching"
+    metrics = alarm["Metrics"]
+    expression = next(m for m in metrics if "Expression" in m)
+    assert expression["Expression"] == (
+        "FILL(started, 0) - FILL(runs, 0) - FILL(failures, 0)"
+    )
+    assert {m["MetricStat"]["Period"] for m in metrics if "MetricStat" in m} == {
+        86_400
+    }
+    by_id = {
+        m["Id"]: m["MetricStat"]["Metric"]["MetricName"]
+        for m in metrics
+        if "MetricStat" in m
+    }
+    assert by_id == {
+        "started": "ReconciliationStarted",
+        "runs": "ReconciliationRuns",
+        "failures": "ReconciliationFailure",
+    }
+    env = next(
+        resource["Properties"]["Environment"]["Variables"]
+        for name, resource in template.find_resources("AWS::Lambda::Function").items()
+        if name.startswith("SpendReconciliationFn")
+    )
+    assert json.loads(env["RECONCILE_SERVICE_NAMES_JSON"]) == [
+        "Amazon Bedrock",
+        "Amazon Bedrock Service",
+    ]
+    dashboard = json.dumps(
+        next(iter(template.find_resources("AWS::CloudWatch::Dashboard").values()))
+    )
+    assert "RevokedIdentitiesDropped" in dashboard
+
+
+def test_reconciliation_service_names_are_configurable():
+    template = _template(
+        {
+            "manage_invocation_logging": True,
+            "reconciliation_enabled": True,
+            "reconciliation_service_names": ["Amazon Bedrock"],
+        }
+    )
+    env = next(
+        resource["Properties"]["Environment"]["Variables"]
+        for name, resource in template.find_resources("AWS::Lambda::Function").items()
+        if name.startswith("SpendReconciliationFn")
+    )
+    assert json.loads(env["RECONCILE_SERVICE_NAMES_JSON"]) == ["Amazon Bedrock"]
+
+
+def _vended_role_statements(template: Template) -> list[dict]:
+    role_id = next(
+        logical_id
+        for logical_id in template.find_resources("AWS::IAM::Role")
+        if logical_id.startswith("BedrockUserRole")
+    )
+    policies = template.find_resources("AWS::IAM::Policy")
+    return [
+        statement
+        for policy in policies.values()
+        if {"Ref": role_id} in policy["Properties"].get("Roles", [])
+        for statement in policy["Properties"]["PolicyDocument"]["Statement"]
+    ]
+
+
+def test_vended_sessions_are_denied_workload_profiles_and_unmetered_paths():
+    """H-5: even with allowed_model_arns '*' a vended session must not reach
+    an application inference profile (workload spend), provisioned
+    throughput, async invocation, or bidirectional streaming."""
+    template = _template({"manage_invocation_logging": True})
+    denies = {
+        statement["Sid"]: statement
+        for statement in _vended_role_statements(template)
+        if statement["Effect"] == "Deny"
+    }
+    profile_deny = denies["DenyWorkloadProfilesAndProvisionedModels"]
+    assert profile_deny["Action"] == ["bedrock:InvokeModel*", "bedrock:CountTokens"]
+    assert json.dumps(profile_deny["Resource"]).count(
+        ":bedrock:*:*:application-inference-profile/*"
+    ) == 1
+    assert ":bedrock:*:*:provisioned-model/*" in json.dumps(profile_deny["Resource"])
+    unmetered = denies["DenyUnmeteredInvokePaths"]
+    assert unmetered["Action"] == [
+        "bedrock:StartAsyncInvoke",
+        "bedrock:InvokeModelWithBidirectionalStream",
+    ]
+    assert unmetered["Resource"] == "*"
+    # The same guardrails sit in the permissions boundary.
+    boundary = next(
+        resource["Properties"]["PolicyDocument"]["Statement"]
+        for logical_id, resource in template.find_resources(
+            "AWS::IAM::ManagedPolicy"
+        ).items()
+        if logical_id.startswith("BedrockUserPermissionsBoundary")
+    )
+    assert {s.get("Sid") for s in boundary if s["Effect"] == "Deny"} == {
+        "DenyWorkloadProfilesAndProvisionedModels",
+        "DenyUnmeteredInvokePaths",
+    }
+    # Workload roles are separate principals: their invoke policies carry no
+    # Deny at all, so the guardrail cannot break the workload path.
+    workload_template = _template(_WORKLOADS_CONTEXT)
+    attach = next(
+        resource["Properties"]["PolicyDocument"]["Statement"]
+        for logical_id, resource in workload_template.find_resources(
+            "AWS::IAM::Policy"
+        ).items()
+        if logical_id.startswith("WorkloadInvokePolicyPayments")
+    )
+    assert all(statement["Effect"] == "Allow" for statement in attach)
+
+
+def test_vended_role_trust_requires_a_source_identity():
+    template = _template({"manage_invocation_logging": True})
+    role = next(
+        resource["Properties"]
+        for logical_id, resource in template.find_resources("AWS::IAM::Role").items()
+        if logical_id.startswith("BedrockUserRole")
+    )
+    assume = next(
+        statement
+        for statement in role["AssumeRolePolicyDocument"]["Statement"]
+        if statement["Action"] == "sts:AssumeRole"
+    )
+    assert assume["Condition"] == {"Null": {"sts:SourceIdentity": "false"}}
+    assert "BrokerApiFnServiceRole" in json.dumps(assume["Principal"])
+
+
+def test_wildcard_model_allowlist_and_profile_only_allowlist_warn():
+    app = cdk.App(context={"manage_invocation_logging": True})
+    stack = SpendControlsStack(
+        app, "TestStack",
+        env=cdk.Environment(account="111122223333", region="us-east-1"),
+    )
+    warnings = [
+        message.entry.data
+        for message in cdk.assertions.Annotations.from_stack(stack).find_warning(
+            "*", Match.any_value()
+        )
+    ]
+    assert any("allowed_model_arns contains '*'" in w for w in warnings)
+    assert not any("no foundation-model ARN" in w for w in warnings)
+
+    profile_only = cdk.App(
+        context={
+            "manage_invocation_logging": True,
+            "allowed_model_arns": [
+                "arn:aws:bedrock:*:111122223333:inference-profile/us.anthropic.claude-opus-4-7"
+            ],
+        }
+    )
+    stack = SpendControlsStack(
+        profile_only, "TestStack",
+        env=cdk.Environment(account="111122223333", region="us-east-1"),
+    )
+    warnings = [
+        message.entry.data
+        for message in cdk.assertions.Annotations.from_stack(stack).find_warning(
+            "*", Match.any_value()
+        )
+    ]
+    assert any("no foundation-model ARN" in w for w in warnings)
+    assert not any("allowed_model_arns contains '*'" in w for w in warnings)
+
+
+def test_enforcement_concurrency_reservation_is_configurable():
+    reserved = _template(_WORKLOADS_CONTEXT)
+    reserved.resource_properties_count_is(
+        "AWS::Lambda::Function", Match.object_like({"ReservedConcurrentExecutions": 1}), 5
+    )
+    unreserved = _template(
+        {**_WORKLOADS_CONTEXT, "reserve_enforcement_concurrency": False}
+    )
+    assert "ReservedConcurrentExecutions" not in json.dumps(unreserved.to_json())
+
+
+def test_every_function_has_an_explicit_log_group_with_retention():
+    template = _template(
+        {
+            **_WORKLOADS_CONTEXT,
+            "admin_ui": True,
+            "admin_jwt_claim": "cognito:groups",
+            "admin_jwt_value": "quota-admins",
+            "reconciliation_enabled": True,
+            "log_retention_days": 30,
+        }
+    )
+    functions = template.find_resources("AWS::Lambda::Function")
+    log_groups = template.find_resources("AWS::Logs::LogGroup")
+    with_group = {
+        logical_id
+        for logical_id, function in functions.items()
+        if "LoggingConfig" in function["Properties"]
+    }
+    # Every Lambda the stack defines (the BucketDeployment helper and the
+    # OIDC provider helper are CDK-internal singletons without that prop).
+    ours = {
+        logical_id
+        for logical_id in functions
+        if logical_id.startswith(
+            (
+                "PriceResolverFn", "PriceRefreshFn", "BrokerApiFn",
+                "UsageProcessorFn", "EmergencyStopProcessorFn",
+                "RevocationProcessorFn", "AutoBlockSweeperFn",
+                "WorkloadEnforcerFn", "EnforcementDispatcherFn",
+                "SpendReconciliationFn", "PriceResolverProvider",
+                "AWS679f53fac002430cb0da5b7982bd2287",
+            )
+        )
+    }
+    assert len(ours) == 12
+    assert ours <= with_group
+    for logical_id in ours:
+        group_ref = functions[logical_id]["Properties"]["LoggingConfig"]["LogGroup"]["Ref"]
+        assert log_groups[group_ref]["Properties"]["RetentionInDays"] == 30
+        assert log_groups[group_ref]["DeletionPolicy"] == "Delete"
+    default = _template({"manage_invocation_logging": True})
+    assert {
+        group["Properties"].get("RetentionInDays")
+        for logical_id, group in default.find_resources("AWS::Logs::LogGroup").items()
+        if not logical_id.startswith("BedrockInvocationLogs")
+    } == {90}
+
+
+def test_web_adapter_layer_is_partition_aware_and_current():
+    template = _template({"manage_invocation_logging": True})
+    broker = next(
+        resource["Properties"]
+        for name, resource in template.find_resources("AWS::Lambda::Function").items()
+        if name.startswith("BrokerApiFn")
+    )
+    layer = json.dumps(broker["Layers"])
+    assert '"Ref": "AWS::Partition"' in layer
+    assert ":layer:LambdaAdapterLayerX86:30" in layer
+    template.has_resource_properties(
+        "AWS::CloudWatch::Dashboard",
+        {"DashboardName": "bedrock-spend-controls"},
     )

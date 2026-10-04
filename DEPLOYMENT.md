@@ -134,8 +134,16 @@ export ADMIN_KEY=$(aws secretsmanager get-secret-value \
 
 Other outputs you will use: `AdminUiUrl`, `DemoUserPoolId`,
 `DemoUserPoolClientId`, `AdminIdentityPoolId`, `BedrockUserRoleArn`,
-`DenyDirectBedrockPolicyArn`, `EmergencyKeySecretArn`, `AlertTopicArn`,
-`UsersTableName`, `UsageTableName`, `BrokerApiRoleArn`.
+`DenyDirectBedrockPolicyArn`, `EmergencyDenyPolicyArn`,
+`EmergencyKeySecretArn`, `AlertTopicArn`, `UsersTableName`,
+`UsageTableName`, `BrokerApiRoleArn`, `InvocationLogGroup`,
+`ModelPricesParameterName` (the SSM parameter holding the resolved price
+table, refreshed daily), `ModelPriceSnapshot` (a one-line digest of the form
+`ssm:<parameter name> sha256:<digest> models=<count>`; read the full table
+with `aws ssm get-parameter --name <ModelPricesParameterName>`; the value is
+`gz1:` followed by base64-encoded gzip of the JSON, see
+[pricing.md](docs/pricing.md#where-prices-come-from)), and
+`ModelFallbackPrice`.
 
 ### 5. Configure the demo administrator
 
@@ -164,19 +172,25 @@ client ID, Identity Pool ID, scopes); it contains no secrets.
 
 ### 6. Administrative smoke test
 
+The client library and the admin CLI have their own pinned dependencies
+(`examples/requirements.txt`: `boto3`, `botocore`, `httpx`). Install them in
+a separate virtualenv at the repository root. `ADMIN_KEY` is already
+exported from step 4; the CLI reads it from the environment (`--admin-key`
+still works but warns, because it puts the key in your shell history).
+
 ```bash
 cd ..   # back to the repository root
+python3 -m venv .venv-examples
+.venv-examples/bin/pip install -r examples/requirements.txt
 
-cdk/.venv/bin/python examples/sigv4_gateway.py \
-  --gateway-url "$BROKER_API_URL" --profile "$AWS_PROFILE" \
-  --region "$AWS_REGION" --admin-key "$ADMIN_KEY" \
+.venv-examples/bin/python examples/sigv4_gateway.py \
+  --gateway-url "$BROKER_API_URL" --profile "$AWS_PROFILE" --region "$AWS_REGION" \
   create-user demo-user \
   --daily-usd 2 --daily-input-tokens 1000000 --daily-output-tokens 200000 \
   --weekly-usd 10 --weekly-input-tokens 5000000 --weekly-output-tokens 1000000
 
-cdk/.venv/bin/python examples/sigv4_gateway.py \
-  --gateway-url "$BROKER_API_URL" --profile "$AWS_PROFILE" \
-  --region "$AWS_REGION" --admin-key "$ADMIN_KEY" \
+.venv-examples/bin/python examples/sigv4_gateway.py \
+  --gateway-url "$BROKER_API_URL" --profile "$AWS_PROFILE" --region "$AWS_REGION" \
   list-users
 ```
 
@@ -218,7 +232,7 @@ broker and hands them to an ordinary boto3 client.
 ```bash
 export GATEWAY_URL="$BROKER_API_URL"
 
-cdk/.venv/bin/python - <<'PY'
+.venv-examples/bin/python - <<'PY'
 import os, sys
 sys.path.insert(0, "examples")
 from refreshable_bedrock import QuotaBrokerCredentialProvider
@@ -238,18 +252,17 @@ PY
 ```
 
 The vend happens on the first signed request; the inference goes directly to
-`bedrock-runtime`. A blocked or over-budget user fails here with a
-`BrokerCredentialError` instead of reaching Bedrock. Allow one to two
-minutes for invocation-log delivery, then read the ledger. `USER_ID` is the
-quota user's `sub`:
+`bedrock-runtime`. A blocked or over-budget user fails here with a typed
+`BrokerCredentialError` subclass (`UserBlockedError`, `QuotaExceededError`)
+instead of reaching Bedrock. Allow one to two minutes for invocation-log
+delivery, then read the ledger. `USER_ID` is the quota user's `sub`:
 
 ```bash
 export USER_ID=$(aws cognito-idp admin-get-user --user-pool-id "$USER_POOL_ID" --username quota-user \
   --query "UserAttributes[?Name=='sub'].Value | [0]" --output text)
 
-cdk/.venv/bin/python examples/sigv4_gateway.py \
-  --gateway-url "$BROKER_API_URL" --profile "$AWS_PROFILE" \
-  --region "$AWS_REGION" --admin-key "$ADMIN_KEY" \
+.venv-examples/bin/python examples/sigv4_gateway.py \
+  --gateway-url "$BROKER_API_URL" --profile "$AWS_PROFILE" --region "$AWS_REGION" \
   get-usage "$USER_ID" --period daily
 ```
 
@@ -312,12 +325,26 @@ The template:
     "arn:aws:iam::111122223333:role/BedrockSpendControlsInvoker"
   ],
   "allowed_model_arns": [
-    "arn:aws:bedrock:us-east-1::foundation-model/openai.gpt-oss-120b-1:0",
-    "arn:aws:bedrock:us-east-1::foundation-model/anthropic.claude-opus-4-7"
+    "arn:aws:bedrock:*:111122223333:inference-profile/us.anthropic.claude-sonnet-5",
+    "arn:aws:bedrock:*::foundation-model/anthropic.claude-sonnet-5",
+    "arn:aws:bedrock:*:111122223333:inference-profile/us.anthropic.claude-opus-4-7",
+    "arn:aws:bedrock:*::foundation-model/anthropic.claude-opus-4-7",
+    "arn:aws:bedrock:*::foundation-model/openai.gpt-oss-120b-1:0"
   ],
   "model_config": "model-pricing.json"
 }
 ```
+
+A cross-Region inference profile needs **two** entries: the profile ARN in
+your account (`arn:aws:bedrock:*:<account>:inference-profile/<profile id>`)
+and the underlying foundation model with a wildcard Region
+(`arn:aws:bedrock:*::foundation-model/<model id>`), because Bedrock authorizes
+the routed model call in whichever Region the profile selects. A model you
+call directly needs only its `foundation-model` ARN. Even with these
+entries, vended sessions are explicitly denied application inference
+profiles, provisioned models, `StartAsyncInvoke`, and
+`InvokeModelWithBidirectionalStream` (role policy and permissions boundary),
+so the allowlist can never open the workload or unmetered paths.
 
 Edit in `config/production.local.json`:
 
@@ -327,10 +354,12 @@ Edit in `config/production.local.json`:
 | `jwt_issuer`, `jwt_audience`, `jwt_user_claim` | Your IdP's issuer URL, the audience of the tokens your backend holds, and the claim that identifies the quota subject |
 | `invocation_log_group_name` | The log group that already receives Bedrock invocation logs in this Region |
 | `invoker_principal_arns` | The exact backend and admin role ARNs that may call the Function URL |
-| `allowed_model_arns` | The exact foundation-model and inference-profile ARNs your users may invoke, in your account and Region |
+| `allowed_model_arns` | The exact foundation-model and inference-profile ARNs your users may invoke, in your account (inference-profile ARN plus the `arn:aws:bedrock:*::foundation-model/<id>` it routes to) |
 | `default_limits`, `warn_threshold`, `usage_retention_days` | Your quota policy ([quotas.md](docs/quotas.md)) |
 | `admin_ui`, `admin_ui_client_id`, `admin_jwt_claim`, `admin_jwt_value` | Only if you host the console against your IdP (step 4) |
-| `reconciliation_enabled`, `workloads` | Optional; see [configuration.md](docs/configuration.md#reconciliation) and [Per-workload quotas](#per-workload-quotas) |
+| `log_retention_days` | Lambda log retention (default 90; any CloudWatch Logs retention value) |
+| `reserve_enforcement_concurrency` | Leave `true` unless the account's Lambda concurrency quota is 10 (see step 3) |
+| `reconciliation_enabled`, `reconciliation_service_names`, `workloads` | Optional; see [configuration.md](docs/configuration.md#reconciliation) and [Per-workload quotas](#per-workload-quotas) |
 
 Every key, its default, and its validation rule:
 [docs/configuration.md](docs/configuration.md). Review `fallback_price` in
@@ -384,6 +413,15 @@ role has no free attachment slot: check the applied value of *Managed
 policies per role* in Service Quotas beforehand, and do not attach other
 managed policies to `BedrockUserRole`.
 
+The five enforcement workers (revocation, emergency, workload enforcer,
+auto-block sweeper, enforcement dispatcher) each reserve one concurrent
+execution so they can never race themselves on IAM writes. Accounts whose
+Lambda *Concurrent executions* quota is 10 (some new or sandbox accounts;
+the default is 1,000) cannot spare five reserved slots and the deploy fails
+with an unreserved-concurrency error: set
+`"reserve_enforcement_concurrency": false` in the deployment file, or
+request a quota increase first.
+
 ### 4. Corporate IdP and console
 
 The broker and the console federate with any OIDC-compliant issuer. The
@@ -393,7 +431,13 @@ exchanges the ID token at a Cognito Identity Pool for the SigV4 credentials
 it signs Function URL requests with.
 
 Set `admin_ui: true` together with your issuer, and the stack hosts the
-console and creates the IAM OIDC provider and Identity Pool that trust it:
+console and creates the IAM OIDC provider and Identity Pool that trust it.
+The Identity Pool uses a rules-based role mapping: only a signed-in user
+whose `admin_jwt_claim` contains `admin_jwt_value` receives the
+`AdminConsoleRole` (and with it `lambda:InvokeFunctionUrl` on the broker);
+everyone else who can sign in to the client is denied a role
+(`AmbiguousRoleResolution: Deny`), so a non-admin login cannot reach the
+Function URL at all.
 
 ```json
 {
@@ -407,8 +451,10 @@ console and creates the IAM OIDC provider and Identity Pool that trust it:
 ```
 
 - `admin_ui_client_id` is the SPA's public OAuth client in your IdP; omit it
-  when the console shares the `jwt_audience` client. The broker accepts both
-  audiences.
+  when the console shares the `jwt_audience` client. The broker accepts the
+  console audience on `/admin/*` only: `jwt_audience` (the first configured
+  audience) is the only one honoured on `POST /v1/credentials`, so a console
+  login can never vend Bedrock credentials.
 - After the first deploy, register the `AdminUiCallbackUrl` output as the
   redirect URI on that client. The CloudFront URL exists only after
   deployment, so this is a second step.
@@ -447,12 +493,16 @@ administrators are authorized by their JWT claim.
 The quotas have no effect if application users retain another principal
 that can call Bedrock directly. Choose one:
 
-- Attach the stack's `DenyDirectBedrockPolicyArn` to every non-vended role.
+- Attach the stack's `DenyDirectBedrockPolicyArn` (managed policy
+  `deny-direct-bedrock-invocation-<region>`; IAM is account-global, so the
+  name carries the Region to allow one stack per Region) to every non-vended
+  role.
 - Apply a permissions boundary.
 - Apply an organizational SCP.
 
 Example SCP with the deployed `BedrockUserRoleArn` as the only inference
-exception:
+exception. `StartAsyncInvoke` and `InvokeModelWithBidirectionalStream` are
+listed because they are not captured by model-invocation logging:
 
 ```json
 {
@@ -464,6 +514,8 @@ exception:
       "Action": [
         "bedrock:InvokeModel",
         "bedrock:InvokeModelWithResponseStream",
+        "bedrock:StartAsyncInvoke",
+        "bedrock:InvokeModelWithBidirectionalStream",
         "bedrock:CallWithBearerToken",
         "bedrock-mantle:CreateInference",
         "bedrock-mantle:CallWithBearerToken"
@@ -481,10 +533,10 @@ exception:
 
 The two `bedrock-mantle:*` actions are included because the Bedrock Mantle
 endpoint is not captured by model-invocation logging: any principal that can
-call it spends outside the ledger. The vended role never receives those
-actions, so the exception does not reopen the gap. If you use workloads,
-add their role ARNs to the exception as well. Validate any SCP in a
-non-production OU first.
+call it spends outside the ledger. The vended role never receives the Mantle
+actions and is explicitly denied the two unmetered `bedrock:` actions, so the
+exception does not reopen the gap. If you use workloads, add their role ARNs
+to the exception as well. Validate any SCP in a non-production OU first.
 
 ### 6. Production acceptance tests
 
@@ -545,7 +597,11 @@ are the operator steps.
 
    `name` must match `[a-z0-9][a-z0-9-]{0,47}`; `model` is a foundation-model
    ID or cross-Region inference-profile ID (never an ARN); `role_arn` is a
-   same-account IAM role and is strongly recommended.
+   single same-account IAM role ARN (no wildcards; synthesis rejects a role
+   in another account) and is strongly recommended. Each workload needs its
+   own role: synthesis rejects a `role_arn` that appears twice, because the
+   deny is a role-wide inline policy and one workload's unblock would
+   otherwise lift another's deny.
 
 2. **Deploy** with `-c workloads=config/workloads.json` (or the `workloads`
    key in the deployment file). Per workload the stack creates an
@@ -573,14 +629,48 @@ are the operator steps.
    (auto-provisioned with `default_limits`, priced by the profile's
    underlying model); until then the console shows *Awaiting traffic*.
    `GET /admin/workloads` returns the roster joined with the metered rows.
-   The workload enforcer attaches the deny within metering lag plus IAM
-   propagation of a block, and removes it once every enabled period is under
-   quota again ([runbook](docs/runbooks/components/workload-enforcer.md)).
+   The workload enforcer attaches the inline deny
+   `bedrock-spend-controls-workload-deny-<region>-<stack>` within metering
+   lag plus IAM propagation of a block, and removes it once every enabled
+   period is under quota again
+   ([runbook](docs/runbooks/components/workload-enforcer.md)).
+
+6. **Remove a workload** in two steps. First unblock it (or restore its
+   budget) and wait one enforcement cycle (5 minutes) so the enforcer
+   detaches the deny from its role; then delete the entry from
+   `workloads.json` and redeploy. Removing a blocked workload from the roster
+   first leaves its deny attached, because the enforcer no longer knows the
+   role; you would have to delete the inline policy by hand
+   (`aws iam delete-role-policy`). The redeploy deletes the application
+   inference profile; the `workload:<name>` row stays in the users table
+   (shown as *Unregistered*) until its usage retention expires.
 
 Scale envelope: 1,000 application inference profiles and 1,000 IAM roles per
 account (adjustable quotas). Reconciliation per workload needs the
 cost-allocation tag activated in the payer account
 ([configuration.md](docs/configuration.md#reconciliation)).
+
+## Upgrading an existing deployment
+
+Redeploying this version over a stack created from an earlier revision
+replaces some resources; plan for the following.
+
+| Resource | What happens | Action |
+|---|---|---|
+| `deny-direct-bedrock-invocation-<region>` managed policy | Replaced (new name, new ARN) | Re-attach the new `DenyDirectBedrockPolicyArn` wherever the old policy was attached |
+| All CloudWatch alarms | Replaced with fixed names `<stack>-<key>`; alarm history resets | Update any external alarm subscriptions or dashboards that reference alarm names |
+| SSM price parameter | CloudFormation deletes the old one; the resolver writes the new compressed parameter (`ModelPricesParameterName`) | None; metering falls back to the conservative price (alarmed) only if the parameter is unreadable at a cold start |
+| Identity Pool authenticated role | Replaced by `AdminConsoleRole` with a rules mapping on `admin_jwt_claim` | Console users sign in again; non-admin logins no longer receive credentials |
+| `QuotaPeriods` Lambda layer | New layer version | None |
+| Lambda log groups | Explicit log groups with `log_retention_days` (default 90) are created; the groups Lambda auto-created earlier remain | Delete the old `/aws/lambda/<function>` groups once you no longer need their history |
+| Usage-processor DLQ and 10 new alarms | Added | Subscribe the new alarms' runbooks ([docs/runbooks/README.md](docs/runbooks/README.md)) |
+
+Not replaced: the DynamoDB tables, `BedrockUserRole`, the invocation log
+group, and the dashboard. The `EnableBedrockInvocationLogging` custom
+resource now also runs on update, so a redeploy repairs the account-wide
+logging setting if something changed it. The workload enforcer renames the
+inline deny on workload roles automatically on its next run (the legacy
+`bedrock-spend-controls-workload-deny` policy is removed).
 
 ## Clean up
 
@@ -589,8 +679,12 @@ cd sample-bedrock-spend-controls/cdk
 npx cdk destroy -c deployment_config=config/demo.json
 ```
 
-Production tables use `RETAIN` and survive stack deletion. Stack-managed
-invocation logging resources are also retained because the stack cannot
-restore a prior account-wide logging configuration. Review and remove
-retained resources only through an explicit data-retention and
-logging-owner decision.
+With `retain_tables_on_delete: true` (as in `config/production.json`) the
+tables use `RETAIN`, carry deletion protection, and survive stack deletion.
+Stack-managed invocation logging resources are always retained because the
+stack cannot restore a prior account-wide logging configuration. To deploy
+again in the same Region after a destroy, delete or rename the retained log
+group `/bedrock/spend-controls/model-invocations` first, or pass it to the
+new stack with `manage_invocation_logging: false` and
+`invocation_log_group_name`. Review and remove retained resources only
+through an explicit data-retention and logging-owner decision.

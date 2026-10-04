@@ -1,6 +1,6 @@
 {
   "title": "Bedrock Spend Controls threat model",
-  "reviewed": "2026-09-15",
+  "reviewed": "2026-10-04",
   "method": "STRIDE per trust boundary",
   "asset": "The Bedrock bill, bounded per identity, tenant, or workload; correct usage attribution; enforcement within the documented bound (metering lag + min(lease remainder, deny propagation)); authorized and audited administration. Prompt confidentiality is out of scope: the broker never sees inference traffic and payload delivery is disabled.",
   "status_legend": {
@@ -420,7 +420,7 @@
       "source": "Administrator / CLI",
       "destination": "Broker admin endpoints",
       "boundary": "B6",
-      "channel": "SigV4 + X-Admin-Key (Secrets Manager); break-glass key per emergency action; If-Match + Idempotency-Key",
+      "channel": "SigV4 + X-Quota-Admin-Key (Secrets Manager); break-glass key per emergency action; If-Match + Idempotency-Key",
       "carries": "admin mutations",
       "assets": [
         "A-4",
@@ -511,13 +511,16 @@
       },
       "title": "JWT forgery or replay",
       "description": "Attacker presents a fabricated or captured token to obtain credentials under another identity.",
-      "mitigation": "Signature verified against issuer JWKS (RS/ES) or dev-only HS256; iss/aud/exp enforced; discovery and JWKS must be HTTPS; lease deadline capped at token exp so a replayed token cannot mint credentials that outlive it.",
+      "mitigation": "Signature verified against issuer JWKS (RS/ES) or dev-only HS256; iss/aud/exp enforced, and only the first configured audience is accepted on /v1/credentials (a console-client token cannot vend); discovery and JWKS must be HTTPS; lease deadline capped at token exp so a replayed token cannot mint credentials that outlive it. The client library keys its per-user cache on a claim read without signature verification, so it requires the application to verify the token first (verified_identity= / client_for_identity reject a mismatch).",
       "code_references": [
         "gateway/app/auth.py:JwtVerifier.verify",
-        "gateway/app/main.py:_reserve_permission_lease"
+        "gateway/app/auth.py:accepted_audiences",
+        "gateway/app/main.py:_reserve_permission_lease",
+        "examples/refreshable_bedrock.py:BedrockSpendControls.client_for"
       ],
       "tests": [
-        "tests/test_auth.py"
+        "tests/test_auth.py",
+        "tests/test_refreshable_credentials.py"
       ],
       "residual_risk": "A token stolen before exp is usable until then; no jti replay cache. Caller must also hold a SigV4 principal allowed on the Function URL.",
       "status": "Accepted"
@@ -645,7 +648,7 @@
       },
       "title": "Session-name collision or injection",
       "description": "Two identities sanitize to the same RoleSessionName, or a crafted claim escapes the session-name character set, so metering or revocation targets the wrong subject.",
-      "mitigation": "session_name_for derives a collision-resistant name (sanitized prefix + hash of the full claim) and the same value is SourceIdentity; the exact stamped value is persisted on the user row (source_identity) so revocation never re-derives it; SESSION# reverse map; SetSourceIdentity/TagSession granted only to the broker role on the trust policy.",
+      "mitigation": "session_name_for derives a collision-resistant name (sanitized prefix + hash of the full claim) and the same value is SourceIdentity; the exact stamped value is persisted on the user row (source_identity) so revocation never re-derives it; SESSION# reverse map; SetSourceIdentity/TagSession granted only to the broker role on the trust policy; the role's trust policy requires sts:SourceIdentity (Null=false), so no BedrockUserRole session can exist without a stamped identity.",
       "code_references": [
         "gateway/app/broker.py:session_name_for",
         "gateway/app/quota.py:record_session"
@@ -679,10 +682,10 @@
       },
       "title": "Session policy widens access",
       "description": "The Resource:\"*\" in the lease session policy could grant models outside the allowlist.",
-      "mitigation": "STS intersects the session policy with the role policy and the permissions boundary; \"*\" only applies the DateLessThan deadline to the existing allowlist. Role grants exactly CountTokens, InvokeModel, InvokeModelWithResponseStream.",
+      "mitigation": "STS intersects the session policy with the role policy and the permissions boundary; \"*\" only applies the DateLessThan deadline to the existing allowlist. Role grants exactly CountTokens, InvokeModel, InvokeModelWithResponseStream. Both the role policy and the boundary carry an explicit Deny on application-inference-profile/* and provisioned-model/* and on StartAsyncInvoke / InvokeModelWithBidirectionalStream, so even allowed_model_arns [\"*\"] cannot reach a workload profile, provisioned throughput, or an unmetered invoke path.",
       "code_references": [
         "gateway/app/session_policy.py",
-        "cdk/stacks/spend_controls_stack.py (BedrockUserPermissionsBoundary)"
+        "cdk/stacks/spend_controls_stack.py (BedrockUserPermissionsBoundary, vended_session_guardrails)"
       ],
       "tests": [
         "tests/test_broker.py",
@@ -816,14 +819,16 @@
       },
       "title": "Unmetered Runtime APIs",
       "description": "StartAsyncInvoke and InvokeModelWithBidirectionalStream authorize under bedrock:InvokeModel* but produce no invocation-log record.",
-      "mitigation": "None possible in the data plane; documented with the recommendation to exclude such models from allowed_model_arns; listed as a reconciliation-delta cause.",
+      "mitigation": "The vended role policy and its permissions boundary explicitly Deny bedrock:StartAsyncInvoke and bedrock:InvokeModelWithBidirectionalStream, so a vended session cannot use the two Runtime paths that model-invocation logging does not record, whatever allowed_model_arns says. The SCP example denies the same actions for other principals.",
       "code_references": [
-        "README.md (Metering coverage caveat)",
-        "docs/runbooks/alarms/reconciliation-delta.md"
+        "cdk/stacks/spend_controls_stack.py (vended_session_guardrails)",
+        "DEPLOYMENT.md § Prevent bypass"
       ],
-      "tests": [],
-      "residual_risk": "Spend through those APIs never reaches the ledger.",
-      "status": "Accepted",
+      "tests": [
+        "tests/test_cdk_stack.py"
+      ],
+      "residual_risk": "Other principals in the account that hold these actions (and bedrock-mantle:*) still spend unmetered unless the SCP is applied; see T-26. Reconciliation shows the gap as a positive delta.",
+      "status": "Mitigated",
       "mitigation_status": "will_not_action"
     },
     {
@@ -1227,11 +1232,12 @@
       },
       "title": "Admin key or emergency key exposure",
       "description": "Leak of the routine or break-glass shared key.",
-      "mitigation": "Both keys in Secrets Manager, read at cold start, never sent to the browser (UI authorizes by admin JWT claim); break-glass key entered per action and not persisted; empty ADMIN_JWT_CLAIM disables JWT admin; both compares constant-time via secrets.compare_digest.",
+      "mitigation": "Both keys in Secrets Manager, read at cold start. The routine key never reaches the browser (UI authorizes by admin JWT claim, and the Identity Pool rules mapping on admin_jwt_claim/admin_jwt_value hands AWS credentials only to that group, AmbiguousRoleResolution Deny for everyone else); the break-glass key is typed by the operator per action, sent in the request header, cleared on submit, excluded from autofill, and never stored. Empty ADMIN_JWT_CLAIM disables JWT admin; both compares constant-time via secrets.compare_digest.",
       "code_references": [
         "gateway/app/main.py:_require_admin",
         "gateway/app/main.py:_require_emergency_admin",
-        "admin-ui/src/api.ts"
+        "admin-ui/src/api.ts",
+        "cdk/stacks/spend_controls_stack.py (AdminConsoleRole, AdminIdentityPool role_mappings)"
       ],
       "tests": [
         "tests/test_gateway_app.py::test_admin_requires_authorization_and_valid_payloads",
@@ -1262,9 +1268,11 @@
       },
       "title": "Admin JWT claim escalation at the IdP",
       "description": "A user adds themselves to the admin group at the IdP.",
-      "mitigation": "Claim/value are operator-configured; IdP group membership is outside the sample.",
+      "mitigation": "Claim/value are operator-configured; IdP group membership is outside the sample. The Identity Pool rules mapping and the broker check the same claim, so a user outside the group gets no AWS credentials at all (not merely a 403), and the console audience is accepted on /admin/* only, so even an admin login cannot vend Bedrock credentials.",
       "code_references": [
-        "gateway/app/main.py:_jwt_admin_principal"
+        "gateway/app/main.py:_jwt_admin_principal",
+        "gateway/app/auth.py:accepted_audiences",
+        "cdk/stacks/spend_controls_stack.py (AdminIdentityPool role_mappings)"
       ],
       "tests": [
         "tests/test_gateway_app.py::test_admin_jwt_group_is_supported"
@@ -1558,6 +1566,7 @@
       "T-07",
       "T-08",
       "T-09",
+      "T-10",
       "T-13",
       "T-14",
       "T-17",
@@ -1574,7 +1583,6 @@
     "Accepted": [
       "T-01",
       "T-02",
-      "T-10",
       "T-11",
       "T-12",
       "T-15",

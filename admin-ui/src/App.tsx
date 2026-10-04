@@ -49,8 +49,8 @@ import {
   type UserStatus,
   type WorkloadEntry,
 } from "./api";
-import { formatCompact, formatNumber, formatUsd } from "./format";
-import { CreateUserWizard, GlobalAuditView, UserDetailDrawer, workloadEnforcementLabel } from "./OperationalUi";
+import { formatCompact, formatNumber, formatUsd, formatUtcTimestamp } from "./format";
+import { CreateUserWizard, GlobalAuditView, UnpricedBadge, UserDetailDrawer, workloadEnforcementLabel } from "./OperationalUi";
 import { OverviewCharts } from "./OverviewCharts";
 import { OperationsView } from "./Operations";
 import { useModalLifecycle } from "./modal";
@@ -66,6 +66,22 @@ export function matchesUserFilter(user: AdminUser, filter: UserFilter): boolean 
 }
 const USER_PAGE_SIZE = 25;
 const QUOTA_PERIODS: QuotaPeriod[] = ["daily", "weekly", "monthly"];
+
+export type UtilizationLevel = "normal" | "warning" | "critical";
+
+/** Colour band for a utilisation ratio against the period's configured
+ *  thresholds (the deployment default 80 % warn / 100 % block when the row
+ *  carries none). `critical` means the block level is reached; an alert-only
+ *  list has no block level, so it tops out at `warning` however far over
+ *  100 % the usage runs, which is exactly what the broker will do. */
+export function utilizationLevel(ratio: number, thresholds?: QuotaThreshold[]): UtilizationLevel {
+  const list = thresholds && thresholds.length > 0 ? thresholds : DEFAULT_THRESHOLDS;
+  const block = list.find((entry) => entry.action === "block");
+  if (block && ratio >= block.at) return "critical";
+  const warns = list.filter((entry) => entry.action === "warn");
+  if (warns.length > 0 && ratio >= Math.min(...warns.map((entry) => entry.at))) return "warning";
+  return "normal";
+}
 
 function periodBounds(period: QuotaPeriod, now = new Date()): { start: Date; end: Date } {
   const start = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()));
@@ -755,9 +771,6 @@ export function UsersPanel({
   const selectedUser = selectedUserId ? users.find((user) => user.user_id === selectedUserId) ?? null : null;
 
   useEffect(() => { setSearchDraft(query); }, [query]);
-  useEffect(() => {
-    if (!enforcement) setStatusChanging(null);
-  }, [enforcement]);
 
   function setUserBusy(userId: string, busy: boolean) {
     setBusyUsers((current) => {
@@ -799,7 +812,17 @@ export function UsersPanel({
         if (isAdminUser(current) && current.user_id === user.user_id && current.version > user.version) {
           const reconciled = applyCanonicalUser(user, current);
           if (editing?.user_id === user.user_id) setEditing(reconciled);
-          if (statusChanging?.user_id === user.user_id) setStatusChanging(reconciled);
+          if (statusChanging?.user_id === user.user_id) {
+            if (current.status !== user.status) {
+              // The other writer already made the change this dialog was
+              // about to make. Re-opening it would offer the opposite
+              // action under the same heading, so close it and say why.
+              setStatusChanging(null);
+              message = statusFlipMessage(reconciled, caught.requestId);
+            } else {
+              setStatusChanging(reconciled);
+            }
+          }
         } else {
           message = apiErrorMessage(new ApiError(
             "The version conflict response did not identify the requested user.",
@@ -873,21 +896,27 @@ export function UsersPanel({
               onOpen={() => onSelectedUserChange(user.user_id)}
               onRequestStatus={() => changeStatus(user)}
               period={period}
-              statusActionAvailable={enforcement !== null}
               user={user}
             />
           ))}</tbody>
         </table>
-        {!loading && users.length === 0 && (error ? <UnavailableState label="Users unavailable" /> : <EmptyState hasFilters={Boolean(query) || filter !== "all"} />)}
+        {!loading && users.length === 0 && (error ? <UnavailableState label="Users unavailable" /> : <EmptyState hasFilters={Boolean(query) || filter !== "all"} hasNext={hasNext} />)}
       </div>
       <div className="pagination users-pagination"><p className="period-display-note"><Info aria-hidden="true" size={13} />Showing {period} usage · all enabled calendar periods are enforced concurrently</p><div><button className="button button-secondary" disabled={loading || !hasPrevious} onClick={onPrevious} type="button">Previous</button><button className="button button-secondary" disabled={loading || !hasNext} onClick={onNext} type="button">Next</button></div></div>
 
       {creating && <CreateUserWizard cfg={cfg} onClose={() => setCreating(false)} onCreated={(created, openDetails) => { onCreateUser?.(created, openDetails); setNotice(`${created.name || created.user_id} was created.`); }} session={session} />}
-      {selectedUser && <UserDetailDrawer cfg={cfg} onCanonical={onUserChanged} onClose={() => onSelectedUserChange(null)} onEdit={() => edit(selectedUser)} onStatus={() => changeStatus(selectedUser)} session={session} statusActionAvailable={enforcement !== null} suspended={Boolean(editing || statusChanging)} user={selectedUser} />}
+      {selectedUser && <UserDetailDrawer cfg={cfg} onCanonical={onUserChanged} onClose={() => onSelectedUserChange(null)} onEdit={() => edit(selectedUser)} onStatus={() => changeStatus(selectedUser)} session={session} suspended={Boolean(editing || statusChanging)} user={selectedUser} />}
       {editing && <LimitsDialog apiError={actionError} busy={busyUsers.has(editing.user_id)} key={`${editing.user_id}:${editing.version}`} onClose={() => setEditing(null)} onSave={(limits) => void saveLimits(editing, limits)} user={editing} />}
-      {statusChanging && enforcement && <StatusDialog apiError={actionError} busy={busyUsers.has(statusChanging.user_id)} enforcement={enforcement} key={`${statusChanging.user_id}:${statusChanging.version}`} onClose={() => setStatusChanging(null)} onConfirm={(reason) => void saveStatus(statusChanging, reason)} user={statusChanging} />}
+      {statusChanging && <StatusDialog apiError={actionError} busy={busyUsers.has(statusChanging.user_id)} enforcement={enforcement} key={`${statusChanging.user_id}:${statusChanging.version}`} onClose={() => setStatusChanging(null)} onConfirm={(reason) => void saveStatus(statusChanging, reason)} user={statusChanging} />}
     </section>
   );
+}
+
+/** Shown in place of the status dialog when a version conflict reveals that
+ *  another administrator already moved the subject to the requested status. */
+export function statusFlipMessage(current: UserRow, requestId: string | null): string {
+  const suffix = requestId ? ` Request ID: ${requestId}.` : "";
+  return `${displayName(current)} is already ${current.status} (changed by ${current.status_origin || "another session"}: ${current.status_reason || "no reason recorded"}). The confirmation was closed; the latest state is shown.${suffix}`;
 }
 
 export function WorkloadsPanel({
@@ -927,10 +956,6 @@ export function WorkloadsPanel({
   const configured = workloads.filter((entry) => entry.registered).length;
   const metered = workloads.filter((entry) => entry.subject !== null).length;
 
-  useEffect(() => {
-    if (!enforcement) setStatusChanging(null);
-  }, [enforcement]);
-
   function setSubjectBusy(id: string, value: boolean) {
     setBusy((current) => {
       const next = new Set(current);
@@ -962,7 +987,14 @@ export function WorkloadsPanel({
         if (isAdminUser(current) && current.user_id === subject.user_id && current.version > subject.version) {
           const reconciled = applyCanonical(subject, current);
           if (editing?.user_id === subject.user_id) setEditing(reconciled);
-          if (statusChanging?.user_id === subject.user_id) setStatusChanging(reconciled);
+          if (statusChanging?.user_id === subject.user_id) {
+            if (current.status !== subject.status) {
+              setStatusChanging(null);
+              message = statusFlipMessage(reconciled, caught.requestId);
+            } else {
+              setStatusChanging(reconciled);
+            }
+          }
         } else {
           message = apiErrorMessage(new ApiError("The version conflict response did not identify the requested workload.", 409, "invalid_response", undefined, caught.requestId));
         }
@@ -1015,7 +1047,6 @@ export function WorkloadsPanel({
               onOpen={() => entry.subject && onSelectedWorkloadChange(entry.workload_id)}
               onRequestStatus={() => { if (entry.subject) { setActionError(""); setNotice(""); setStatusChanging(entry.subject); } }}
               period={period}
-              statusActionAvailable={enforcement !== null}
             />
           ))}</tbody>
         </table>
@@ -1023,9 +1054,9 @@ export function WorkloadsPanel({
       </div>
       <div className="pagination users-pagination"><p className="period-display-note"><Info aria-hidden="true" size={13} />Showing {period} usage · roster from {meta ? formatOperationalLabel(meta.rosterSource) : "deployment"}{meta && <> · cost tag <code>{meta.tagKey}</code></>}</p><div /></div>
 
-      {selected && <UserDetailDrawer cfg={cfg} onCanonical={onSubjectChanged} onClose={() => onSelectedWorkloadChange(null)} onEdit={() => { setActionError(""); setNotice(""); setEditing(selected); }} onStatus={() => { setActionError(""); setNotice(""); setStatusChanging(selected); }} session={session} statusActionAvailable={enforcement !== null} suspended={Boolean(editing || statusChanging)} user={selected} />}
+      {selected && <UserDetailDrawer cfg={cfg} onCanonical={onSubjectChanged} onClose={() => onSelectedWorkloadChange(null)} onEdit={() => { setActionError(""); setNotice(""); setEditing(selected); }} onStatus={() => { setActionError(""); setNotice(""); setStatusChanging(selected); }} session={session} suspended={Boolean(editing || statusChanging)} user={selected} />}
       {editing && <LimitsDialog apiError={actionError} busy={busy.has(editing.user_id)} key={`${editing.user_id}:${editing.version}`} onClose={() => setEditing(null)} onSave={(limits) => void saveLimits(editing, limits)} user={editing} />}
-      {statusChanging && enforcement && <StatusDialog apiError={actionError} busy={busy.has(statusChanging.user_id)} enforcement={enforcement} key={`${statusChanging.user_id}:${statusChanging.version}`} onClose={() => setStatusChanging(null)} onConfirm={(reason) => void saveStatus(statusChanging, reason)} user={statusChanging} />}
+      {statusChanging && <StatusDialog apiError={actionError} busy={busy.has(statusChanging.user_id)} enforcement={enforcement} key={`${statusChanging.user_id}:${statusChanging.version}`} onClose={() => setStatusChanging(null)} onConfirm={(reason) => void saveStatus(statusChanging, reason)} user={statusChanging} />}
     </section>
   );
 }
@@ -1037,7 +1068,6 @@ function WorkloadTableRow({
   onOpen,
   onRequestStatus,
   period,
-  statusActionAvailable,
 }: {
   busy: boolean;
   entry: WorkloadEntry;
@@ -1045,7 +1075,6 @@ function WorkloadTableRow({
   onOpen: () => void;
   onRequestStatus: () => void;
   period: QuotaPeriod;
-  statusActionAvailable: boolean;
 }) {
   const subject = entry.subject;
   const enforcementState = workloadEnforcementLabel(entry);
@@ -1066,6 +1095,7 @@ function WorkloadTableRow({
               : <strong className="user-name-static" title={entry.name}>{entry.name}</strong>}
             <span title={entry.workload_id}>{entry.workload_id}</span>
             {highest && <span className={`highest-utilization highest-${highest.level}`}>Highest: {periodLabel(highest.period)} {highest.percent}%</span>}
+            {usage && <UnpricedBadge count={usage.unpriced_requests} period={period} />}
           </div>
         </div>
       </td>
@@ -1093,7 +1123,7 @@ function WorkloadTableRow({
           <span className="ops-status ops-status-plain ops-status-gray" title="Configured at deploy time; the quota row is created on the first metered invocation."><span aria-hidden="true" />Awaiting traffic</span>
         )}
       </td>
-      <td>{usage ? <QuotaUsage current={usage.cost_usd} enabled={limits !== null} format={(value) => formatUsd(value)} limit={limits?.usd ?? 0} /> : <span className="operations-muted">—</span>}</td>
+      <td>{usage ? <QuotaUsage current={usage.cost_usd} enabled={limits !== null} format={(value) => formatUsd(value)} limit={limits?.usd ?? 0} thresholds={limits?.thresholds} /> : <span className="operations-muted">—</span>}</td>
       <td className="request-count">{usage ? formatNumber(usage.requests) : "—"}</td>
       <td>
         <div className="row-actions">
@@ -1102,14 +1132,12 @@ function WorkloadTableRow({
           </IconButton>
           <IconButton
             danger={Boolean(subject) && isActive}
-            disabled={busy || !subject || !statusActionAvailable}
+            disabled={busy || !subject}
             label={!subject
               ? `${entry.name} has no quota row yet`
-              : !statusActionAvailable
-                ? `Status change unavailable for ${entry.name} until a fresh enforcement summary loads`
-                : isActive
-                  ? (entry.enforcement_ready ? `Block ${entry.name}` : `Record block for ${entry.name} (not enforced)`)
-                  : `Unblock ${entry.name}`}
+              : isActive
+                ? (entry.enforcement_ready ? `Block ${entry.name}` : `Record block for ${entry.name} (not enforced)`)
+                : `Unblock ${entry.name}`}
             onClick={onRequestStatus}
           >
             {busy ? <RefreshCw className="spin" aria-hidden="true" size={17} /> : isActive || !subject ? <Lock aria-hidden="true" size={17} /> : <Unlock aria-hidden="true" size={17} />}
@@ -1136,7 +1164,6 @@ function UserTableRow({
   onOpen,
   onRequestStatus,
   period,
-  statusActionAvailable,
   user,
 }: {
   busy: boolean;
@@ -1144,7 +1171,6 @@ function UserTableRow({
   onOpen: () => void;
   onRequestStatus: () => void;
   period: QuotaPeriod;
-  statusActionAvailable: boolean;
   user: UserRow;
 }) {
   const isActive = user.status === "active";
@@ -1161,6 +1187,7 @@ function UserTableRow({
             <button className="user-name-button" disabled={busy} onClick={onOpen} title={user.name} type="button">{displayName(user)}</button>
             <span title={user.user_id}>{user.user_id}</span>
             {highest && <span className={`highest-utilization highest-${highest.level}`}>Highest: {periodLabel(highest.period)} {highest.percent}%</span>}
+            <UnpricedBadge count={usage.unpriced_requests} period={period} />
           </div>
         </div>
       </td>
@@ -1186,6 +1213,7 @@ function UserTableRow({
           enabled={limits !== null}
           format={(value) => formatUsd(value)}
           limit={limits?.usd ?? 0}
+          thresholds={limits?.thresholds}
         />
       </td>
       <td>
@@ -1194,6 +1222,7 @@ function UserTableRow({
           enabled={limits !== null}
           format={formatCompact}
           limit={limits?.input_tokens ?? 0}
+          thresholds={limits?.thresholds}
         />
       </td>
       <td>
@@ -1202,6 +1231,7 @@ function UserTableRow({
           enabled={limits !== null}
           format={formatCompact}
           limit={limits?.output_tokens ?? 0}
+          thresholds={limits?.thresholds}
         />
       </td>
       <td className="request-count">{formatNumber(usage.requests)}</td>
@@ -1212,10 +1242,8 @@ function UserTableRow({
           </IconButton>
           <IconButton
             danger={isActive}
-            disabled={busy || !statusActionAvailable}
-            label={statusActionAvailable
-              ? `${isActive ? "Block" : "Unblock"} ${displayName(user)}`
-              : `Status change unavailable for ${displayName(user)} until a fresh enforcement summary loads`}
+            disabled={busy}
+            label={`${isActive ? "Block" : "Unblock"} ${displayName(user)}`}
             onClick={onRequestStatus}
           >
             {busy ? (
@@ -1237,11 +1265,14 @@ export function QuotaUsage({
   enabled = true,
   format,
   limit,
+  thresholds,
 }: {
   current: number;
   enabled?: boolean;
   format: (value: number) => string;
   limit: number;
+  /** The period's configured thresholds; omitted = deployment default. */
+  thresholds?: QuotaThreshold[];
 }) {
   if (!enabled) {
     return (
@@ -1264,7 +1295,7 @@ export function QuotaUsage({
   }
 
   const percentage = (current / limit) * 100;
-  const level = percentage >= 100 ? "critical" : percentage >= 80 ? "warning" : "normal";
+  const level = utilizationLevel(current / limit, thresholds);
   const roundedPercentage = Math.round(percentage);
 
   return (
@@ -1597,7 +1628,7 @@ export function LimitsDialog({
                     <input checked={draft[period].enabled} disabled={busy} onChange={(event) => changed(period, { enabled: event.target.checked })} type="checkbox" />
                     <span>{periodLabel(period)}</span>
                   </label>
-                  <small>Resets {formatTimestamp(user.current_usage[period].resets_at)}</small>
+                  <small>Resets {formatUtcTimestamp(user.current_usage[period].resets_at)}</small>
                 </legend>
                 <div className="field-grid">
                   <label><span>{periodLabel(period)} USD limit</span><div className="number-input"><span aria-hidden="true">$</span><input aria-describedby="limits-zero-help" aria-label={`${periodLabel(period)} USD limit`} disabled={busy || !draft[period].enabled} min="0" ref={index === 0 ? firstFieldRef : undefined} step="0.000001" type="number" value={draft[period].usd} onChange={(event) => changed(period, { usd: event.target.value })} /></div></label>
@@ -1710,7 +1741,9 @@ export function StatusDialog({
 }: {
   apiError: string;
   busy: boolean;
-  enforcement: Summary["enforcement"];
+  /** null when no fresh summary is available: the dialog still works, with
+   *  generic enforcement copy instead of the deployment's mode and window. */
+  enforcement: Summary["enforcement"] | null;
   onClose: () => void;
   onConfirm: (reason: string) => void;
   user: UserRow;
@@ -1778,8 +1811,9 @@ export function StatusDialog({
           <div className={`enforcement-warning${blocking ? " enforcement-warning-destructive" : ""}`} id="status-enforcement-message">
             <ShieldAlert aria-hidden="true" size={18} />
             <div>
-              <strong>{isWorkload(user) ? (recordOnly ? "Not enforced" : "IAM Deny on workload role") : `${formatOperationalLabel(enforcement.mode)} mode`}</strong>
+              <strong>{isWorkload(user) ? (recordOnly ? "Not enforced" : "IAM Deny on workload role") : enforcement ? `${formatOperationalLabel(enforcement.mode)} mode` : "Enforcement"}</strong>
               <p>{statusEnforcementMessage(enforcement, nextStatus, user)}</p>
+              {!enforcement && !isWorkload(user) && <p className="field-help">The enforcement summary is unavailable right now, so the exact lease window is not shown; the change itself is unaffected.</p>}
             </div>
           </div>
           <label className="reason-field">
@@ -1816,7 +1850,7 @@ export function StatusDialog({
 }
 
 export function statusEnforcementMessage(
-  enforcement: Summary["enforcement"],
+  enforcement: Summary["enforcement"] | null,
   nextStatus: UserStatus,
   user?: Pick<AdminUser, "user_id" | "granularity" | "workload"> & Partial<Pick<AdminUser, "status" | "status_origin" | "status_reason">>,
 ): string {
@@ -1841,6 +1875,9 @@ export function statusEnforcementMessage(
     return user && user.status !== undefined && isAutomaticBlock(user as Pick<AdminUser, "status" | "status_origin" | "status_reason">)
       ? `${base} ${AUTOMATIC_BLOCK_HINT}`
       : base;
+  }
+  if (!enforcement) {
+    return "Blocking prevents new credentials from being issued and requests active-session revocation. Existing permissions expire with their lease; revocation usually cuts them earlier, so bounded overspend is limited to whichever ends first.";
   }
   const window = formatDuration(enforcement.permission_lease_seconds);
   return `Blocking prevents new credentials from being issued and requests active-session revocation. Existing permissions expire with their lease (up to ${window} after detection); revocation usually cuts them earlier, so bounded overspend is limited to whichever ends first.`;
@@ -1998,7 +2035,18 @@ function UnavailableState({ label }: { label: string }) {
   );
 }
 
-function EmptyState({ hasFilters }: { hasFilters: boolean }) {
+function EmptyState({ hasFilters, hasNext }: { hasFilters: boolean; hasNext: boolean }) {
+  // The broker filters after it pages, so a page can be empty while later
+  // pages still hold matches: that is not "no users".
+  if (hasNext) {
+    return (
+      <div className="empty-state">
+        <Users aria-hidden="true" size={24} />
+        <strong>No users on this page</strong>
+        <span>Later pages may still contain matches; try Next.</span>
+      </div>
+    );
+  }
   return (
     <div className="empty-state">
       <Users aria-hidden="true" size={24} />
@@ -2023,8 +2071,8 @@ function initials(user: UserRow): string {
   return source.slice(0, 2).toUpperCase();
 }
 
-function highestUtilization(user: UserRow): { period: QuotaPeriod; percent: number; level: string } | null {
-  let highest: { period: QuotaPeriod; ratio: number } | null = null;
+export function highestUtilization(user: UserRow): { period: QuotaPeriod; percent: number; level: UtilizationLevel } | null {
+  let highest: { period: QuotaPeriod; ratio: number; thresholds?: QuotaThreshold[] } | null = null;
   for (const period of QUOTA_PERIODS) {
     const limits = user.limits[period];
     if (!limits) continue;
@@ -2035,22 +2083,17 @@ function highestUtilization(user: UserRow): { period: QuotaPeriod; percent: numb
       limits.output_tokens > 0 ? usage.output_tokens / limits.output_tokens : 0,
     ];
     const ratio = Math.max(...ratios);
-    if (highest === null || ratio > highest.ratio) highest = { period, ratio };
+    if (highest === null || ratio > highest.ratio) highest = { period, ratio, thresholds: limits.thresholds };
   }
   if (highest === null) return null;
   return {
     period: highest.period,
     percent: Math.round(highest.ratio * 100),
-    level: highest.ratio >= 1 ? "critical" : highest.ratio >= 0.8 ? "warning" : "normal",
+    level: utilizationLevel(highest.ratio, highest.thresholds),
   };
 }
 
 function periodLabel(period: QuotaPeriod): string {
   return period[0].toUpperCase() + period.slice(1);
-}
-
-function formatTimestamp(value: string): string {
-  const timestamp = new Date(value);
-  return Number.isNaN(timestamp.getTime()) ? "Invalid timestamp" : timestamp.toLocaleString();
 }
 

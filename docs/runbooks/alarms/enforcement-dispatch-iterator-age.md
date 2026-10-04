@@ -1,6 +1,6 @@
 # EnforcementDispatchIteratorAgeAlarm
 
-**Operations key:** `enforcement_dispatch_iterator_age` · **Metric:** Lambda `IteratorAge` on `EnforcementDispatcherFn`, Maximum ≥ 300 000 ms (5 min) over 5 min, 1 period.
+**Operations key:** `enforcement_dispatch_iterator_age` · **Alarm name:** `<stack>-enforcement-dispatch-iterator-age` · **Metric:** Lambda `IteratorAge` on `EnforcementDispatcherFn`, Maximum ≥ 300 000 ms (5 min) over 5 min, 1 period.
 
 ## What it means
 
@@ -70,4 +70,5 @@ Note that the alarm also fires benignly right after the stream is recreated
 ## Related
 
 - [enforcement-dispatch-dlq.md](enforcement-dispatch-dlq.md)
+- [enforcement-dispatcher-errors.md](enforcement-dispatcher-errors.md)
 - Component: [components/enforcement-dispatcher.md](../components/enforcement-dispatcher.md)

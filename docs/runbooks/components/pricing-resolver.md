@@ -2,7 +2,7 @@
 
 **Code:** `cdk/pricing_resolver/handler.py` — `handler` (CloudFormation
 custom resource `Custom::BedrockModelPriceSnapshot`, deploy-time) and
-`scheduled_handler` (`ModelPriceRefreshSchedule`, `rate(24 hours)`). Both
+`scheduled_handler` (`ModelPriceRefreshSchedule`, `rate(1 day)`). Both
 256 MB, 1 min timeout. **Log groups:** `/aws/lambda/<PriceResolverFn>`,
 `/aws/lambda/<PriceRefreshFn>`.
 
@@ -21,18 +21,24 @@ Ambiguity (two different rates for one dimension) **fails** the resolve.
 `price_overrides` are copied through verbatim. The conservative fallback is
 raised per dimension to the maximum known rate.
 
-- **Deploy-time:** the custom resource returns `ModelPricesJson` and
-  `FallbackPriceJson` as CloudFormation attributes; they seed the usage
-  processor's env and the SSM parameter `ModelPricesParameter`.
+- **Deploy-time:** the custom resource writes the resolved table itself to
+  the SSM parameter `/bedrock-spend-controls/<stack>/model-prices`
+  (Intelligent-Tiering; value `gz1:` + base64 of the gzipped JSON, see
+  `encode_parameter_value`) and returns only `ParameterName`,
+  `SnapshotDigest`, `ModelCount`, `ResolvedAt`, and `FallbackPriceJson` as
+  CloudFormation attributes. The fallback seeds the usage processor's env;
+  the digest and count appear in the `ModelPriceSnapshot` output.
 - **Daily:** `scheduled_handler` re-resolves with the same properties (the
   EventBridge rule input mirrors the custom resource properties) and
   overwrites the SSM parameter. The usage processor reads the parameter with
-  a 15-minute cache and keeps the last good value across failed reads.
+  a 15-minute cache and keeps the last good value across failed reads; it
+  has no built-in price table, so an unreadable parameter at a cold start
+  means fallback pricing (alarmed).
 
 ## IAM scope
 
 - `pricing:GetProducts` (`*` — the Pricing API has no resource-level permissions).
-- Refresher: `ssm:PutParameter` on the one prices parameter.
+- Both: `ssm:PutParameter` on the one prices parameter.
 
 ## Failure modes
 
@@ -40,7 +46,7 @@ raised per dimension to the maximum known rate.
 |---|---|---|
 | `cdk deploy` fails at `BedrockModelPriceSnapshot` | CloudFormation events | A `catalog_models` entry has zero or ambiguous standard on-demand rows in the target Region. Fix the catalog name (see `tools/bedrock_price_catalog.py --region <r>`) or pin the model in `price_overrides`. |
 | Daily refresh `Errors` = 1 | `PriceRefreshFn` Lambda `Errors` (no alarm configured) | Same ambiguity, or Pricing API throttling. Parameter left unchanged; metering continues on the previous value. **Add a CloudWatch alarm on this function's `Errors` if a stale catalog matters to you.** |
-| Prices look stale in metering | usage processor log `Model price parameter unavailable` | SSM read failing; processor uses last good value / built-in defaults. |
+| Prices look stale in metering | usage processor log `Model price parameter unavailable` | SSM read failing; the processor keeps its last good value, or prices at the fallback on a cold start. |
 | New dimension not priced | [pricing-fallback alarm](../alarms/pricing-fallback.md) | The Price List does not publish it for that model (Marketplace models) — pin it. |
 
 ## Manual operations
@@ -48,7 +54,7 @@ raised per dimension to the maximum known rate.
 - **See what the resolver would produce** without deploying (needs
   `pricing:GetProducts`):
   ```bash
-  cdk/.venv/bin/python - <<'PY'
+  python - <<'PY'
   import json, sys, boto3
   sys.path.insert(0, "cdk")
   from pricing_resolver import handler as r
@@ -60,6 +66,6 @@ raised per dimension to the maximum known rate.
   ```
 - **Force a refresh now:** `aws lambda invoke --function-name <PriceRefreshFn>
   --payload "$(aws events list-targets-by-rule --rule <ModelPriceRefreshSchedule rule name> --query 'Targets[0].Input' --output text)" --cli-binary-format raw-in-base64-out /dev/stdout`.
-- **Read the live parameter:** `aws ssm get-parameter --name <parameter> --query Parameter.Value --output text | python3 -m json.tool` (`resolved_at` shows the last successful refresh).
+- **Read the live parameter:** `aws ssm get-parameter --name <ModelPricesParameterName> --query Parameter.Value --output text | cut -c5- | base64 -d | gunzip | python3 -m json.tool` (`resolved_at` shows the last successful refresh).
 - **Discover Price List rows for a model/Region:**
-  `cdk/.venv/bin/python tools/bedrock_price_catalog.py --region eu-west-1 --format csv --output /tmp/prices.csv`.
+  `python3 tools/bedrock_price_catalog.py --region eu-west-1 --format csv --output "$TMPDIR/prices.csv"`.

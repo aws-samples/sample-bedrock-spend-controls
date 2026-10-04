@@ -24,6 +24,7 @@ breach and lifted automatically once the current minute is under the limit.
 
 from __future__ import annotations
 
+import math
 import re
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta, timezone
@@ -261,17 +262,27 @@ def normalize_thresholds(
         unknown = sorted(set(entry) - {"at", "at_bps", "action"})
         if unknown:
             raise ValueError(f"{label} has unknown keys: {', '.join(unknown)}")
+        # ``json.loads`` accepts the non-standard ``Infinity``/``NaN``
+        # literals; ``int()`` on those raises OverflowError/ValueError, so
+        # check finiteness before converting.
         if "at_bps" in entry:
             at_bps_raw = entry["at_bps"]
-            if isinstance(at_bps_raw, bool) or not isinstance(
-                at_bps_raw, (int, float)
-            ) or int(at_bps_raw) != at_bps_raw:
+            if (
+                isinstance(at_bps_raw, bool)
+                or not isinstance(at_bps_raw, (int, float))
+                or not math.isfinite(at_bps_raw)
+                or int(at_bps_raw) != at_bps_raw
+            ):
                 raise ValueError(f"{label}.at_bps must be an integer")
             at_bps = int(at_bps_raw)
         elif "at" in entry:
             at_raw = entry["at"]
-            if isinstance(at_raw, bool) or not isinstance(at_raw, (int, float)):
-                raise ValueError(f"{label}.at must be a number")
+            if (
+                isinstance(at_raw, bool)
+                or not isinstance(at_raw, (int, float))
+                or not math.isfinite(at_raw)
+            ):
+                raise ValueError(f"{label}.at must be a finite number")
             at_bps = ratio_to_bps(at_raw)
         else:
             raise ValueError(f"{label} needs an 'at' utilization ratio")
@@ -503,6 +514,11 @@ def evaluate_limits(
         block_bps = block_threshold_bps(thresholds)
         period_usage = usage.get(period, {})
         peak = 0.0
+        # (usage, limit) per enforced dimension, kept as integers so the
+        # warn comparison below is exact like the block comparison: 57 of
+        # 100 against a 57 % threshold must warn, which ``0.57 * 10_000``
+        # in floating point does not.
+        utilizations: list[tuple[int, int]] = []
         for dimension in DIMENSIONS:
             limit_key = "usd_micro" if dimension == "usd" else dimension
             limit = int(period_limits.get(limit_key, 0))
@@ -512,6 +528,7 @@ def evaluate_limits(
             ratio = current / limit
             ratios[f"{period}.{dimension}"] = ratio
             peak = max(peak, ratio)
+            utilizations.append((current, limit))
             if block_bps is not None and current * BPS >= block_bps * limit:
                 breaches.append(
                     QuotaBreach(
@@ -524,7 +541,10 @@ def evaluate_limits(
                     )
                 )
         for at_bps in warn_thresholds_bps(thresholds):
-            if peak * BPS >= at_bps:
+            if any(
+                current * BPS >= at_bps * limit
+                for current, limit in utilizations
+            ):
                 warnings.append(
                     ThresholdCrossing(
                         period=period,

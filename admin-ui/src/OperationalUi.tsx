@@ -20,6 +20,7 @@ import {
   AUTOMATIC_BLOCK_HINT,
   api,
   apiErrorMessage,
+  isAdminUser,
   isAutomaticBlock,
   normalizeUsd,
   thresholdsError,
@@ -36,7 +37,7 @@ import {
   type UserRow,
   type WorkloadIdentity,
 } from "./api";
-import { formatNumber, formatRatioPercent, formatUsd } from "./format";
+import { formatNumber, formatRatioPercent, formatUsd, formatUtcTimestamp } from "./format";
 import { useModalLifecycle } from "./modal";
 
 const PAGE_SIZE = 25;
@@ -74,6 +75,20 @@ function ErrorMessage({ message }: { message: string }) {
 
 function BusyLabel({ children }: { children: string }) {
   return <span className="inline-busy"><RefreshCw className="spin" aria-hidden="true" size={16} />{children}</span>;
+}
+
+export const UNPRICED_HINT = "Requests whose USD could not be fully priced because a dimension had no catalog rate. The spend shown is an undercount until the pricing catalog is repaired; see tools/unpriced_usage.py.";
+
+/** Warning chip for a usage row whose spend is known to be incomplete.
+ *  Renders nothing when the count is zero or the broker omitted the field. */
+export function UnpricedBadge({ count, period }: { count: number | undefined; period?: QuotaPeriod }) {
+  if (!count || count <= 0) return null;
+  return (
+    <span className="ops-status ops-status-amber unpriced-badge" role="status" title={UNPRICED_HINT}>
+      <span aria-hidden="true" />
+      {formatNumber(count)} unpriced {count === 1 ? "request" : "requests"}{period ? ` this ${period} window` : ""} · spend undercounted
+    </span>
+  );
 }
 
 
@@ -401,11 +416,12 @@ function UsageTab({ active, cfg, session, userId }: { active: boolean; cfg: Admi
       {rangeError && <ErrorMessage message={rangeError} />}
       {error && <ErrorMessage message={error} />}
       {error && page && <span className="ops-status ops-status-amber"><span aria-hidden="true" />Showing the previous usage page</span>}
+      {page && <UnpricedBadge count={page.usage.reduce((sum, row) => sum + (row.unpriced_requests ?? 0), 0)} />}
       {loading && !page ? <div className="drawer-loading"><BusyLabel>Loading usage</BusyLabel></div> : page && (
         <>
           <div aria-label={`${periodLabel(period)} usage history`} className="drawer-table-scroll" role="region" tabIndex={0}>
-            <table className="compact-table"><thead><tr><th>Window start</th><th>Resets</th><th>USD</th><th>Input tokens</th><th>Output tokens</th><th>Requests</th></tr></thead><tbody>
-              {page.usage.map((row) => <tr key={row.window}><td>{row.window}</td><td>{formatTimestamp(row.resets_at)}</td><td>{formatUsd(row.cost_usd)}</td><td>{formatNumber(row.input_tokens)}</td><td>{formatNumber(row.output_tokens)}</td><td>{formatNumber(row.requests)}</td></tr>)}
+            <table className="compact-table"><thead><tr><th>Window start</th><th>Resets (UTC)</th><th>USD</th><th>Input tokens</th><th>Output tokens</th><th>Requests</th><th>Unpriced</th></tr></thead><tbody>
+              {page.usage.map((row) => <tr key={row.window}><td>{row.window}</td><td>{formatUtcTimestamp(row.resets_at)}</td><td>{formatUsd(row.cost_usd)}</td><td>{formatNumber(row.input_tokens)}</td><td>{formatNumber(row.output_tokens)}</td><td>{formatNumber(row.requests)}</td><td>{row.unpriced_requests ? <span className="unpriced-count" title={UNPRICED_HINT}>{formatNumber(row.unpriced_requests)}</span> : "0"}</td></tr>)}
             </tbody></table>
             {page.usage.length === 0 && <div className="compact-empty">No usage was recorded in this date range.</div>}
           </div>
@@ -516,7 +532,6 @@ export function UserDetailDrawer({
   onClose,
   onEdit,
   onStatus,
-  statusActionAvailable = true,
   suspended = false,
 }: {
   cfg: AdminConfig;
@@ -526,7 +541,6 @@ export function UserDetailDrawer({
   onClose: () => void;
   onEdit: () => void;
   onStatus: () => void;
-  statusActionAvailable?: boolean;
   suspended?: boolean;
 }) {
   const [tab, setTab] = useState<DrawerTab>("overview");
@@ -593,9 +607,8 @@ export function UserDetailDrawer({
           <div className="drawer-actions">
             <button className="button button-secondary" onClick={onEdit} type="button"><Pencil aria-hidden="true" size={16} />Edit limits</button>
             <button
-              aria-label={statusActionAvailable ? blockLabel : "Status change unavailable until a fresh enforcement summary loads"}
+              aria-label={blockLabel}
               className={`button ${user.status === "active" ? "button-danger" : "button-primary"}`}
-              disabled={!statusActionAvailable}
               onClick={onStatus}
               type="button"
             >
@@ -605,7 +618,7 @@ export function UserDetailDrawer({
           </div>
           {workload && <WorkloadIdentitySection workload={workload} />}
           <section><h3>Identity and status</h3><dl className="detail-list"><div><dt>Status</dt><dd><span className={`status-badge status-${user.status}`}><span aria-hidden="true" />{user.status}</span></dd></div><div><dt>Status origin</dt><dd>{user.status_origin || "Not provided"}</dd></div><div><dt>Status reason</dt><dd>{user.status_reason || "Not provided"}</dd></div>{isAutomaticBlock(user) && <div><dt>Lifts</dt><dd>{AUTOMATIC_BLOCK_HINT}</dd></div>}<div><dt>Created</dt><dd>{formatTimestamp(user.created_at)}</dd></div><div><dt>Updated</dt><dd>{formatTimestamp(user.updated_at)}</dd></div><div><dt>Version</dt><dd>{user.version}</dd></div></dl></section>
-          <section><h3>Calendar quota windows</h3><div className="detail-periods">{QUOTA_PERIODS.map((period) => { const limits = user.limits[period]; const usage = detailUsage[period]; const thresholds = limits?.thresholds ?? []; const alertOnly = thresholds.length > 0 && thresholds.every((entry) => entry.action !== "block"); return <article className="detail-period" key={period}><div><h4>{periodLabel(period)}</h4><span>Resets {formatTimestamp(usage.resets_at)}</span></div>{limits ? <dl className="detail-list"><div><dt>USD</dt><dd>{formatUsd(usage.cost_usd)} of {formatLimit(limits.usd, (value) => formatUsd(value))}</dd></div><div><dt>Input tokens</dt><dd>{formatNumber(usage.input_tokens)} of {formatLimit(limits.input_tokens, (value) => formatNumber(value))}</dd></div><div><dt>Output tokens</dt><dd>{formatNumber(usage.output_tokens)} of {formatLimit(limits.output_tokens, (value) => formatNumber(value))}</dd></div><div><dt>Requests</dt><dd>{formatNumber(usage.requests)}</dd></div><div><dt>Thresholds</dt><dd>{thresholds.length > 0 ? thresholds.map((entry) => `${formatRatioPercent(entry.at)} ${entry.action}`).join(", ") : "default"}{alertOnly && <span className="ops-status ops-status-amber"> alert-only</span>}</dd></div></dl> : <p className="operations-muted">Disabled</p>}</article>; })}</div></section>
+          <section><h3>Calendar quota windows</h3><div className="detail-periods">{QUOTA_PERIODS.map((period) => { const limits = user.limits[period]; const usage = detailUsage[period]; const thresholds = limits?.thresholds ?? []; const alertOnly = thresholds.length > 0 && thresholds.every((entry) => entry.action !== "block"); return <article className="detail-period" key={period}><div><h4>{periodLabel(period)}</h4><span>Resets {formatUtcTimestamp(usage.resets_at)}</span></div>{limits ? <dl className="detail-list"><div><dt>USD</dt><dd>{formatUsd(usage.cost_usd)} of {formatLimit(limits.usd, (value) => formatUsd(value))}</dd></div><div><dt>Input tokens</dt><dd>{formatNumber(usage.input_tokens)} of {formatLimit(limits.input_tokens, (value) => formatNumber(value))}</dd></div><div><dt>Output tokens</dt><dd>{formatNumber(usage.output_tokens)} of {formatLimit(limits.output_tokens, (value) => formatNumber(value))}</dd></div><div><dt>Requests</dt><dd>{formatNumber(usage.requests)}</dd></div>{(usage.unpriced_requests ?? 0) > 0 && <div><dt>Unpriced requests</dt><dd><UnpricedBadge count={usage.unpriced_requests} /></dd></div>}<div><dt>Thresholds</dt><dd>{thresholds.length > 0 ? thresholds.map((entry) => `${formatRatioPercent(entry.at)} ${entry.action}`).join(", ") : "default"}{alertOnly && <span className="ops-status ops-status-amber"> alert-only</span>}</dd></div></dl> : <p className="operations-muted">Disabled</p>}</article>; })}</div></section>
           <section><h3>Rate limits</h3><dl className="detail-list"><div><dt>Requests per minute</dt><dd>{user.rate?.rpm ? formatNumber(user.rate.rpm) : "Unlimited"}</dd></div><div><dt>Tokens per minute</dt><dd>{user.rate?.tpm ? formatNumber(user.rate.tpm) : "Unlimited"}</dd></div></dl></section>
           <ModelBudgetsSection cfg={cfg} onCanonical={onCanonical} session={session} user={user} />
         </div>
@@ -701,11 +714,36 @@ export function ModelBudgetsSection({
 }) {
   const [draft, setDraft] = useState<ModelBudgetDraft | null>(null);
   const [editing, setEditing] = useState<string | null>(null);
+  const [unlimitedConfirmed, setUnlimitedConfirmed] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   const [usage, setUsage] = useState<Record<string, CurrentUsage>>({});
   const budgets = user.model_budgets ?? {};
   const modelIds = Object.keys(budgets).sort();
+
+  // Same rule as the create wizard and the limits editor: a 0 dimension on
+  // an enabled period is Unlimited and has to be acknowledged, not defaulted
+  // into (the empty draft starts at 0/0/0).
+  const parsedDraft = draft ? parseModelBudgetDraft(draft) : null;
+  const unlimitedFields = parsedDraft && "limits" in parsedDraft
+    ? QUOTA_PERIODS.flatMap((period) => {
+      const value = parsedDraft.limits[period];
+      if (!value) return [];
+      return (["usd", "input_tokens", "output_tokens"] as const)
+        .filter((dimension) => value[dimension] === 0)
+        .map((dimension) => `${period} ${dimension.replace(/_/g, " ")}`);
+    })
+    : [];
+
+  /** A 409 carries the broker's current row; applying it refreshes the
+   *  drawer's version so the retry carries a matching If-Match. */
+  function reconcileConflict(caught: unknown): boolean {
+    if (!(caught instanceof ApiError) || caught.status !== 409 || caught.code !== "version_conflict") return false;
+    const current = (caught.details as { current_user?: unknown } | undefined)?.current_user;
+    if (!isAdminUser(current) || current.user_id !== user.user_id || current.version <= user.version) return false;
+    onCanonical(current);
+    return true;
+  }
 
   useEffect(() => {
     let active = true;
@@ -725,6 +763,7 @@ export function ModelBudgetsSection({
     if (modelId.startsWith("arn:")) { setError("Use the model ID, not an ARN."); return; }
     const parsed = parseModelBudgetDraft(draft);
     if ("error" in parsed) { setError(parsed.error); return; }
+    if (unlimitedFields.length > 0 && !unlimitedConfirmed) { setError("Confirm that every 0 limit in this model budget should be Unlimited."); return; }
     setBusy(true);
     setError("");
     try {
@@ -732,7 +771,9 @@ export function ModelBudgetsSection({
       onCanonical(result.data.user);
       setDraft(null);
       setEditing(null);
+      setUnlimitedConfirmed(false);
     } catch (caught) {
+      reconcileConflict(caught);
       setError(apiErrorMessage(caught));
     } finally {
       setBusy(false);
@@ -748,6 +789,7 @@ export function ModelBudgetsSection({
       const result = await api.removeModelBudget(cfg, session, user, modelId, reason);
       onCanonical(result.data.user);
     } catch (caught) {
+      reconcileConflict(caught);
       setError(apiErrorMessage(caught));
     } finally {
       setBusy(false);
@@ -756,6 +798,7 @@ export function ModelBudgetsSection({
 
   function setPeriod(period: QuotaPeriod, patch: Partial<ModelBudgetPeriodDraft>) {
     setDraft((current) => current ? { ...current, periods: { ...current.periods, [period]: { ...current.periods[period], ...patch } } } : current);
+    setUnlimitedConfirmed(false);
     setError("");
   }
 
@@ -811,9 +854,18 @@ export function ModelBudgetsSection({
               </fieldset>
             ))}
           </div>
+          {unlimitedFields.length > 0 && (
+            <div className="safety-warning safety-warning-critical">
+              <ShieldAlert aria-hidden="true" size={18} />
+              <label>
+                <input checked={unlimitedConfirmed} disabled={busy} onChange={(event) => setUnlimitedConfirmed(event.target.checked)} type="checkbox" />
+                <span>I confirm the {unlimitedFields.join(", ")} limit{unlimitedFields.length === 1 ? "" : "s"} of this model budget should be Unlimited (0 never blocks).</span>
+              </label>
+            </div>
+          )}
           <label className="reason-field"><span>Reason</span><textarea aria-label="Model budget reason" disabled={busy} onChange={(event) => setDraft((current) => current ? { ...current, reason: event.target.value } : current)} rows={2} value={draft.reason} /></label>
           <div className="dialog-actions">
-            <button className="button button-secondary" disabled={busy} onClick={() => { setDraft(null); setEditing(null); setError(""); }} type="button">Cancel</button>
+            <button className="button button-secondary" disabled={busy} onClick={() => { setDraft(null); setEditing(null); setUnlimitedConfirmed(false); setError(""); }} type="button">Cancel</button>
             <button className="button button-primary" disabled={busy} type="submit">{busy ? <BusyLabel>Saving</BusyLabel> : editing ? "Save model budget" : "Add model budget"}</button>
           </div>
         </form>
@@ -886,13 +938,17 @@ export function GlobalAuditView({ cfg, session, onTargetUser }: { cfg: AdminConf
   </section>;
 }
 
-export function LiveLeases({ cfg, configuration, session }: {
+export function LiveLeases({ cfg, configuration, session, pollIntervalMs = 5000 }: {
   cfg: AdminConfig;
   configuration: Operations["configuration"];
   session: Session;
+  pollIntervalMs?: number;
 }) {
   const [rows, setRows] = useState<AdminUser[]>([]);
   const [loaded, setLoaded] = useState(false);
+  const [loadedAt, setLoadedAt] = useState<number | null>(null);
+  const [pollError, setPollError] = useState("");
+  const [truncated, setTruncated] = useState(false);
   const [now, setNow] = useState(() => Date.now());
   const generations = useRef<Record<string, number>>({});
   const renewedAt = useRef<Record<string, number>>({});
@@ -913,21 +969,28 @@ export function LiveLeases({ cfg, configuration, session }: {
         }
         setRows(page.users);
         setLoaded(true);
-      } catch {
-        // Keep the previous rows; the next poll retries.
+        setLoadedAt(Date.now());
+        setPollError("");
+        // leaseSnapshot follows next_cursor up to its page bound; a non-null
+        // cursor means subjects beyond that bound are not shown.
+        setTruncated(page.next_cursor !== null);
+      } catch (caught) {
+        if (cancelled) return;
+        // Keep the previous rows so countdowns stay visible, but say so: a
+        // silent failure would let stale deadlines pass for live ones.
+        setPollError(apiErrorMessage(caught));
       }
     }
     void poll();
-    const interval = window.setInterval(poll, 5000);
+    const interval = window.setInterval(poll, pollIntervalMs);
     return () => { cancelled = true; window.clearInterval(interval); };
-  }, [cfg, session]);
+  }, [cfg, session, pollIntervalMs]);
 
   useEffect(() => {
     const tick = window.setInterval(() => setNow(Date.now()), 1000);
     return () => window.clearInterval(tick);
   }, []);
 
-  const leaseSeconds = configuration.permission_lease_seconds;
   const stsSeconds = configuration.credential_ttl_seconds;
   const active = rows.filter((user) => user.lease !== null && user.lease !== undefined);
   const clock = (iso: string) => new Date(iso).toISOString().slice(11, 19);
@@ -938,13 +1001,29 @@ export function LiveLeases({ cfg, configuration, session }: {
         <RefreshCw aria-hidden="true" size={16} />
         <strong>Live leases</strong>
         <span>Currently vended credentials, updated every 5 seconds: grant time, time left on the lease, and renewals as they happen.</span>
+        {pollError && loaded && loadedAt !== null && (
+          <span className="ops-status ops-status-amber" role="status">
+            <span aria-hidden="true" />
+            Stale · last update {clock(new Date(loadedAt).toISOString())} UTC · refresh failed
+          </span>
+        )}
+        {truncated && (
+          <span className="ops-status ops-status-amber" role="status" title="The list endpoint pages at 50 subjects; the poll follows a bounded number of pages.">
+            <span aria-hidden="true" />
+            Showing the first {rows.length} subjects; more exist
+          </span>
+        )}
       </div>
+      {pollError && !loaded && <ErrorMessage message={`Lease state unavailable: ${pollError}`} />}
       {!loaded ? (
-        <p className="operations-muted">Loading lease state…</p>
+        !pollError && <p className="operations-muted">Loading lease state…</p>
       ) : active.length === 0 ? (
         <p className="operations-muted">No vended credentials right now. Leases appear here the moment a user vends.</p>
       ) : active.map((user) => {
         const lease = user.lease!;
+        // The lease carries its own duration: a dial change applies only to
+        // new leases, so outstanding ones must not be measured against it.
+        const leaseSeconds = lease.lease_seconds > 0 ? lease.lease_seconds : configuration.permission_lease_seconds;
         const expires = new Date(lease.expires_at).getTime();
         const granted = new Date(lease.granted_at).getTime();
         const remaining = Math.max(0, Math.round((expires - now) / 1000));

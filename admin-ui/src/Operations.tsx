@@ -21,6 +21,7 @@ import {
   api,
   apiErrorMessage,
   type EmergencyAction,
+  type EmergencyStopState,
   type EnforcementConfig,
   type Operations,
   type ReconciliationResponse,
@@ -33,6 +34,27 @@ const EMERGENCY_CONFIRMATIONS: Record<EmergencyAction, string> = {
   activate: "STOP_ALL_BEDROCK_SESSIONS",
   recover: "RESTORE_ALL_BEDROCK_SESSIONS",
 };
+
+/** After an activate/recover request the card re-reads GET /admin/emergency-stop
+ *  on this cadence until the state settles, giving up after the cap. */
+export const EMERGENCY_POLL_INTERVAL_MS = 5_000;
+export const EMERGENCY_POLL_MAX_MS = 5 * 60 * 1_000;
+
+/** `activating` / `recovering` are in flight; `active` / `inactive` are settled. */
+export function emergencySettled(state: string): boolean {
+  return state === "active" || state === "inactive";
+}
+
+/** Alarm keys arrive as `snake_case` from OPERATIONS_ALARM_NAMES_JSON. Any key
+ *  is rendered (new alarms need no console change); the label is the key with
+ *  spaces and the common acronyms in capitals. */
+export function humanizeAlarmKey(key: string): string {
+  return key
+    .split("_")
+    .filter((part) => part.length > 0)
+    .map((part) => (part === "dlq" || part === "iam" || part === "sns" || part === "sqs") ? part.toUpperCase() : part)
+    .join(" ");
+}
 
 export function leaseWindowLabel(seconds: number): string {
   if (seconds % 60 === 0) {
@@ -484,21 +506,104 @@ export function EnforcementDialCard({
   );
 }
 
+/** What the card knows about the break-glass state, from whichever source is
+ *  freshest: the operations payload (with convergence bookkeeping), the raw
+ *  GET /admin/emergency-stop fallback, or a post-request poll. */
+type KnownEmergencyState = EmergencyStopState & Partial<Pick<Operations["emergency"], "applied_generation" | "applied_at" | "converged">>;
+
 export function EmergencyStopCard({
   cfg,
   session,
   emergency,
   onApplied,
+  pollIntervalMs = EMERGENCY_POLL_INTERVAL_MS,
+  pollMaxMs = EMERGENCY_POLL_MAX_MS,
 }: {
   cfg: AdminConfig;
   session: Session;
   emergency: Operations["emergency"] | null;
   onApplied: () => void;
+  pollIntervalMs?: number;
+  pollMaxMs?: number;
 }) {
   const [dialogAction, setDialogAction] = useState<EmergencyAction | null>(null);
   const [notice, setNotice] = useState("");
-  const active = emergency?.desired_active ?? false;
-  const tone = emergency === null ? "gray" : active ? "red" : emergency.converged ? "green" : "amber";
+  // Raw state read directly when the operations payload is unavailable, so
+  // the buttons do not depend on CloudWatch-backed telemetry.
+  const [fallback, setFallback] = useState<EmergencyStopState | null>(null);
+  const [fallbackError, setFallbackError] = useState("");
+  // Latest acknowledgement or poll result after a request from this card.
+  const [polled, setPolled] = useState<EmergencyStopState | null>(null);
+  const [pollingSince, setPollingSince] = useState<number | null>(null);
+  const [pollError, setPollError] = useState("");
+  const [pollTimedOut, setPollTimedOut] = useState(false);
+
+  const operationsAvailable = emergency !== null;
+  useEffect(() => {
+    if (operationsAvailable) {
+      setFallback(null);
+      setFallbackError("");
+      return;
+    }
+    let cancelled = false;
+    setFallbackError("");
+    api.getEmergencyStop(cfg, session)
+      .then((state) => { if (!cancelled) setFallback(state); })
+      .catch((caught) => { if (!cancelled) setFallbackError(apiErrorMessage(caught)); });
+    return () => { cancelled = true; };
+  }, [operationsAvailable, cfg, session]);
+
+  useEffect(() => {
+    if (pollingSince === null) return;
+    let cancelled = false;
+    let timer = 0;
+    async function tick() {
+      try {
+        const next = await api.getEmergencyStop(cfg, session);
+        if (cancelled) return;
+        setPolled(next);
+        setPollError("");
+        if (emergencySettled(next.state)) {
+          setPollingSince(null);
+          setNotice(next.desired_active
+            ? "Emergency stop is active: all Bedrock credentials and sessions are denied."
+            : "Emergency stop is inactive: Bedrock access is restored for identities that are not individually blocked.");
+          onApplied();
+          return;
+        }
+      } catch (caught) {
+        if (cancelled) return;
+        setPollError(apiErrorMessage(caught));
+      }
+      if (Date.now() - (pollingSince as number) >= pollMaxMs) {
+        setPollingSince(null);
+        setPollTimedOut(true);
+        return;
+      }
+      timer = window.setTimeout(() => void tick(), pollIntervalMs);
+    }
+    timer = window.setTimeout(() => void tick(), pollIntervalMs);
+    return () => { cancelled = true; window.clearTimeout(timer); };
+  }, [pollingSince]);
+
+  // A poll result wins while a request is settling, or when it is newer than
+  // the last operations payload; otherwise the operations payload (which
+  // carries convergence bookkeeping) or the raw fallback.
+  const known: KnownEmergencyState | null = polled && (pollingSince !== null || !emergency || polled.generation > emergency.generation)
+    ? polled
+    : emergency ?? fallback;
+  const active = known?.desired_active ?? false;
+  const settled = known !== null && emergencySettled(known.state) && (known.converged ?? true);
+  const tone = known === null ? "gray" : active ? "red" : settled ? "green" : "amber";
+  const polling = pollingSince !== null;
+
+  function startPolling(acknowledgement: EmergencyStopState) {
+    setPolled(acknowledgement);
+    setPollError("");
+    setPollTimedOut(false);
+    if (emergencySettled(acknowledgement.state)) return;
+    setPollingSince(Date.now());
+  }
 
   return (
     <article aria-labelledby="emergency-title" className="control-card control-card-emergency">
@@ -507,34 +612,45 @@ export function EmergencyStopCard({
           <OctagonX aria-hidden="true" size={19} />
           <strong id="emergency-title">Emergency stop</strong>
         </div>
-        <span className={`ops-status ops-status-${tone}`}>
+        <span aria-label="Emergency stop state" className={`ops-status ops-status-${tone}`} role="status">
           <span aria-hidden="true" />
-          {emergency ? formatOperationalLabel(emergency.state) : "unknown"}
+          {known ? formatOperationalLabel(known.state) : "unknown"}
+          {polling && " · checking every few seconds"}
         </span>
       </div>
       <p className="control-card-help">
         Break-glass control: denies every Bedrock credential and active session for all
-        identities at once. Requires the separate emergency key — the console never stores it.
+        identities at once. Requires the separate emergency key, typed by the operator for
+        each action and never stored by the console.
       </p>
-      {emergency && (
+      {known && (
         <dl className="control-meta">
-          <div><dt>Converged</dt><dd>{emergency.converged ? "Yes" : "No"}</dd></div>
-          <div><dt>Generation</dt><dd>{emergency.applied_generation} / {emergency.generation}</dd></div>
-          <div><dt>Requested</dt><dd>{formatTimestamp(emergency.requested_at)}</dd></div>
-          <div><dt>Applied</dt><dd>{formatTimestamp(emergency.applied_at)}</dd></div>
+          <div><dt>Converged</dt><dd>{known.converged === undefined ? (emergencySettled(known.state) ? "Yes" : "Pending") : known.converged ? "Yes" : "No"}</dd></div>
+          <div><dt>Generation</dt><dd>{known.applied_generation === undefined ? known.generation : `${known.applied_generation} / ${known.generation}`}</dd></div>
+          <div><dt>Requested</dt><dd>{formatTimestamp(known.requested_at ?? null)}</dd></div>
+          {known.applied_at !== undefined && <div><dt>Applied</dt><dd>{formatTimestamp(known.applied_at)}</dd></div>}
+          {!operationsAvailable && <div><dt>Source</dt><dd>Direct read; operational telemetry is unavailable</dd></div>}
         </dl>
       )}
+      {fallbackError && !known && <ErrorMessage message={`Emergency state unavailable: ${fallbackError}`} />}
       <div className="control-actions">
         {active ? (
-          <button className="button button-primary" disabled={!emergency} onClick={() => setDialogAction("recover")} type="button">
+          <button className="button button-primary" disabled={!known} onClick={() => setDialogAction("recover")} type="button">
             Recover from emergency stop
           </button>
         ) : (
-          <button className="button button-danger" disabled={!emergency} onClick={() => setDialogAction("activate")} type="button">
+          <button className="button button-danger" disabled={!known} onClick={() => setDialogAction("activate")} type="button">
             Activate emergency stop
           </button>
         )}
       </div>
+      {pollError && polling && <span className="ops-status ops-status-amber" role="status"><span aria-hidden="true" />Last state check failed; retrying. {pollError}</span>}
+      {pollTimedOut && (
+        <ErrorMessage
+          dismiss={() => setPollTimedOut(false)}
+          message={`The emergency state has not settled after ${Math.round(pollMaxMs / 60_000)} minutes. Check the emergency failure and DLQ alarms, then refresh.`}
+        />
+      )}
       {notice && <SuccessMessage message={notice} dismiss={() => setNotice("")} />}
       {dialogAction && (
         <EmergencyDialog
@@ -545,7 +661,8 @@ export function EmergencyStopCard({
             setDialogAction(null);
             setNotice(state.idempotent
               ? "The emergency state already matched this request; nothing changed."
-              : `Emergency ${dialogAction === "activate" ? "stop" : "recovery"} requested. Convergence is reconciled automatically; watch the status above.`);
+              : `Emergency ${dialogAction === "activate" ? "stop" : "recovery"} requested. The console re-checks the state every ${Math.round(pollIntervalMs / 1_000)} seconds until it settles.`);
+            startPolling(state);
             onApplied();
           }}
           session={session}
@@ -565,7 +682,7 @@ function EmergencyDialog({
   action: EmergencyAction;
   cfg: AdminConfig;
   onClose: () => void;
-  onRequested: (state: { idempotent?: boolean }) => void;
+  onRequested: (state: EmergencyStopState) => void;
   session: Session;
 }) {
   const [emergencyKey, setEmergencyKey] = useState("");
@@ -586,12 +703,17 @@ function EmergencyDialog({
     if (!ready) return;
     setBusy(true);
     setError("");
+    const key = emergencyKey.trim();
+    // The key lives in component state only for the duration of this
+    // request: it is dropped before the response is shown, whether the
+    // broker accepted it or not.
+    setEmergencyKey("");
     try {
       const state = await api.setEmergencyStop(cfg, session, {
         action,
         confirmation,
         reason,
-        emergencyKey: emergencyKey.trim(),
+        emergencyKey: key,
       });
       onRequested(state);
     } catch (caught) {
@@ -599,6 +721,12 @@ function EmergencyDialog({
       setBusy(false);
     }
   }
+
+  // After a rejected request the (cleared) key field takes focus again once
+  // the form is re-enabled, so the operator can re-enter it straight away.
+  useEffect(() => {
+    if (error && !busy) keyRef.current?.focus();
+  }, [error, busy]);
 
   return (
     <div className="dialog-backdrop" onMouseDown={(event) => {
@@ -638,16 +766,18 @@ function EmergencyDialog({
           <label className="reason-field">
             <span>Emergency key <strong aria-hidden="true">*</strong></span>
             <input
+              aria-describedby="emergency-key-help"
               aria-label="Emergency key"
-              autoComplete="off"
+              autoComplete="new-password"
               disabled={busy}
               onChange={(event) => { setEmergencyKey(event.target.value); setError(""); }}
               ref={keyRef}
+              spellCheck={false}
               type="password"
               value={emergencyKey}
             />
           </label>
-          <p className="field-help">The separate break-glass secret. It is sent only with this request and never stored by the console.</p>
+          <p className="field-help" id="emergency-key-help">Used for this action only: sent in the request header, cleared from the form on submit, and never stored by the console or offered to the browser&apos;s password manager.</p>
           <label className="reason-field">
             <span>Type <code>{expectedConfirmation}</code> to confirm <strong aria-hidden="true">*</strong></span>
             <input
@@ -816,7 +946,7 @@ export function OperationsView({
         {operations.alarms.length ? operations.alarms.map((alarm) => (
           <span className={`ops-status ops-status-${alarmTone(alarm.state)}`} key={alarm.key} title={alarm.updated_at ? `Updated ${formatTimestamp(alarm.updated_at)}` : "No state timestamp"}>
             <span aria-hidden="true" />
-            {formatOperationalLabel(alarm.key)}: {formatOperationalLabel(alarm.state)}
+            {humanizeAlarmKey(alarm.key)}: {formatOperationalLabel(alarm.state)}
           </span>
         )) : <span className="operations-muted">No alarm metadata configured.</span>}
       </div>

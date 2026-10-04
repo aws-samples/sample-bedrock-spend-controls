@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { act, render, screen, waitFor } from "@testing-library/react";
+import { act, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { describe, expect, it, vi } from "vitest";
 import { CreateUserWizard, GlobalAuditView, UserDetailDrawer } from "./OperationalUi";
@@ -238,7 +238,14 @@ describe("user detail drawer", () => {
     await actor.type(input, "1000");
     await actor.type(screen.getByLabelText("Model budget daily thresholds"), "50:warn,100:block");
     await actor.type(screen.getByLabelText("Model budget reason"), "Cheap model, tight cap");
-    await actor.click(screen.getByRole("button", { name: "Add model budget" }));
+    // Output tokens stayed at 0: that is Unlimited and must be acknowledged,
+    // exactly as in the create wizard and the limits editor.
+    const submit = screen.getByRole("button", { name: "Add model budget" });
+    await actor.click(submit);
+    expect(screen.getByRole("alert")).toHaveTextContent("Confirm that every 0 limit in this model budget should be Unlimited.");
+    expect(setModelBudget).not.toHaveBeenCalled();
+    await actor.click(screen.getByRole("checkbox", { name: /daily output tokens limit of this model budget should be Unlimited/ }));
+    await actor.click(submit);
 
     await waitFor(() => expect(setModelBudget).toHaveBeenCalledWith(
       cfg, session, expect.objectContaining({ user_id: alice.user_id, version: 2 }), "openai.gpt-oss-20b",
@@ -253,6 +260,63 @@ describe("user detail drawer", () => {
       cfg, session, expect.objectContaining({ version: 3 }), "us.anthropic.claude-opus-4-7", "No longer needed",
     ));
     await waitFor(() => expect(screen.queryByText("us.anthropic.claude-opus-4-7")).not.toBeInTheDocument());
+  });
+
+  it("requires the Unlimited confirmation for an all-zero new model budget and clears it on edit", async () => {
+    const actor = userEvent.setup();
+    vi.spyOn(api, "getUser").mockResolvedValue({ data: { user: adminUser(), current_usage: currentUsage }, etag: '"1"', requestId: null, status: 200 });
+    const setModelBudget = vi.spyOn(api, "setModelBudget");
+    render(<DrawerHarness />);
+    await actor.click(screen.getByRole("button", { name: "Open Alice" }));
+    await actor.click(await screen.findByRole("button", { name: "Add model budget" }));
+    await actor.type(screen.getByLabelText("Model budget model ID"), "us.amazon.nova-micro-v1:0");
+
+    // The empty draft is 0 / 0 / 0 on the daily period: nothing is enforced.
+    const confirm = screen.getByRole("checkbox", { name: /daily usd, daily input tokens, daily output tokens limits of this model budget should be Unlimited/ });
+    const submit = screen.getByRole("button", { name: "Add model budget" });
+    await actor.click(submit);
+    expect(screen.getByRole("alert")).toHaveTextContent(/Confirm that every 0 limit/);
+    await actor.click(confirm);
+    expect(confirm).toBeChecked();
+    // Any edit to the figures withdraws the acknowledgement.
+    const usd = screen.getByLabelText("Model budget daily USD limit");
+    await actor.clear(usd);
+    await actor.type(usd, "2");
+    expect(screen.getByRole("checkbox", { name: /daily input tokens, daily output tokens limits/ })).not.toBeChecked();
+    await actor.click(submit);
+    expect(screen.getByRole("alert")).toHaveTextContent(/Confirm that every 0 limit/);
+    expect(setModelBudget).not.toHaveBeenCalled();
+  });
+
+  it("applies the current user from a model-budget version conflict so the drawer version refreshes", async () => {
+    const actor = userEvent.setup();
+    vi.spyOn(api, "getUser").mockResolvedValue({ data: { user: adminUser({ version: 2 }), current_usage: currentUsage }, etag: '"2"', requestId: null, status: 200 });
+    const conflicted = adminUser({ version: 5, name: "Alice Example", status_reason: "Changed from the CLI" });
+    vi.spyOn(api, "setModelBudget").mockRejectedValue(new ApiError("Changed", 409, "version_conflict", { current_user: conflicted }, "mb-conflict"));
+    render(<DrawerHarness />);
+    await actor.click(screen.getByRole("button", { name: "Open Alice" }));
+    const drawer = await screen.findByRole("dialog", { name: "Alice Example" });
+    await waitFor(() => expect(within(drawer).getByText("Version").nextElementSibling).toHaveTextContent("2"));
+
+    await actor.click(screen.getByRole("button", { name: "Add model budget" }));
+    await actor.type(screen.getByLabelText("Model budget model ID"), "us.amazon.nova-micro-v1:0");
+    const usd = screen.getByLabelText("Model budget daily USD limit");
+    await actor.clear(usd);
+    await actor.type(usd, "2");
+    const input = screen.getByLabelText("Model budget daily input token limit");
+    await actor.clear(input);
+    await actor.type(input, "100");
+    const output = screen.getByLabelText("Model budget daily output token limit");
+    await actor.clear(output);
+    await actor.type(output, "50");
+    await actor.click(screen.getByRole("button", { name: "Add model budget" }));
+
+    expect(await screen.findByRole("alert")).toHaveTextContent(/changed since you opened it.*Request ID: mb-conflict/);
+    // The 409 payload is the new canonical row: the next save carries If-Match "5".
+    expect(within(drawer).getByText("Version").nextElementSibling).toHaveTextContent("5");
+    expect(within(drawer).getByText("Changed from the CLI")).toBeInTheDocument();
+    // The form stays open with the operator's draft for the retry.
+    expect(screen.getByLabelText("Model budget daily USD limit")).toHaveValue(2);
   });
 
   it("rejects an ARN and a malformed thresholds spec in the model budget form", async () => {
@@ -366,6 +430,43 @@ describe("user detail drawer", () => {
 
     expect(usage.mock.calls[1][3]).toMatchObject({ period: "weekly" });
     expect(await screen.findByLabelText("Weekly usage history")).toBeInTheDocument();
+  });
+});
+
+describe("user detail drawer usage presentation", () => {
+  it("shows reset times in UTC and flags unpriced requests on the overview and in history", async () => {
+    const actor = userEvent.setup();
+    const partiallyPriced: CurrentUsage = { ...currentUsage, daily: { ...currentUsage.daily, unpriced_requests: 2 } };
+    vi.spyOn(api, "getUser").mockResolvedValue({ data: { user: adminUser(), current_usage: partiallyPriced }, etag: '"1"', requestId: null, status: 200 });
+    vi.spyOn(api, "usageHistory").mockResolvedValue({
+      user_id: alice.user_id,
+      period: "daily",
+      start: "2026-08-27",
+      end: "2026-09-02",
+      usage: [
+        { user_id: alice.user_id, period: "daily", window: "2026-09-02", window_start: "2026-09-02T00:00:00+00:00", window_end: "2026-09-03T00:00:00+00:00", resets_at: "2026-09-03T00:00:00+00:00", cost_usd: 1.25, input_tokens: 100, output_tokens: 50, requests: 3, unpriced_requests: 1 },
+        { user_id: alice.user_id, period: "daily", window: "2026-09-01", window_start: "2026-09-01T00:00:00+00:00", window_end: "2026-09-02T00:00:00+00:00", resets_at: "2026-09-02T00:00:00+00:00", cost_usd: 1, input_tokens: 80, output_tokens: 40, requests: 2 },
+      ],
+      next_cursor: null,
+    });
+    render(<DrawerHarness />);
+    await actor.click(screen.getByRole("button", { name: "Open Alice" }));
+    const drawer = await screen.findByRole("dialog", { name: "Alice Example" });
+
+    // Calendar boundaries are UTC, labelled; the browser zone is not used.
+    expect(await within(drawer).findByText("Resets 2026-09-03 00:00 UTC")).toBeInTheDocument();
+    expect(within(drawer).getByText("Resets 2026-09-07 00:00 UTC")).toBeInTheDocument();
+    expect(within(drawer).getByText("Unpriced requests")).toBeInTheDocument();
+    expect(within(drawer).getByRole("status")).toHaveTextContent("2 unpriced requests · spend undercounted");
+
+    await actor.click(screen.getByRole("tab", { name: "Usage" }));
+    const history = await screen.findByRole("region", { name: "Daily usage history" });
+    expect(within(history).getByRole("columnheader", { name: "Resets (UTC)" })).toBeInTheDocument();
+    expect(within(history).getByRole("columnheader", { name: "Unpriced" })).toBeInTheDocument();
+    expect(within(history).getAllByText("2026-09-03 00:00 UTC")).toHaveLength(1);
+    expect(within(history).getByTitle(/no catalog rate/)).toHaveTextContent("1");
+    // The page-level warning sums the rows on the page.
+    expect(screen.getByText(/^1 unpriced request · spend undercounted$/)).toHaveClass("ops-status-amber");
   });
 });
 

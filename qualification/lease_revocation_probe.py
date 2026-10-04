@@ -5,6 +5,13 @@ operations. Live mode deliberately requires an exact account ID and role ARN
 confirmation because it calls STS and temporarily changes one sandbox role's
 permissions. It never creates or deletes the target role.
 
+Live mode also refuses to run unless the sandbox is unmistakably set aside
+for it: both the role and the managed deny policy must carry the tag
+``bedrock-spend-controls:qualification=true``, the policy must not be
+CloudFormation-managed (no ``aws:cloudformation:*`` tags), and its current
+default document must be the probe placeholder (``probe_placeholder_policy``,
+printed by the dry run). The probe deletes only policy versions it created.
+
 Example dry run:
 
     python qualification/lease_revocation_probe.py \
@@ -43,10 +50,142 @@ _ACCESS_DENIED_CODES = {
     "AccessDeniedException",
     "UnauthorizedOperation",
 }
+#: Required on both the sandbox role and the managed deny policy.
+QUALIFICATION_TAG_KEY = "bedrock-spend-controls:qualification"
+QUALIFICATION_TAG_VALUE = "true"
+#: The managed policy's default version must be this do-nothing document.
+PROBE_PLACEHOLDER_SID = "BedrockSpendControlsQualificationPlaceholder"
+PROBE_PLACEHOLDER_IDENTITY = "bedrock-spend-controls-qualification-placeholder"
+LEASE_CHOICES = (60, 300, 900)
+# Vended STS keys must outlive the lease deadline so a post-deadline denial
+# is a lease decision, not an expired token.
+_LEASE_SESSION_MARGIN_SECONDS = 300
+_MIN_SESSION_SECONDS = 900
 
 
 def _utc_now() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def lease_session_seconds(lease_seconds: int) -> int:
+    """STS session duration for a lease probe: the lease plus a margin."""
+    return max(_MIN_SESSION_SECONDS, lease_seconds + _LEASE_SESSION_MARGIN_SECONDS)
+
+
+def probe_placeholder_policy() -> dict:
+    """The document a dedicated probe policy must carry between runs.
+
+    It denies Bedrock only to a source identity nobody uses, so attaching it
+    changes nothing, and its presence proves the policy exists for this
+    probe rather than for production revocation.
+    """
+    return {
+        "Version": "2012-10-17",
+        "Statement": [
+            {
+                "Sid": PROBE_PLACEHOLDER_SID,
+                "Effect": "Deny",
+                "Action": list(BEDROCK_ACTIONS),
+                "Resource": "*",
+                "Condition": {
+                    "StringEquals": {
+                        "aws:SourceIdentity": [PROBE_PLACEHOLDER_IDENTITY]
+                    }
+                },
+            }
+        ],
+    }
+
+
+def _as_list(value) -> list:
+    if value is None:
+        return []
+    return list(value) if isinstance(value, (list, tuple)) else [value]
+
+
+def is_probe_placeholder(document) -> bool:
+    """True when ``document`` is the placeholder (allowing IAM's normalisation)."""
+    if not isinstance(document, dict):
+        return False
+    statements = _as_list(document.get("Statement"))
+    if len(statements) != 1 or not isinstance(statements[0], dict):
+        return False
+    statement = statements[0]
+    condition = statement.get("Condition")
+    identities = (
+        _as_list(condition.get("StringEquals", {}).get("aws:SourceIdentity"))
+        if isinstance(condition, dict)
+        and isinstance(condition.get("StringEquals"), dict)
+        and len(condition) == 1
+        else None
+    )
+    return (
+        statement.get("Sid") == PROBE_PLACEHOLDER_SID
+        and statement.get("Effect") == "Deny"
+        and set(_as_list(statement.get("Action"))) == set(BEDROCK_ACTIONS)
+        and _as_list(statement.get("Resource")) == ["*"]
+        and identities == [PROBE_PLACEHOLDER_IDENTITY]
+    )
+
+
+def check_qualification_tags(tags: Iterable[dict], *, resource: str) -> None:
+    """Refuse a role or policy that is not tagged for qualification."""
+    for tag in tags:
+        if (
+            str(tag.get("Key", "")) == QUALIFICATION_TAG_KEY
+            and str(tag.get("Value", "")).lower() == QUALIFICATION_TAG_VALUE
+        ):
+            return
+    raise RuntimeError(
+        f"sandbox {resource} is not tagged {QUALIFICATION_TAG_KEY}="
+        f"{QUALIFICATION_TAG_VALUE}; refusing to touch a resource that was "
+        "not set aside for qualification"
+    )
+
+
+def check_policy_tags(tags: Iterable[dict]) -> None:
+    """The managed policy must be tagged and must not belong to a stack."""
+    tags = list(tags)
+    cfn = sorted(
+        str(tag.get("Key", ""))
+        for tag in tags
+        if str(tag.get("Key", "")).startswith("aws:cloudformation:")
+    )
+    if cfn:
+        raise RuntimeError(
+            "managed policy is managed by CloudFormation (" + ", ".join(cfn)
+            + "); the probe only versions a hand-made dedicated policy"
+        )
+    check_qualification_tags(tags, resource="policy")
+
+
+def select_removable_probe_version(
+    versions: Iterable[dict], probe_versions: Iterable[str]
+) -> str | None:
+    """Pick the oldest non-default version *this probe created*, or ``None``.
+
+    Returns ``None`` when the policy still has room (fewer than five
+    versions). Raises instead of touching a version the probe did not make.
+    """
+    versions = list(versions)
+    if len(versions) < 5:
+        return None
+    owned = set(probe_versions)
+    removable = sorted(
+        (
+            version
+            for version in versions
+            if not version.get("IsDefaultVersion")
+            and version["VersionId"] in owned
+        ),
+        key=lambda version: version.get("CreateDate", _utc_now()),
+    )
+    if not removable:
+        raise RuntimeError(
+            "managed policy has five versions and none of them were created "
+            "by this probe; remove old versions manually before re-running"
+        )
+    return removable[0]["VersionId"]
 
 
 def _compact(document: dict) -> str:
@@ -155,8 +294,8 @@ class ProbeConfig:
         account_id, _ = role_account_and_name(self.role_arn)
         if not self.model_id:
             raise ValueError("model ID is required")
-        if any(seconds not in {60, 300} for seconds in self.lease_seconds):
-            raise ValueError("probe lease durations must be 60 and/or 300 seconds")
+        if any(seconds not in LEASE_CHOICES for seconds in self.lease_seconds):
+            raise ValueError("probe lease durations must be 60, 300, or 900 seconds")
         if self.revocation_samples < 1:
             raise ValueError("revocation sample count must be positive")
         if self.propagation_timeout_seconds < 1 or self.poll_seconds <= 0:
@@ -235,9 +374,15 @@ def validate_probe_result(result: ProbeResult) -> None:
 
 
 class LiveProbe:
-    """Runs live calls only after ``ProbeConfig.validate`` safety checks."""
+    """Runs live calls only after ``ProbeConfig.validate`` safety checks.
 
-    def __init__(self, config: ProbeConfig):
+    Construction performs the read-only guards: the policy is attached to the
+    role, both carry the qualification tag, the policy is not
+    CloudFormation-managed, and its default document is the placeholder.
+    ``iam_client`` / ``sts_client`` exist for tests.
+    """
+
+    def __init__(self, config: ProbeConfig, *, iam_client=None, sts_client=None):
         config.validate()
         if not config.execute:
             raise ValueError("LiveProbe requires execute=True")
@@ -246,8 +391,8 @@ class LiveProbe:
             profile_name=config.profile or None,
             region_name=config.region,
         )
-        self.sts = self._session.client("sts")
-        self.iam = self._session.client("iam")
+        self.sts = sts_client or self._session.client("sts")
+        self.iam = iam_client or self._session.client("iam")
         _, self._role_name = role_account_and_name(config.role_arn)
         attached = self.iam.list_entities_for_policy(
             PolicyArn=config.managed_policy_arn,
@@ -259,6 +404,15 @@ class LiveProbe:
             raise RuntimeError(
                 "confirmed managed policy is not attached to the sandbox role"
             )
+        check_qualification_tags(
+            self.iam.list_role_tags(RoleName=self._role_name).get("Tags", []),
+            resource="role",
+        )
+        check_policy_tags(
+            self.iam.list_policy_tags(
+                PolicyArn=config.managed_policy_arn
+            ).get("Tags", [])
+        )
         policy = self.iam.get_policy(
             PolicyArn=config.managed_policy_arn
         )["Policy"]
@@ -269,6 +423,12 @@ class LiveProbe:
                 VersionId=self._original_version_id,
             )["PolicyVersion"]["Document"]
         )
+        if not is_probe_placeholder(self._original_document):
+            raise RuntimeError(
+                "managed policy's default version is not the probe placeholder "
+                f"(statement Sid {PROBE_PLACEHOLDER_SID}); it may be carrying "
+                "real revocations, so the probe will not version it"
+            )
         self._probe_versions: list[str] = []
 
     @staticmethod
@@ -344,28 +504,14 @@ class LiveProbe:
         versions = self.iam.list_policy_versions(
             PolicyArn=self.config.managed_policy_arn
         ).get("Versions", [])
-        if len(versions) < 5:
+        version_id = select_removable_probe_version(versions, self._probe_versions)
+        if version_id is None:
             return
-        removable = sorted(
-            (
-                version
-                for version in versions
-                if not version.get("IsDefaultVersion")
-                and version["VersionId"] != self._original_version_id
-            ),
-            key=lambda version: version.get("CreateDate", _utc_now()),
-        )
-        if not removable:
-            raise RuntimeError(
-                "sandbox managed policy has no removable probe version"
-            )
-        version_id = removable[0]["VersionId"]
         self.iam.delete_policy_version(
             PolicyArn=self.config.managed_policy_arn,
             VersionId=version_id,
         )
-        if version_id in self._probe_versions:
-            self._probe_versions.remove(version_id)
+        self._probe_versions.remove(version_id)
 
     def _set_managed_policy_document(self, document: dict) -> None:
         self._make_version_room()
@@ -437,6 +583,7 @@ class LiveProbe:
             source = f"quota-probe-lease-{seconds}-{uuid.uuid4().hex[:6]}"
             credentials = self._assume(
                 source,
+                duration_seconds=lease_session_seconds(seconds),
                 policy=lease_policy(expires_at),
             )
             allowed_before = self._count_tokens_allowed(credentials)
@@ -542,11 +689,26 @@ def dry_run_report(config: ProbeConfig) -> dict:
         },
         "planned_operations": [
             "sts:GetCallerIdentity",
-            "sts:AssumeRole at 900, 3600, and 3601 seconds",
+            "iam:ListEntitiesForPolicy, iam:ListRoleTags, iam:ListPolicyTags, "
+            "iam:GetPolicy, iam:GetPolicyVersion (read-only guards)",
+            "sts:AssumeRole at 3600 and 3601 seconds (role-chaining check)",
+            "sts:AssumeRole with a session policy per lease duration ("
+            + ", ".join(
+                f"{seconds}s lease / {lease_session_seconds(seconds)}s session"
+                for seconds in config.lease_seconds
+            )
+            + ")",
             "bedrock:CountTokens with two isolated source identities",
-            "iam:CreatePolicyVersion on a pre-attached managed deny policy",
-            "iam:SetDefaultPolicyVersion and DeletePolicyVersion cleanup",
+            "iam:CreatePolicyVersion on the pre-attached placeholder policy",
+            "iam:SetDefaultPolicyVersion and DeletePolicyVersion of the "
+            "versions this probe created (never pre-existing ones)",
         ],
+        "prerequisites": {
+            "required_tag": f"{QUALIFICATION_TAG_KEY}={QUALIFICATION_TAG_VALUE} "
+            "on both the role and the managed policy",
+            "policy_must_not_be_cloudformation_managed": True,
+            "placeholder_policy_document": probe_placeholder_policy(),
+        },
         "lease_policies": lease_documents,
         "targeted_deny_policy": source_identity_deny_policy(
             ["quota-probe-example"]
@@ -586,7 +748,8 @@ def _parser() -> argparse.ArgumentParser:
         type=int,
         nargs="+",
         default=[60, 300],
-        choices=[60, 300],
+        choices=list(LEASE_CHOICES),
+        help="Lease windows to probe (60, 300, 900); 900 waits 15 minutes",
     )
     parser.add_argument("--revocation-samples", type=int, default=5)
     parser.add_argument("--propagation-timeout-seconds", type=int, default=300)

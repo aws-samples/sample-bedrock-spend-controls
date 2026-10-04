@@ -83,6 +83,53 @@ def _blocked_identities(users_table) -> list[str]:
     return sorted(set(identities))
 
 
+def _identities_in(document: dict) -> set[str]:
+    """Source identities a deny document currently denies (sentinel dropped).
+
+    Tolerant of hand-edited or foreign documents: anything that does not
+    match the shape ``deny_policy`` writes contributes nothing.
+    """
+    identities: set[str] = set()
+    for statement in document.get("Statement", []) or []:
+        if not isinstance(statement, dict):
+            continue
+        values = (
+            statement.get("Condition", {})
+            .get("StringEquals", {})
+            .get("aws:SourceIdentity", [])
+        )
+        if isinstance(values, str):
+            values = [values]
+        identities.update(str(value) for value in values or [])
+    identities.discard(_NO_BLOCKED_IDENTITY)
+    return identities
+
+
+def fit_overflowing_shard(
+    current: set[str], desired: list[str], max_characters: int
+) -> tuple[list[str], list[str]]:
+    """Choose what an overflowing shard denies: ``(applied, dropped)``.
+
+    Identities that are no longer blocked are always removed (an admin
+    unblock must take effect even when the shard is full). Identities that
+    are already denied stay. New identities are added in sorted order while
+    the document still fits; the rest fall back to session expiry and the
+    capacity alarm until operators add qualified capacity.
+    """
+    wanted = sorted(set(desired))
+    applied = [identity for identity in wanted if identity in current]
+    dropped: list[str] = []
+    for identity in wanted:
+        if identity in current:
+            continue
+        candidate = applied + [identity]
+        if len(_compact(deny_policy(candidate))) <= max_characters:
+            applied = candidate
+        else:
+            dropped.append(identity)
+    return sorted(applied), dropped
+
+
 def _decode_document(document: Any) -> dict:
     if isinstance(document, dict):
         return document
@@ -192,45 +239,60 @@ def handler(event, context, *, dynamodb=None, iam=None, sns=None) -> dict:
         iam = iam or default_iam
         sns = sns or default_sns
 
-    policy_arns = json.loads(os.environ["REVOCATION_POLICY_ARNS_JSON"])
-    if not policy_arns:
-        raise ValueError("at least one revocation policy ARN is required")
-    max_characters = int(os.environ.get("REVOCATION_POLICY_MAX_CHARACTERS", "6144"))
-    users_table = dynamodb.Table(os.environ["USERS_TABLE"])
-    identities = _blocked_identities(users_table)
-    grouped: list[list[str]] = [[] for _ in policy_arns]
-    for identity in identities:
-        grouped[shard_for(identity, len(policy_arns))].append(identity)
-
-    result = {
+    identities: list[str] = []
+    result: dict = {
         "reconciled": True,
-        "blocked_identities": len(identities),
+        "blocked_identities": 0,
         "updated_shards": 0,
         "unchanged_shards": 0,
         "overflow_shards": [],
+        "dropped_identities": 0,
         "shards": [],
     }
+    # Everything that can fail sits inside the try so a scan error or a bad
+    # configuration raises the failure metric and alert, not just the stream
+    # retry.
     try:
+        policy_arns = json.loads(os.environ["REVOCATION_POLICY_ARNS_JSON"])
+        if not policy_arns:
+            raise ValueError("at least one revocation policy ARN is required")
+        max_characters = int(
+            os.environ.get("REVOCATION_POLICY_MAX_CHARACTERS", "6144")
+        )
+        users_table = dynamodb.Table(os.environ["USERS_TABLE"])
+        identities = _blocked_identities(users_table)
+        result["blocked_identities"] = len(identities)
+        grouped: list[list[str]] = [[] for _ in policy_arns]
+        for identity in identities:
+            grouped[shard_for(identity, len(policy_arns))].append(identity)
+
         for index, (policy_arn, shard_identities) in enumerate(
             zip(policy_arns, grouped, strict=True)
         ):
             desired = deny_policy(shard_identities)
             desired_characters = len(_compact(desired))
             overflow = desired_characters > max_characters
+            dropped: list[str] = []
             if overflow:
-                # Preserve the last known-good deny set. Replacing it with a
-                # no-op would immediately restore every blocked identity in
-                # this shard. New identities fall back to session expiry and
-                # the capacity alarm until operators add qualified capacity.
-                applied = _current_document(iam, policy_arn)
-                changed = False
+                # Keep what fits, deterministically: identities no longer
+                # blocked leave the shard (an admin unblock must take effect),
+                # identities already denied stay, and new ones are added in
+                # sorted order until the document is full. The remainder
+                # falls back to session expiry and the capacity alarm until
+                # operators add qualified capacity.
+                current = _identities_in(_current_document(iam, policy_arn))
+                kept, dropped = fit_overflowing_shard(
+                    current, shard_identities, max_characters
+                )
+                applied = deny_policy(kept)
             else:
                 applied = desired
-                changed = _sync_policy(iam, policy_arn, applied)
+            changed = _sync_policy(iam, policy_arn, applied)
             applied_characters = len(_compact(applied))
             result["updated_shards" if changed else "unchanged_shards"] += 1
             if overflow:
                 result["overflow_shards"].append(index)
+                result["dropped_identities"] += len(dropped)
             result["shards"].append(
                 {
                     "index": index,
@@ -238,6 +300,7 @@ def handler(event, context, *, dynamodb=None, iam=None, sns=None) -> dict:
                     "desired_characters": desired_characters,
                     "applied_characters": applied_characters,
                     "overflow": overflow,
+                    "dropped_identities": len(dropped),
                     "changed": changed,
                 }
             )
@@ -265,6 +328,10 @@ def handler(event, context, *, dynamodb=None, iam=None, sns=None) -> dict:
         {
             "RevocationSyncSuccess": ("Count", 1),
             "RevocationPolicyOverflow": ("Count", overflow_count),
+            "RevokedIdentitiesDropped": (
+                "Count",
+                result["dropped_identities"],
+            ),
             "RevokedIdentitiesDesired": (
                 "Count",
                 len(identities),

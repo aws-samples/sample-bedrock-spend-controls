@@ -45,7 +45,9 @@ A period is an object or `null`:
 }
 ```
 
-- `null` disables the period entirely.
+- `null` disables `weekly` or `monthly` entirely. `daily` is always enabled
+  (synthesis and the admin API reject `"daily": null`); make a dimension
+  Unlimited instead.
 - `0` on one dimension means **Unlimited** for that dimension of an enabled
   period. The console shows it as "Unlimited".
 - `usd` is the estimated spend priced from the catalog
@@ -63,11 +65,11 @@ The daily ledger row per subject is the canonical record. Weekly and monthly
 totals are not stored; they are derived on demand by a strongly consistent
 DynamoDB range query over the retained daily rows of the current window.
 
-The query reads at most **37 rows**: a monthly window spans at most 31 daily
-rows, and a weekly window can begin up to 6 days before the first of the
-month (a week that straddles the month boundary), so the union of the two
-windows never exceeds 31 + 6 = 37 days. This is why `usage_retention_days`
-must be at least 31.
+The query reads at most **31 rows**: it spans from the earliest enabled
+window start to today. A monthly window covers at most 31 days, and a weekly
+window that starts before the 1st only matters while the month is less than
+a week old, so the union of the two never exceeds 31 days. This is why
+`usage_retention_days` must be at least 31.
 
 Because totals are derived from history, enabling a weekly or monthly limit
 in the middle of a window includes usage recorded before the limit existed.
@@ -79,20 +81,29 @@ does not restore rows that already expired.
 Each enabled period carries an ordered `thresholds` list of
 `{"at": <ratio>, "action": "warn" | "block"}`:
 
-- `at` is utilization (`1.0` = 100 %), greater than 0 and at most `10.0`.
-- Entries must be strictly increasing in `at`.
+- `at` is utilization (`1.0` = 100 %), a finite number greater than 0 and at
+  most `10.0`. A level fires when utilization reaches it exactly (the
+  comparison is on integer basis points, so `1.0` fires at 100.00 %, not
+  only above it).
+- Entries must be strictly increasing in `at`; a list holds 1 to 20 entries.
 - At most one `block` entry, and it must be last. It may sit above 100 %
   (`{"at": 1.2, "action": "block"}`).
 - A period whose list has **no `block` entry is alert-only**: it warns at
   every configured level and never blocks, however far over 100 % it runs.
   The console flags such periods.
 
-When a period is submitted without `thresholds`, it uses the deployment
+When a period is created without `thresholds`, it uses the deployment
 default `[{"at": <warn_threshold>, "action": "warn"}, {"at": 1.0, "action": "block"}]`.
+On `PUT /admin/user/limits` a period sent without `thresholds` keeps the
+list it already has, and a period omitted from the body keeps all of its
+current values; the route updates rather than replaces.
 
 The usage processor sends one SNS warning per `warn` level per calendar
 window (crossing 50 % then 80 % sends two messages; a duplicate log delivery
-sends none) and blocks only when the `block` level is reached.
+sends none) and blocks only when the `block` level is reached. The per-level
+marker is written conditionally before the SNS publish and rolled back if
+the publish fails, so a retried batch re-sends the warning instead of losing
+it.
 
 ## Rate limits
 
@@ -101,12 +112,17 @@ input + output tokens per UTC minute, counted from metered invocations.
 `0` disables a dimension. Cached tokens never count toward `tpm`.
 
 Rate limits are evaluated by the usage processor against a short-lived
-per-minute counter that exists only for subjects with a rate limit. Reaching
-either limit blocks the subject through the same automatic path as a
-calendar breach, with reason `auto: rpm rate limit reached in minute ...` and
-SNS subject `BLOCKED <subject> reason=rpm|tpm`. The block lifts by itself as
-soon as the current minute is under the limit (see
-[Blocking and unblocking](#blocking-and-unblocking)).
+per-minute counter (`RATE#<subject>`) that exists only for subjects with a
+rate limit and is incremented inside the same transaction as the ledger
+rows. The minute is the one in which the invocation **occurred** according
+to the log record, not the one in which the record was processed, so late
+delivery neither hides a burst nor invents one. Reaching either limit blocks
+the subject through the same automatic path as a calendar breach, with
+reason `auto: rpm rate limit reached in minute ...` and SNS subject
+`BLOCKED <subject> reason=rpm|tpm`. A subject that stays blocked is not
+re-blocked (and not re-notified) in each following minute or window; the
+block lifts through the automatic paths once the current minute is under
+the limit (see [Blocking and unblocking](#blocking-and-unblocking)).
 
 `vend_rate_limit_per_minute` is a different control: it bounds how often one
 identity may call the credential broker and protects the broker, not Bedrock
@@ -136,10 +152,13 @@ to other models are refused too, until every enabled period is under quota
 again or the budget is raised or removed. Use model budgets as a cost
 guardrail, not as a model allowlist; `allowed_model_arns` is the allowlist.
 
-Model budgets are not part of the credential-vend check: the model is
-unknown at vend time, so the broker evaluates subject-level limits and rate
-limits only. The first metered invocation that crosses a model budget's
-block threshold blocks the subject.
+Model budgets are evaluated at vend as well as at metering: the broker
+re-reads every enabled subject period, the current rate minute, and every
+model budget before issuing credentials, so a subject whose model budget is
+already exhausted is refused (`429 quota_exceeded` with the budget's period
+and dimension in the headers) even though the model it is about to call is
+unknown. Between vends, the first metered invocation that crosses a model
+budget's block threshold blocks the subject.
 
 Admin routes: `PUT` / `DELETE /admin/user/model-budget` and
 `GET /admin/user/model-usage` ([admin-api.md](admin-api.md)). The console
@@ -162,8 +181,10 @@ with the actor and a reason.
 
 With `auto_provision_users: true` (the demo default), the first valid JWT for
 an unknown claim value creates the user row with `default_limits`. With
-`false` (the production default), unknown users receive `403 quota_blocked`
-until an operator creates them through the console or `POST /admin/users`.
+`false` (the production default), unknown users receive `401
+authentication_error` until an operator creates them through the console or
+`POST /admin/users`. Identities containing `#` are never provisioned
+(`401` at vend, `400` on admin routes).
 
 Workload rows are always created by metering: the first invocation
 attributed to a workload's inference profile creates `workload:<name>` with
@@ -206,7 +227,9 @@ is shown on the Operations tab and in `GET /admin/operations` →
 **Admin block and unblock.** `PUT /admin/user/status` with `{"status":
 "blocked" | "active", "reason": "..."}` sets `status_origin: admin`. An
 admin block never lifts automatically. An admin unblock makes the row active
-immediately; a later breach blocks it again through the automatic path.
+immediately; a later breach blocks it again through the automatic path, and
+that new block has automatic origin, so it lifts automatically like any
+other.
 
 **Limit changes reconcile status immediately.** Lowering a limit or adding a
 model budget below current usage blocks the subject at once; raising the

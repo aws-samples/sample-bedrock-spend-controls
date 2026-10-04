@@ -31,14 +31,17 @@ _DEPLOYMENT_KEYS = {
     "jwt_issuer",
     "jwt_jwks_url",
     "jwt_user_claim",
+    "log_retention_days",
     "manage_invocation_logging",
     "model_config",
     "permission_lease_seconds",
     "reconcile_lag_days",
     "reconciliation_alarm_percent",
     "reconciliation_enabled",
+    "reconciliation_service_names",
     "refresh_jitter_seconds",
     "refresh_overlap_seconds",
+    "reserve_enforcement_concurrency",
     "retain_tables_on_delete",
     "revocation_policy_shards",
     "revocation_reconcile_minutes",
@@ -75,13 +78,21 @@ _DEFAULTS = {
     "jwt_issuer": "",
     "jwt_jwks_url": "",
     "jwt_user_claim": "sub",
+    "log_retention_days": 90,
     "model_config": "config/model-pricing.json",
     "permission_lease_seconds": 300,
     "reconcile_lag_days": 2,
     "reconciliation_alarm_percent": 10,
     "reconciliation_enabled": False,
+    # Cost Explorer SERVICE dimension values summed as "Bedrock spend".
+    "reconciliation_service_names": ["Amazon Bedrock", "Amazon Bedrock Service"],
     "refresh_jitter_seconds": 5,
     "refresh_overlap_seconds": 10,
+    # Pins the five enforcement workers at one concurrent execution each so
+    # they can never race themselves on IAM policy writes. Set false only in
+    # accounts whose Lambda concurrency quota (default 1,000; 10 in some new
+    # or sandbox accounts) cannot spare five reserved slots.
+    "reserve_enforcement_concurrency": True,
     "retain_tables_on_delete": False,
     "revocation_policy_shards": 19,
     "revocation_reconcile_minutes": 5,
@@ -175,14 +186,17 @@ class DeploymentConfig:
     jwt_issuer: str
     jwt_jwks_url: str
     jwt_user_claim: str
+    log_retention_days: int
     manage_invocation_logging: bool
     model_pricing: ModelPricingConfig
     permission_lease_seconds: int
     reconcile_lag_days: int
     reconciliation_alarm_percent: float
     reconciliation_enabled: bool
+    reconciliation_service_names: tuple[str, ...]
     refresh_jitter_seconds: int
     refresh_overlap_seconds: int
+    reserve_enforcement_concurrency: bool
     retain_tables_on_delete: bool
     revocation_policy_shards: int
     revocation_reconcile_minutes: int
@@ -213,7 +227,16 @@ class DeploymentConfig:
         return json.dumps(payload, sort_keys=True)
 
     @classmethod
-    def from_node(cls, node: Node) -> "DeploymentConfig":
+    def from_node(
+        cls, node: Node, *, account: str | None = None
+    ) -> "DeploymentConfig":
+        """Build the configuration from CDK context and the deployment file.
+
+        ``account`` is the stack's resolved AWS account ID when the CDK
+        environment is known at synth (``CDK_DEFAULT_ACCOUNT`` or an explicit
+        ``env``); pass ``None`` for an environment-agnostic synth. When
+        known, workload ``role_arn`` entries must belong to that account.
+        """
         raw_deployment = node.try_get_context("deployment_config")
         deployment, deployment_dir = _load_deployment(raw_deployment)
 
@@ -268,7 +291,9 @@ class DeploymentConfig:
             if node.try_get_context("workloads") is not None
             else deployment_dir
         )
-        workloads = _workloads(value("workloads"), workloads_base)
+        workloads = _workloads(
+            value("workloads"), workloads_base, account=account
+        )
 
         allowed_model_arns = _string_list(
             "allowed_model_arns", value("allowed_model_arns")
@@ -288,9 +313,11 @@ class DeploymentConfig:
             "invoker_principal_arns", value("invoker_principal_arns")
         )
         for principal_arn in invoker_arns:
-            if not principal_arn.startswith("arn:"):
+            if not _INVOKER_PRINCIPAL_ARN.match(principal_arn):
                 raise ValueError(
-                    "invoker_principal_arns entries must be IAM principal ARNs; "
+                    "invoker_principal_arns entries must be IAM principal ARNs "
+                    "(arn:<partition>:iam::<account>:root|role/...|user/..., "
+                    "or an STS assumed-role ARN) without wildcards; "
                     f"got {principal_arn}"
                 )
 
@@ -408,6 +435,24 @@ class DeploymentConfig:
                 "admin_jwt_value because the browser never receives the "
                 "shared admin secret"
             )
+        jwt_jwks_url = _string("jwt_jwks_url", value("jwt_jwks_url"))
+        if jwt_issuer and not jwt_issuer.startswith("https://"):
+            raise ValueError(
+                "jwt_issuer must be an https:// URL; the broker fetches "
+                f"OIDC discovery and JWKS from it. Got {jwt_issuer!r}"
+            )
+        if jwt_jwks_url and not jwt_jwks_url.startswith("https://"):
+            raise ValueError(
+                f"jwt_jwks_url must be an https:// URL; got {jwt_jwks_url!r}"
+            )
+        if jwt_jwks_url and not jwt_issuer:
+            raise ValueError("jwt_jwks_url requires jwt_issuer")
+        if jwt_issuer and not jwt_audience:
+            raise ValueError(
+                "jwt_audience is required with a bring-your-own jwt_issuer: "
+                "without it the broker would skip 'aud' verification and "
+                "accept any token the issuer ever minted for any client"
+            )
 
         default_limits_raw = value("default_limits")
         default_limits = _quota_default_limits(default_limits_raw)
@@ -418,6 +463,16 @@ class DeploymentConfig:
             raise ValueError(
                 "usage_retention_days must be at least 31 so current monthly "
                 "quota evaluation cannot lose retained daily usage"
+            )
+        log_retention_days = _positive_int(
+            "log_retention_days", value("log_retention_days")
+        )
+        if log_retention_days not in _LOG_RETENTION_DAYS:
+            raise ValueError(
+                "log_retention_days must be one of the CloudWatch Logs "
+                "retention values "
+                f"({', '.join(str(d) for d in sorted(_LOG_RETENTION_DAYS))}); "
+                f"got {log_retention_days}"
             )
 
         reconciliation_enabled = _boolean(
@@ -439,6 +494,15 @@ class DeploymentConfig:
             raise ValueError(
                 "reconciliation_alarm_percent must be at most 100; "
                 f"got {reconciliation_alarm_percent}"
+            )
+        reconciliation_service_names = _string_list(
+            "reconciliation_service_names",
+            value("reconciliation_service_names"),
+        )
+        if not reconciliation_service_names:
+            raise ValueError(
+                "reconciliation_service_names must list at least one Cost "
+                "Explorer SERVICE value"
             )
 
         return cls(
@@ -463,16 +527,22 @@ class DeploymentConfig:
             invoker_principal_arns=tuple(invoker_arns),
             jwt_audience=jwt_audience,
             jwt_issuer=jwt_issuer,
-            jwt_jwks_url=_string("jwt_jwks_url", value("jwt_jwks_url")),
+            jwt_jwks_url=jwt_jwks_url,
             jwt_user_claim=jwt_user_claim,
+            log_retention_days=log_retention_days,
             manage_invocation_logging=manage_logging,
             model_pricing=model_pricing,
             permission_lease_seconds=permission_lease_seconds,
             reconcile_lag_days=reconcile_lag_days,
             reconciliation_alarm_percent=reconciliation_alarm_percent,
             reconciliation_enabled=reconciliation_enabled,
+            reconciliation_service_names=tuple(reconciliation_service_names),
             refresh_jitter_seconds=refresh_jitter_seconds,
             refresh_overlap_seconds=refresh_overlap_seconds,
+            reserve_enforcement_concurrency=_boolean(
+                "reserve_enforcement_concurrency",
+                value("reserve_enforcement_concurrency"),
+            ),
             retain_tables_on_delete=_boolean(
                 "retain_tables_on_delete", value("retain_tables_on_delete")
             ),
@@ -572,16 +642,43 @@ def _model_pricing(raw: Any, base_dir: Path) -> ModelPricingConfig:
 
 
 _WORKLOAD_NAME = re.compile(r"^[a-z0-9][a-z0-9-]{0,47}$")
-_WORKLOAD_ROLE_ARN = re.compile(r"^arn:aws[a-z-]*:iam::\d{12}:role/.+")
+# Role names allow [\w+=,.@-] and a path of [\w+=,.@/-]; wildcards and empty
+# segments are excluded so the enforcer's iam:PutRolePolicy/DeleteRolePolicy
+# grant can never widen to "every role".
+_WORKLOAD_ROLE_ARN = re.compile(
+    r"^arn:aws[a-z-]*:iam::(?P<account>\d{12}):role/"
+    r"(?:[\w+=,.@-]+/)*[\w+=,.@-]+$"
+)
 _WORKLOAD_KEYS = {"name", "model", "role_arn"}
+# Broker-invoking principals: account root, a role or user (with optional
+# path), or an STS assumed-role session. No wildcards: the grant is on the
+# Function URL's resource policy, where "*" would open the broker to any
+# AWS account.
+_INVOKER_PRINCIPAL_ARN = re.compile(
+    r"^arn:aws[a-z-]*:(?:iam::\d{12}:(?:root|(?:role|user)/"
+    r"(?:[\w+=,.@-]+/)*[\w+=,.@-]+)"
+    r"|sts::\d{12}:assumed-role/[\w+=,.@-]+/[\w+=,.@-]+)$"
+)
+# CloudWatch Logs accepts only these retention values (PutRetentionPolicy).
+_LOG_RETENTION_DAYS = frozenset(
+    {
+        1, 3, 5, 7, 14, 30, 60, 90, 120, 150, 180, 365, 400, 545, 731,
+        1096, 1827, 2192, 2557, 2922, 3288, 3653,
+    }
+)
 
 
-def _workloads(raw: Any, base_dir: Path) -> tuple[WorkloadConfig, ...]:
+def _workloads(
+    raw: Any, base_dir: Path, *, account: str | None = None
+) -> tuple[WorkloadConfig, ...]:
     """Parse the optional workload-mode roster.
 
     Accepts '' (workload mode off), an inline JSON object, or a JSON file
     path. The document shape is {"workloads": [{"name", "model",
-    "role_arn"?}, ...]}.
+    "role_arn"?}, ...]}. ``role_arn`` must be a concrete same-account IAM
+    role ARN (no wildcards) and may enroll at most one workload: the
+    enforcer converges each workload onto its own inline Deny, so two
+    workloads sharing one role would fight over that policy.
     """
     if raw is None or (isinstance(raw, str) and not raw.strip()):
         return ()
@@ -596,6 +693,7 @@ def _workloads(raw: Any, base_dir: Path) -> tuple[WorkloadConfig, ...]:
         )
     parsed: list[WorkloadConfig] = []
     seen_names: set[str] = set()
+    seen_roles: dict[str, str] = {}
     for index, entry in enumerate(entries):
         label = f"workloads[{index}]"
         if not isinstance(entry, dict):
@@ -623,14 +721,35 @@ def _workloads(raw: Any, base_dir: Path) -> tuple[WorkloadConfig, ...]:
                 f"not an ARN: {model}"
             )
         role_arn = entry.get("role_arn", "")
-        if role_arn and (
-            not isinstance(role_arn, str)
-            or not _WORKLOAD_ROLE_ARN.match(role_arn)
-        ):
-            raise ValueError(
-                f"{label}.role_arn must be an IAM role ARN "
-                f"(arn:aws:iam::<account>:role/...); got {role_arn!r}"
-            )
+        if role_arn:
+            if not isinstance(role_arn, str) or any(
+                wildcard in role_arn for wildcard in "*?"
+            ):
+                raise ValueError(
+                    f"{label}.role_arn must be a single concrete IAM role "
+                    f"ARN without wildcards; got {role_arn!r}"
+                )
+            match = _WORKLOAD_ROLE_ARN.match(role_arn)
+            if not match:
+                raise ValueError(
+                    f"{label}.role_arn must be an IAM role ARN "
+                    f"(arn:aws:iam::<account>:role/...); got {role_arn!r}"
+                )
+            if account is not None and match.group("account") != account:
+                raise ValueError(
+                    f"{label}.role_arn belongs to account "
+                    f"{match.group('account')} but this stack deploys to "
+                    f"{account}; the enforcer can only manage roles in "
+                    "its own account"
+                )
+            if role_arn in seen_roles:
+                raise ValueError(
+                    f"{label}.role_arn {role_arn} is already enrolled by "
+                    f"workload {seen_roles[role_arn]!r}; each workload "
+                    "needs its own IAM role so Deny enforcement for one "
+                    "cannot be undone by another"
+                )
+            seen_roles[role_arn] = name
         parsed.append(
             WorkloadConfig(name=name, model=model.strip(), role_arn=role_arn)
         )

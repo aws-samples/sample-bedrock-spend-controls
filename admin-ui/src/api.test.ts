@@ -3,7 +3,10 @@ import type { Session } from "./auth";
 import type { AdminConfig } from "./config";
 import {
   ApiError,
+  LEASE_SNAPSHOT_MAX_PAGES,
   api,
+  apiErrorMessage,
+  queryString,
   transport,
   type CurrentUsage,
   type QuotaLimits,
@@ -118,6 +121,27 @@ describe("transport", () => {
     await expect(transport(cfg, sessionWith(networkFetch), "GET", "/offline"))
       .rejects.toMatchObject({ status: 0, code: "network_error", message: "Failed to fetch" });
   });
+  it("reports sign-in, Identity Pool, and token-refresh failures as authentication errors", async () => {
+    const fetch = vi.fn();
+    const session = sessionWith(fetch);
+    (session.authorization as ReturnType<typeof vi.fn>).mockRejectedValue(
+      new Error("NotAuthorizedException: Token is not from a supported provider of this identity pool."),
+    );
+
+    const caught = await transport(cfg, session, "GET", "/admin/summary").catch((error) => error);
+
+    expect(caught).toMatchObject({ status: 0, code: "auth_error" });
+    expect(fetch).not.toHaveBeenCalled();
+    const message = apiErrorMessage(caught);
+    expect(message).toMatch(/Sign-in could not be completed/);
+    expect(message).toMatch(/NotAuthorizedException/);
+    expect(message).not.toMatch(/Unable to reach the broker/);
+
+    // A genuine network failure keeps the reachability wording.
+    const offline = await transport(cfg, sessionWith(vi.fn().mockRejectedValue(new TypeError("Failed to fetch"))), "GET", "/x").catch((error) => error);
+    expect(apiErrorMessage(offline)).toMatch(/Unable to reach the broker/);
+  });
+
   it("triggers managed reauthentication on a 401 response", async () => {
     const fetch = vi.fn().mockResolvedValue(jsonResponse({
       error: { type: "unauthorized", message: "Expired" },
@@ -336,7 +360,75 @@ describe("mutation requests", () => {
 });
 
 
+describe("query string encoding", () => {
+  it("encodes spaces as %20 so the signed URL matches the URL sent", () => {
+    // URLSearchParams would write "Jane+Doe"; aws4fetch signs "Jane%20Doe".
+    expect(queryString({ query: "Jane Doe" })).toBe("?query=Jane%20Doe");
+    expect(queryString({ query: "Jane Doe" })).not.toContain("+");
+    // RFC 3986 reserved characters that encodeURIComponent leaves alone.
+    expect(queryString({ q: "a*b!c'(d)" })).toBe("?q=a%2Ab%21c%27%28d%29");
+    expect(queryString({ user_id: "tenant/alice", limit: 25 })).toBe("?user_id=tenant%2Falice&limit=25");
+    // Undefined, null, and empty values are omitted; no params gives no "?".
+    expect(queryString({ a: undefined, b: null, c: "" })).toBe("");
+    expect(queryString({ limit: 0 })).toBe("?limit=0");
+  });
+
+  it("signs and sends the same URL for a user search containing a space", async () => {
+    const fetch = vi.fn().mockResolvedValue(jsonResponse({ users: [], next_cursor: null }, 200));
+    await api.listUsersPage(cfg, sessionWith(fetch), { query: "Jane Doe", granularity: "user" });
+    const url = String(fetch.mock.calls[0][0]);
+    expect(url).toBe("https://gateway.example.test/admin/users?limit=25&query=Jane%20Doe&granularity=user");
+    expect(url).not.toContain("+");
+    // The server still decodes the intended value.
+    expect(new URL(url).searchParams.get("query")).toBe("Jane Doe");
+  });
+});
+
 describe("paginated operational endpoints", () => {
+  it("follows next_cursor for the lease snapshot up to the page bound", async () => {
+    const { today: _today, current_usage: _currentUsage, ...canonical } = user;
+    const second = { ...canonical, user_id: "tenant/bob" };
+    const fetch = vi.fn()
+      .mockResolvedValueOnce(jsonResponse({ users: [canonical], next_cursor: "page two" }, 200))
+      .mockResolvedValueOnce(jsonResponse({ users: [second], next_cursor: null }, 200));
+
+    const snapshot = await api.leaseSnapshot(cfg, sessionWith(fetch));
+
+    expect(snapshot.users.map((entry) => entry.user_id)).toEqual(["tenant/alice", "tenant/bob"]);
+    expect(snapshot.next_cursor).toBeNull();
+    expect(fetch).toHaveBeenCalledTimes(2);
+    expect(String(fetch.mock.calls[0][0])).toBe("https://gateway.example.test/admin/users?limit=50&include_usage=false");
+    expect(String(fetch.mock.calls[1][0])).toBe("https://gateway.example.test/admin/users?limit=50&include_usage=false&cursor=page%20two");
+
+    // An endless cursor stops at the bound and reports that more remains.
+    const endless = vi.fn().mockImplementation(() => Promise.resolve(jsonResponse({ users: [canonical], next_cursor: "more" }, 200)));
+    const bounded = await api.leaseSnapshot(cfg, sessionWith(endless));
+    expect(endless).toHaveBeenCalledTimes(LEASE_SNAPSHOT_MAX_PAGES);
+    expect(bounded.users).toHaveLength(LEASE_SNAPSHOT_MAX_PAGES);
+    expect(bounded.next_cursor).toBe("more");
+  });
+
+  it("reads the raw emergency-stop state and rejects a malformed one", async () => {
+    const okFetch = vi.fn().mockResolvedValue(jsonResponse({ state: "activating", desired_active: true, generation: 2, requested_at: "2026-09-09T10:00:00Z" }, 200));
+    await expect(api.getEmergencyStop(cfg, sessionWith(okFetch))).resolves.toMatchObject({ state: "activating", desired_active: true });
+    expect(String(okFetch.mock.calls[0][0])).toBe("https://gateway.example.test/admin/emergency-stop");
+    expect((okFetch.mock.calls[0][1] as RequestInit).method).toBe("GET");
+
+    const badFetch = vi.fn().mockResolvedValue(jsonResponse({ state: "active" }, 200));
+    await expect(api.getEmergencyStop(cfg, sessionWith(badFetch))).rejects.toMatchObject({ code: "invalid_response" });
+  });
+
+  it("accepts and type-checks the optional unpriced_requests usage field", async () => {
+    const { today: _today, current_usage: _currentUsage, ...canonical } = user;
+    const withUnpriced = Object.fromEntries(Object.entries(currentUsage).map(([period, row]) => [period, { ...row, unpriced_requests: 2 }]));
+    const okFetch = vi.fn().mockResolvedValue(jsonResponse({ user: canonical, current_usage: withUnpriced }, 200));
+    const detail = await api.getUser(cfg, sessionWith(okFetch), user.user_id);
+    expect(detail.data.current_usage.daily.unpriced_requests).toBe(2);
+
+    const badFetch = vi.fn().mockResolvedValue(jsonResponse({ user: canonical, current_usage: { ...currentUsage, daily: { ...currentUsage.daily, unpriced_requests: -1 } } }, 200));
+    await expect(api.getUser(cfg, sessionWith(badFetch), user.user_id)).rejects.toMatchObject({ code: "invalid_response" });
+  });
+
   it("loads exactly one 25-user page and passes opaque cursor, status, and query server-side", async () => {
     const fetch = vi.fn()
       .mockResolvedValueOnce(jsonResponse({ users: [user], next_cursor: "opaque {cursor}" }, 200))

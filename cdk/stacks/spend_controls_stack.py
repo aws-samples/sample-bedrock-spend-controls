@@ -58,6 +58,7 @@ from aws_cdk import (
     aws_events_targets as events_targets,
     aws_iam as iam,
     aws_lambda as lambda_,
+    aws_lambda_destinations as lambda_destinations,
     aws_lambda_event_sources as lambda_event_sources,
     aws_logs as logs,
     aws_logs_destinations as logs_destinations,
@@ -87,6 +88,52 @@ WORKLOAD_TAG_KEY = "bedrock-spend-controls-workload"
 _CR_PROFILE_PREFIXES = {
     "us", "eu", "apac", "jp", "au", "ca", "sa", "global", "us-gov",
 }
+
+# CloudWatch Logs retention values (configuration validates against the same
+# set in ``_LOG_RETENTION_DAYS``).
+_LOG_RETENTION_BY_DAYS = {
+    1: logs.RetentionDays.ONE_DAY,
+    3: logs.RetentionDays.THREE_DAYS,
+    5: logs.RetentionDays.FIVE_DAYS,
+    7: logs.RetentionDays.ONE_WEEK,
+    14: logs.RetentionDays.TWO_WEEKS,
+    30: logs.RetentionDays.ONE_MONTH,
+    60: logs.RetentionDays.TWO_MONTHS,
+    90: logs.RetentionDays.THREE_MONTHS,
+    120: logs.RetentionDays.FOUR_MONTHS,
+    150: logs.RetentionDays.FIVE_MONTHS,
+    180: logs.RetentionDays.SIX_MONTHS,
+    365: logs.RetentionDays.ONE_YEAR,
+    400: logs.RetentionDays.THIRTEEN_MONTHS,
+    545: logs.RetentionDays.EIGHTEEN_MONTHS,
+    731: logs.RetentionDays.TWO_YEARS,
+    1096: logs.RetentionDays.THREE_YEARS,
+    1827: logs.RetentionDays.FIVE_YEARS,
+    2192: logs.RetentionDays.SIX_YEARS,
+    2557: logs.RetentionDays.SEVEN_YEARS,
+    2922: logs.RetentionDays.EIGHT_YEARS,
+    3288: logs.RetentionDays.NINE_YEARS,
+    3653: logs.RetentionDays.TEN_YEARS,
+}
+
+
+@jsii.implements(cdk.IStableStringProducer)
+class _DeferredString:
+    """Lazy string resolved at synth, after the referenced construct exists.
+
+    Used for the admin console role's trust policy, which must pin the
+    Identity Pool ID while the Identity Pool itself needs the role ARN for
+    its role mapping (CloudFormation has no ordering problem; only the
+    construction order does).
+    """
+
+    def __init__(self):
+        self.produce_value = None
+
+    def produce(self) -> str:
+        if self.produce_value is None:
+            raise RuntimeError("Deferred string was never bound")
+        return self.produce_value()
 
 
 @jsii.implements(cdk.ILocalBundling)
@@ -189,7 +236,15 @@ class SpendControlsStack(Stack):
     def __init__(self, scope: Construct, construct_id: str, **kwargs) -> None:
         super().__init__(scope, construct_id, **kwargs)
 
-        config = DeploymentConfig.from_node(self.node)
+        config = DeploymentConfig.from_node(
+            self.node,
+            # Same-account checks (workload role ARNs) run only when the
+            # account is concrete; an environment-agnostic synth validates
+            # format alone.
+            account=(
+                None if cdk.Token.is_unresolved(self.account) else self.account
+            ),
+        )
         alert_email = config.alert_email
         jwt_issuer = config.jwt_issuer
         jwt_audience = config.jwt_audience
@@ -200,10 +255,59 @@ class SpendControlsStack(Stack):
         # one hour, and configuration caps the vended TTL at the same value.
         max_session_seconds = 3600
         use_snapstart = config.snapstart
+        # Five enforcement workers run single-file; sandbox accounts with a
+        # 10-concurrency quota can opt out (see configuration.py).
+        enforcement_concurrency = (
+            1 if config.reserve_enforcement_concurrency else None
+        )
+        self._log_retention = _LOG_RETENTION_BY_DAYS[config.log_retention_days]
+        self._custom_resource_log_group: logs.LogGroup | None = None
+
+        if "*" in config.allowed_model_arns:
+            cdk.Annotations.of(self).add_warning(
+                "allowed_model_arns contains '*': vended sessions may invoke "
+                "every foundation model and inference profile in the "
+                "account (workload application inference profiles, async "
+                "invocation, bidirectional streaming, and provisioned "
+                "throughput are still denied explicitly). Fine for the "
+                "demo; pin the list for production."
+            )
+        has_profile_arn = any(
+            ":inference-profile/" in arn for arn in config.allowed_model_arns
+        )
+        has_foundation_arn = any(
+            "::foundation-model/" in arn for arn in config.allowed_model_arns
+        )
+        if has_profile_arn and not has_foundation_arn:
+            cdk.Annotations.of(self).add_warning(
+                "allowed_model_arns lists an inference-profile ARN but no "
+                "foundation-model ARN. Invoking through a cross-Region or "
+                "application inference profile also authorizes against the "
+                "routed foundation model in every destination Region, so "
+                "add arn:<partition>:bedrock:*::foundation-model/<model-id> "
+                "entries or every call will be denied."
+            )
 
         # ------------------------------------------------------------------
         # Deployment-time Bedrock price snapshot
+        #
+        # The resolver Lambda writes the resolved price table straight to a
+        # deterministic Parameter Store name (Intelligent-Tiering, 8 KB) and
+        # returns only a digest to CloudFormation: custom-resource responses
+        # are capped at 4,096 bytes and the full catalog exceeds that once
+        # cache and image dimensions are included. The daily refresh writes
+        # the same parameter. Metering reads it by name with a short cache
+        # and prices at the conservative fallback (alarmed) if Parameter
+        # Store is unreadable at a cold start.
         # ------------------------------------------------------------------
+        model_prices_parameter_name = (
+            f"/bedrock-spend-controls/{self.stack_name}/model-prices"
+        )
+        model_prices_parameter_arn = self.format_arn(
+            service="ssm",
+            resource="parameter",
+            resource_name=model_prices_parameter_name.lstrip("/"),
+        )
         price_resolver_fn = lambda_.Function(
             self, "PriceResolverFn",
             runtime=lambda_.Runtime.PYTHON_3_12,
@@ -211,6 +315,7 @@ class SpendControlsStack(Stack):
             timeout=Duration.minutes(1),
             handler="handler.handler",
             code=lambda_.Code.from_asset("pricing_resolver"),
+            log_group=self._function_log_group("PriceResolverFn"),
         )
         price_resolver_fn.add_to_role_policy(
             iam.PolicyStatement(
@@ -218,9 +323,16 @@ class SpendControlsStack(Stack):
                 resources=["*"],
             )
         )
+        price_resolver_fn.add_to_role_policy(
+            iam.PolicyStatement(
+                actions=["ssm:PutParameter", "ssm:DeleteParameter"],
+                resources=[model_prices_parameter_arn],
+            )
+        )
         price_provider = cr.Provider(
             self, "PriceResolverProvider",
             on_event_handler=price_resolver_fn,
+            log_group=self._function_log_group("PriceResolverProvider"),
         )
         price_snapshot = cdk.CustomResource(
             self, "BedrockModelPriceSnapshot",
@@ -228,37 +340,16 @@ class SpendControlsStack(Stack):
             resource_type="Custom::BedrockModelPriceSnapshot",
             properties={
                 "RegionCode": self.region,
+                "ParameterName": model_prices_parameter_name,
                 "CatalogModels": config.model_pricing.catalog_models,
                 "PinnedPrices": config.model_pricing.price_overrides,
                 "FallbackPrice": config.model_pricing.fallback_price,
             },
         )
-        model_prices_json = price_snapshot.get_att_string("ModelPricesJson")
+        price_snapshot_digest = price_snapshot.get_att_string("SnapshotDigest")
+        price_snapshot_models = price_snapshot.get_att_string("ModelCount")
         fallback_price_json = price_snapshot.get_att_string("FallbackPriceJson")
 
-        # Runtime price configuration. The deployment snapshot seeds the
-        # parameter; a daily scheduled refresh keeps it aligned with the
-        # Pricing API so catalog price changes do not require a redeploy.
-        # Metering reads the parameter with a short cache and falls back to
-        # the env snapshot if Parameter Store is unavailable.
-        model_prices_parameter = ssm.StringParameter(
-            self,
-            "ModelPricesParameter",
-            string_value=cdk.Fn.join(
-                "",
-                [
-                    '{"models":',
-                    model_prices_json,
-                    ',"fallback":',
-                    fallback_price_json,
-                    "}",
-                ],
-            ),
-            description=(
-                "Bedrock model token prices used by quota metering; "
-                "refreshed daily from the AWS Pricing API"
-            ),
-        )
         price_refresh_fn = lambda_.Function(
             self,
             "PriceRefreshFn",
@@ -267,10 +358,9 @@ class SpendControlsStack(Stack):
             timeout=Duration.minutes(1),
             handler="handler.scheduled_handler",
             code=lambda_.Code.from_asset("pricing_resolver"),
+            log_group=self._function_log_group("PriceRefreshFn"),
             environment={
-                "PRICES_PARAMETER_NAME": (
-                    model_prices_parameter.parameter_name
-                ),
+                "PRICES_PARAMETER_NAME": model_prices_parameter_name,
             },
         )
         price_refresh_fn.add_to_role_policy(
@@ -279,7 +369,12 @@ class SpendControlsStack(Stack):
                 resources=["*"],
             )
         )
-        model_prices_parameter.grant_write(price_refresh_fn)
+        price_refresh_fn.add_to_role_policy(
+            iam.PolicyStatement(
+                actions=["ssm:PutParameter"],
+                resources=[model_prices_parameter_arn],
+            )
+        )
         events.Rule(
             self,
             "ModelPriceRefreshSchedule",
@@ -542,6 +637,7 @@ class SpendControlsStack(Stack):
                         ]
                     ),
                     install_latest_aws_sdk=False,
+                    log_group=self._shared_custom_resource_log_group(),
                 )
                 ensure_admin_group.node.add_dependency(user_pool)
 
@@ -570,6 +666,13 @@ class SpendControlsStack(Stack):
             if config.retain_tables_on_delete
             else RemovalPolicy.DESTROY
         )
+        # Point-in-time recovery on every table (35-day continuous backups);
+        # deletion protection follows retain_tables_on_delete so a
+        # production stack cannot lose its ledger to an accidental
+        # `cdk destroy` or table replacement.
+        table_recovery = ddb.PointInTimeRecoverySpecification(
+            point_in_time_recovery_enabled=True
+        )
         users_table = ddb.Table(
             self, "UsersTable",
             partition_key=ddb.Attribute(name="user_id", type=ddb.AttributeType.STRING),
@@ -580,6 +683,8 @@ class SpendControlsStack(Stack):
             stream=ddb.StreamViewType.NEW_AND_OLD_IMAGES,
             time_to_live_attribute="expires_at",
             removal_policy=table_removal_policy,
+            point_in_time_recovery_specification=table_recovery,
+            deletion_protection=config.retain_tables_on_delete,
         )
 
         usage_table = ddb.Table(
@@ -589,6 +694,8 @@ class SpendControlsStack(Stack):
             billing_mode=ddb.BillingMode.PAY_PER_REQUEST,
             time_to_live_attribute="expires_at",
             removal_policy=table_removal_policy,
+            point_in_time_recovery_specification=table_recovery,
+            deletion_protection=config.retain_tables_on_delete,
         )
 
         admin_audit_table = ddb.Table(
@@ -603,6 +710,8 @@ class SpendControlsStack(Stack):
             billing_mode=ddb.BillingMode.PAY_PER_REQUEST,
             time_to_live_attribute="expires_at",
             removal_policy=table_removal_policy,
+            point_in_time_recovery_specification=table_recovery,
+            deletion_protection=config.retain_tables_on_delete,
         )
         admin_audit_table.add_global_secondary_index(
             index_name="scope-event-key-index",
@@ -643,7 +752,8 @@ class SpendControlsStack(Stack):
         # per https://github.com/awslabs/aws-lambda-web-adapter — override
         # with -c adapter_layer_arn=... if a newer version ships.
         adapter_layer_arn = config.adapter_layer_arn or (
-            f"arn:aws:lambda:{self.region}:753240598075:layer:LambdaAdapterLayerX86:28"
+            f"arn:{self.partition}:lambda:{self.region}:753240598075:"
+            "layer:LambdaAdapterLayerX86:30"
         )
         adapter_layer = lambda_.LayerVersion.from_layer_version_arn(
             self, "WebAdapterLayer", adapter_layer_arn,
@@ -666,6 +776,7 @@ class SpendControlsStack(Stack):
             timeout=Duration.minutes(5),
             handler="run.sh",
             layers=[adapter_layer, quota_periods_layer],
+            log_group=self._function_log_group("BrokerApiFn"),
             snap_start=lambda_.SnapStartConf.ON_PUBLISHED_VERSIONS if use_snapstart else None,
             code=lambda_.Code.from_asset(
                 "../gateway",
@@ -779,6 +890,38 @@ class SpendControlsStack(Stack):
         # revocation worker can update attached deny-policy versions. The
         # worker cannot turn that write capability into IAM or wider-model
         # permissions because those actions/resources are absent here.
+        # Guardrails that hold even when allowed_model_arns is "*": vended
+        # sessions must never reach a workload's application inference
+        # profile (spend would be charged to the workload's budget), a
+        # provisioned-throughput model (not priced per token), or the two
+        # invoke paths that model-invocation logging does not meter. These
+        # Deny statements sit in both the role policy and the permissions
+        # boundary, so neither the revocation worker nor a future allowlist
+        # edit can lift them. (Converse/ConverseStream are authorized by the
+        # InvokeModel actions, so bedrock:InvokeModel* covers them.)
+        def vended_session_guardrails() -> list[iam.PolicyStatement]:
+            return [
+                iam.PolicyStatement(
+                    sid="DenyWorkloadProfilesAndProvisionedModels",
+                    effect=iam.Effect.DENY,
+                    actions=["bedrock:InvokeModel*", "bedrock:CountTokens"],
+                    resources=[
+                        f"arn:{self.partition}:bedrock:*:*:"
+                        "application-inference-profile/*",
+                        f"arn:{self.partition}:bedrock:*:*:provisioned-model/*",
+                    ],
+                ),
+                iam.PolicyStatement(
+                    sid="DenyUnmeteredInvokePaths",
+                    effect=iam.Effect.DENY,
+                    actions=[
+                        "bedrock:StartAsyncInvoke",
+                        "bedrock:InvokeModelWithBidirectionalStream",
+                    ],
+                    resources=["*"],
+                ),
+            ]
+
         bedrock_permissions_boundary = iam.ManagedPolicy(
             self,
             "BedrockUserPermissionsBoundary",
@@ -794,15 +937,21 @@ class SpendControlsStack(Stack):
                         "bedrock:InvokeModelWithResponseStream",
                     ],
                     resources=list(config.allowed_model_arns),
-                )
+                ),
+                *vended_session_guardrails(),
             ],
         )
         bedrock_user_role = iam.Role(
             self, "BedrockUserRole",
-            # Only the broker Lambda role may assume this. The broker assigns
-            # SourceIdentity and the quota-user session tag; users never hold
-            # static Bedrock access.
-            assumed_by=iam.ArnPrincipal(broker_api_fn.role.role_arn),
+            # Only the broker Lambda role may assume this, and only while
+            # stamping a SourceIdentity (Null=false requires the key): a
+            # session without one could not be metered or revoked. The
+            # broker assigns SourceIdentity and the quota-user session tag;
+            # users never hold static Bedrock access.
+            assumed_by=iam.PrincipalWithConditions(
+                iam.ArnPrincipal(broker_api_fn.role.role_arn),
+                {"Null": {"sts:SourceIdentity": "false"}},
+            ),
             permissions_boundary=bedrock_permissions_boundary,
             # >= the vended TTL (and >= the STS 3600s floor), so the broker's
             # AssumeRole DurationSeconds can never exceed the role's ceiling.
@@ -836,6 +985,8 @@ class SpendControlsStack(Stack):
                 resources=list(config.allowed_model_arns),
             )
         )
+        for statement in vended_session_guardrails():
+            bedrock_user_role.add_to_policy(statement)
         emergency_deny_policy = iam.ManagedPolicy(
             self,
             "EmergencyBedrockDenyPolicy",
@@ -913,6 +1064,11 @@ class SpendControlsStack(Stack):
                 self, "BedrockInvocationLogs", existing_log_group_name
             )
         else:
+            # Log groups are Regional, so one stack per Region never collides.
+            # The group is RETAINED on destroy (see above), so a destroy and
+            # redeploy in the same Region must first delete or rename the
+            # retained group, or deploy with invocation_log_group_name set
+            # to it.
             invocation_log_group = logs.LogGroup(
                 self, "BedrockInvocationLogs",
                 log_group_name="/bedrock/spend-controls/model-invocations",
@@ -964,25 +1120,31 @@ class SpendControlsStack(Stack):
                 },
             )
             bedrock_logging_role.apply_removal_policy(RemovalPolicy.RETAIN)
-            # Enable model-invocation logging account/region-wide.
+            # Enable model-invocation logging account/region-wide. The same
+            # call runs on create and on every stack update, so a redeploy
+            # repairs the account-wide setting if something else overwrote
+            # it (metering silently stops otherwise).
+            enable_logging_call = cr.AwsSdkCall(
+                service="Bedrock",
+                action="putModelInvocationLoggingConfiguration",
+                parameters={
+                    "loggingConfig": {
+                        "cloudWatchConfig": {
+                            "logGroupName": invocation_log_group.log_group_name,
+                            "roleArn": bedrock_logging_role.role_arn,
+                        },
+                        "textDataDeliveryEnabled": False,
+                        "imageDataDeliveryEnabled": False,
+                        "embeddingDataDeliveryEnabled": False,
+                    }
+                },
+                physical_resource_id=cr.PhysicalResourceId.of("bedrock-invocation-logging"),
+            )
             invocation_logging_config = cr.AwsCustomResource(
                 self, "EnableBedrockInvocationLogging",
-                on_create=cr.AwsSdkCall(
-                    service="Bedrock",
-                    action="putModelInvocationLoggingConfiguration",
-                    parameters={
-                        "loggingConfig": {
-                            "cloudWatchConfig": {
-                                "logGroupName": invocation_log_group.log_group_name,
-                                "roleArn": bedrock_logging_role.role_arn,
-                            },
-                            "textDataDeliveryEnabled": False,
-                            "imageDataDeliveryEnabled": False,
-                            "embeddingDataDeliveryEnabled": False,
-                        }
-                    },
-                    physical_resource_id=cr.PhysicalResourceId.of("bedrock-invocation-logging"),
-                ),
+                on_create=enable_logging_call,
+                on_update=enable_logging_call,
+                log_group=self._shared_custom_resource_log_group(),
                 policy=cr.AwsCustomResourcePolicy.from_statements([
                     iam.PolicyStatement(
                         actions=[
@@ -1092,6 +1254,10 @@ class SpendControlsStack(Stack):
                         )],
                     )
                 )
+                admin_mapping_provider = idpool.IdentityPoolProviderUrl.user_pool(
+                    user_pool, user_pool_client
+                )
+                admin_mapping_key = "cognito-user-pool"
             else:
                 # BYO issuer: the Identity Pool trusts the corporate IdP
                 # through an IAM OIDC provider scoped to the SPA's client id.
@@ -1106,14 +1272,73 @@ class SpendControlsStack(Stack):
                         open_id_connect_providers=[admin_ui_oidc_provider],
                     )
                 )
+                # Role mappings key OIDC providers by their IAM provider ARN
+                # (the form the Cognito RBAC documentation uses).
+                admin_mapping_provider = idpool.IdentityPoolProviderUrl.open_id(
+                    admin_ui_oidc_provider.open_id_connect_provider_arn
+                )
+                admin_mapping_key = "oidc-provider"
+            # Only members of the admin group get AWS credentials at all.
+            # Without a rules mapping every user who can sign in to the
+            # console client would receive the authenticated role and with
+            # it lambda:InvokeFunctionUrl on the broker, i.e. the ability
+            # to vend raw Bedrock credentials for themselves. The rule
+            # matches the same claim/value the broker uses for admin-by-JWT
+            # (Contains, because cognito:groups and most IdP group claims
+            # are arrays); AmbiguousRoleResolution=Deny refuses everyone
+            # else. The role's trust policy pins the Identity Pool ID, which
+            # is resolved lazily because the pool needs this role's ARN.
+            identity_pool_id = _DeferredString()
+            admin_console_role = iam.Role(
+                self,
+                "AdminConsoleRole",
+                description=(
+                    "Identity Pool role for signed-in admin-console users in "
+                    f"the {config.admin_jwt_value!r} group"
+                ),
+                assumed_by=iam.FederatedPrincipal(
+                    "cognito-identity.amazonaws.com",
+                    {
+                        "StringEquals": {
+                            "cognito-identity.amazonaws.com:aud": (
+                                cdk.Lazy.string(identity_pool_id)
+                            )
+                        },
+                        "ForAnyValue:StringLike": {
+                            "cognito-identity.amazonaws.com:amr": "authenticated"
+                        },
+                    },
+                    "sts:AssumeRoleWithWebIdentity",
+                ),
+            )
             admin_identity_pool = idpool.IdentityPool(
                 self, "AdminIdentityPool",
                 allow_unauthenticated_identities=False,
                 authentication_providers=ui_authentication_providers,
+                authenticated_role=admin_console_role,
+                role_mappings=[
+                    idpool.IdentityPoolRoleMapping(
+                        provider_url=admin_mapping_provider,
+                        mapping_key=admin_mapping_key,
+                        use_token=False,
+                        resolve_ambiguous_roles=False,
+                        rules=[
+                            idpool.RoleMappingRule(
+                                claim=config.admin_jwt_claim,
+                                claim_value=config.admin_jwt_value,
+                                match_type=idpool.RoleMappingMatchType.CONTAINS,
+                                mapped_role=admin_console_role,
+                            )
+                        ],
+                    )
+                ],
             )
-            # The authenticated browser identity may invoke the Function URL;
-            # the JWT it presents (admin group) authorizes the /admin routes.
-            fn_url.grant_invoke_url(admin_identity_pool.authenticated_role)
+            identity_pool_id.produce_value = (
+                lambda: admin_identity_pool.identity_pool_id
+            )
+            # The admin browser identity may invoke the Function URL; the
+            # JWT it presents (admin group) authorizes the /admin routes.
+            fn_url.grant_invoke_url(admin_console_role)
             # dist/ is a generated Vite bundle (gitignored), resolved relative
             # to this file so it works regardless of the synth CWD. Fail with an
             # actionable message rather than a cryptic asset error if it is
@@ -1206,6 +1431,7 @@ class SpendControlsStack(Stack):
                     ]
                 ),
                 install_latest_aws_sdk=False,
+                log_group=self._shared_custom_resource_log_group(),
             )
             ui_config_writer.node.add_dependency(ui_deployment)
             cdk.CfnOutput(self, "AdminUiUrl",
@@ -1228,9 +1454,12 @@ class SpendControlsStack(Stack):
         # be able to bypass the gateway (dev roles, notebook roles, CI, ...).
         # For org-wide enforcement use the SCP in the README instead.
         # ------------------------------------------------------------------
+        # Region-suffixed: managed policy names are account-global, so a
+        # second Regional stack would otherwise collide. (Renaming replaces
+        # the policy; re-attach it to your roles after upgrading.)
         deny_direct = iam.ManagedPolicy(
             self, "DenyDirectBedrockInvocation",
-            managed_policy_name="deny-direct-bedrock-invocation",
+            managed_policy_name=f"deny-direct-bedrock-invocation-{self.region}",
             description=(
                 "Denies direct Bedrock model invocation so that inference must "
                 "go through the spend-controls gateway. Attach to non-gateway roles."
@@ -1259,9 +1488,62 @@ class SpendControlsStack(Stack):
         # ------------------------------------------------------------------
         # Event-driven usage processor + alerting
         # ------------------------------------------------------------------
-        alert_topic = sns.Topic(self, "QuotaAlerts", display_name="Bedrock Spend Controls alerts")
+        alert_topic = sns.Topic(
+            self,
+            "QuotaAlerts",
+            display_name="Bedrock Spend Controls alerts",
+            enforce_ssl=True,
+        )
         if alert_email:
             alert_topic.add_subscription(subs.EmailSubscription(alert_email))
+
+        # Alarm registry for the console's operations view (the broker
+        # exposes these names through /admin/operations) plus the shared
+        # Lambda Errors alarm used by every function below. ``Errors`` is
+        # the only signal for exceptions a handler did not expect (DynamoDB
+        # throttles, timeouts, SNS failures); every worker gets one.
+        #
+        # Every alarm has a fixed, stack-scoped physical name
+        # (``<stack>-<key>``): the broker environment carries the whole map
+        # and Lambda caps environments at 4 KB, which twenty generated
+        # ``<stack>-<LogicalIdHash>-<random>`` names would nearly exhaust.
+        # Fixed names also keep the broker's own Errors alarm out of a
+        # CloudFormation cycle (alarm -> function name -> env -> alarm) and
+        # give runbooks stable names.
+        operations_alarms: dict[str, cw.Alarm] = {}
+        fixed_alarm_names: dict[str, str] = {}
+
+        def alarm_name_for(key: str) -> str:
+            name = f"{self.stack_name}-{key.replace('_', '-')}"
+            fixed_alarm_names[key] = name
+            return name
+
+        def errors_alarm(
+            function: lambda_.Function, logical_id: str, key: str
+        ) -> cw.Alarm:
+            alarm = cw.Alarm(
+                self,
+                logical_id,
+                alarm_name=alarm_name_for(key),
+                metric=function.metric_errors(
+                    statistic="Sum", period=Duration.minutes(5)
+                ),
+                threshold=1,
+                evaluation_periods=1,
+                comparison_operator=(
+                    cw.ComparisonOperator.GREATER_THAN_OR_EQUAL_TO_THRESHOLD
+                ),
+                treat_missing_data=cw.TreatMissingData.NOT_BREACHING,
+                alarm_description=(
+                    f"{function.node.id} raised an unhandled exception in "
+                    "the last 5 minutes"
+                ),
+            )
+            alarm.add_alarm_action(cw_actions.SnsAction(alert_topic))
+            operations_alarms[key] = alarm
+            return alarm
+
+        errors_alarm(broker_api_fn, "BrokerApiErrorsAlarm", "broker_api_errors")
 
         # ------------------------------------------------------------------
         # Workload mode: one application inference profile per directly-
@@ -1437,6 +1719,7 @@ class SpendControlsStack(Stack):
             handler="handler.handler",
             code=lambda_.Code.from_asset("../usage_processor"),
             layers=[quota_periods_layer],
+            log_group=self._function_log_group("UsageProcessorFn"),
             environment={
                 "USERS_TABLE": users_table.table_name,
                 "USAGE_TABLE": usage_table.table_name,
@@ -1452,9 +1735,7 @@ class SpendControlsStack(Stack):
                 # processor prices at the conservative fallback (alarmed)
                 # only if Parameter Store is unreadable at a cold start.
                 "MODEL_FALLBACK_PRICE_JSON": fallback_price_json,
-                "PRICES_PARAMETER_NAME": (
-                    model_prices_parameter.parameter_name
-                ),
+                "PRICES_PARAMETER_NAME": model_prices_parameter_name,
                 "BEDROCK_USER_ROLE_NAME": bedrock_user_role.role_name,
                 "WORKLOAD_PROFILES_JSON": (
                     cdk.Fn.to_json_string(workload_profiles)
@@ -1470,7 +1751,52 @@ class SpendControlsStack(Stack):
         users_table.grant_read_write_data(usage_processor_fn)
         usage_table.grant_read_write_data(usage_processor_fn)
         alert_topic.grant_publish(usage_processor_fn)
-        model_prices_parameter.grant_read(usage_processor_fn)
+        usage_processor_fn.add_to_role_policy(
+            iam.PolicyStatement(
+                actions=["ssm:GetParameter", "ssm:GetParameters"],
+                resources=[model_prices_parameter_arn],
+            )
+        )
+
+        # Logs subscriptions invoke the processor asynchronously: Lambda
+        # retries a failed batch twice and then drops it unless an
+        # on-failure destination captures the event. Every metering record
+        # in a dropped batch would be lost (and the user never blocked), so
+        # failed events land in a 14-day queue that is alarmed, next to a
+        # Lambda Errors alarm for the first failure.
+        usage_dlq = sqs.Queue(
+            self,
+            "UsageProcessorDeadLetterQueue",
+            encryption=sqs.QueueEncryption.SQS_MANAGED,
+            enforce_ssl=True,
+            retention_period=Duration.days(14),
+        )
+        usage_processor_fn.configure_async_invoke(
+            retry_attempts=2,
+            on_failure=lambda_destinations.SqsDestination(usage_dlq),
+        )
+        usage_dlq_alarm = cw.Alarm(
+            self,
+            "UsageProcessorDlqAlarm",
+            alarm_name=alarm_name_for("usage_processor_dlq"),
+            metric=usage_dlq.metric_approximate_number_of_messages_visible(
+                period=Duration.minutes(5)
+            ),
+            threshold=1,
+            evaluation_periods=1,
+            treat_missing_data=cw.TreatMissingData.NOT_BREACHING,
+            alarm_description=(
+                "Metering batches the usage processor failed to process "
+                "after retries; redrive from the queue (see runbook)"
+            ),
+        )
+        usage_dlq_alarm.add_alarm_action(cw_actions.SnsAction(alert_topic))
+        operations_alarms["usage_processor_dlq"] = usage_dlq_alarm
+        errors_alarm(
+            usage_processor_fn,
+            "UsageProcessorErrorsAlarm",
+            "usage_processor_errors",
+        )
 
         # CloudWatch Logs subscriptions are at-least-once. The processor uses
         # the Bedrock requestId as a DynamoDB idempotency key and updates the
@@ -1511,11 +1837,11 @@ class SpendControlsStack(Stack):
         # consistent vending gate first; this worker then applies/removes the
         # shared-role deny and marks the control state stable.
         # ------------------------------------------------------------------
-        operations_alarms: dict[str, cw.Alarm] = {}
         emergency_dlq = sqs.Queue(
             self,
             "EmergencyStopDeadLetterQueue",
             encryption=sqs.QueueEncryption.SQS_MANAGED,
+            enforce_ssl=True,
             retention_period=Duration.days(14),
         )
         emergency_fn = lambda_.Function(
@@ -1524,9 +1850,10 @@ class SpendControlsStack(Stack):
             runtime=lambda_.Runtime.PYTHON_3_12,
             memory_size=256,
             timeout=Duration.minutes(2),
-            reserved_concurrent_executions=1,
+            reserved_concurrent_executions=enforcement_concurrency,
             handler="handler.handler",
             code=lambda_.Code.from_asset("../emergency_processor"),
+            log_group=self._function_log_group("EmergencyStopProcessorFn"),
             environment={
                 "USERS_TABLE": users_table.table_name,
                 "SNS_TOPIC_ARN": alert_topic.topic_arn,
@@ -1602,6 +1929,7 @@ class SpendControlsStack(Stack):
         emergency_failure_alarm = cw.Alarm(
             self,
             "EmergencyStopFailureAlarm",
+            alarm_name=alarm_name_for("emergency_failure"),
             metric=cw.Metric(
                 namespace=METRICS_NAMESPACE,
                 metric_name="EmergencyStopFailure",
@@ -1618,6 +1946,7 @@ class SpendControlsStack(Stack):
         emergency_dlq_alarm = cw.Alarm(
             self,
             "EmergencyStopDlqAlarm",
+            alarm_name=alarm_name_for("emergency_dlq"),
             metric=emergency_dlq.metric_approximate_number_of_messages_visible(
                 period=Duration.minutes(5)
             ),
@@ -1626,6 +1955,11 @@ class SpendControlsStack(Stack):
         )
         emergency_dlq_alarm.add_alarm_action(cw_actions.SnsAction(alert_topic))
         operations_alarms["emergency_dlq"] = emergency_dlq_alarm
+        errors_alarm(
+            emergency_fn,
+            "EmergencyStopProcessorErrorsAlarm",
+            "emergency_processor_errors",
+        )
 
         # ------------------------------------------------------------------
         # Active-session revocation: always deployed. The 19 SourceIdentity
@@ -1672,10 +2006,11 @@ class SpendControlsStack(Stack):
             runtime=lambda_.Runtime.PYTHON_3_12,
             memory_size=256,
             timeout=Duration.minutes(2),
-            reserved_concurrent_executions=1,
+            reserved_concurrent_executions=enforcement_concurrency,
             handler="handler.handler",
             code=lambda_.Code.from_asset("../revocation_processor"),
             layers=[quota_periods_layer],
+            log_group=self._function_log_group("RevocationProcessorFn"),
             environment={
                 "USERS_TABLE": users_table.table_name,
                 "SNS_TOPIC_ARN": alert_topic.topic_arn,
@@ -1730,6 +2065,7 @@ class SpendControlsStack(Stack):
         revocation_failure_alarm = cw.Alarm(
             self,
             "RevocationSyncFailureAlarm",
+            alarm_name=alarm_name_for("revocation_failure"),
             metric=cw.Metric(
                 namespace=METRICS_NAMESPACE,
                 metric_name="RevocationSyncFailure",
@@ -1748,6 +2084,7 @@ class SpendControlsStack(Stack):
         revocation_overflow_alarm = cw.Alarm(
             self,
             "RevocationPolicyOverflowAlarm",
+            alarm_name=alarm_name_for("revocation_overflow"),
             metric=cw.Metric(
                 namespace=METRICS_NAMESPACE,
                 metric_name="RevocationPolicyOverflow",
@@ -1762,6 +2099,11 @@ class SpendControlsStack(Stack):
         )
         operations_alarms["revocation_overflow"] = (
             revocation_overflow_alarm
+        )
+        errors_alarm(
+            revocation_fn,
+            "RevocationProcessorErrorsAlarm",
+            "revocation_processor_errors",
         )
 
         # ------------------------------------------------------------------
@@ -1781,10 +2123,11 @@ class SpendControlsStack(Stack):
             runtime=lambda_.Runtime.PYTHON_3_12,
             memory_size=256,
             timeout=Duration.minutes(2),
-            reserved_concurrent_executions=1,
+            reserved_concurrent_executions=enforcement_concurrency,
             handler="handler.handler",
             code=lambda_.Code.from_asset("../auto_block_sweeper"),
             layers=[quota_periods_layer],
+            log_group=self._function_log_group("AutoBlockSweeperFn"),
             environment={
                 "USERS_TABLE": users_table.table_name,
                 "USAGE_TABLE": usage_table.table_name,
@@ -1815,6 +2158,7 @@ class SpendControlsStack(Stack):
         auto_block_sweep_failure_alarm = cw.Alarm(
             self,
             "AutoBlockSweepFailureAlarm",
+            alarm_name=alarm_name_for("auto_block_sweep_failure"),
             metric=cw.Metric(
                 namespace=METRICS_NAMESPACE,
                 metric_name="AutoBlockSweepFailure",
@@ -1830,6 +2174,11 @@ class SpendControlsStack(Stack):
         )
         operations_alarms["auto_block_sweep_failure"] = (
             auto_block_sweep_failure_alarm
+        )
+        errors_alarm(
+            auto_block_sweeper_fn,
+            "AutoBlockSweeperErrorsAlarm",
+            "auto_block_sweeper_errors",
         )
 
         # ------------------------------------------------------------------
@@ -1848,10 +2197,11 @@ class SpendControlsStack(Stack):
                 runtime=lambda_.Runtime.PYTHON_3_12,
                 memory_size=256,
                 timeout=Duration.minutes(2),
-                reserved_concurrent_executions=1,
+                reserved_concurrent_executions=enforcement_concurrency,
                 handler="handler.handler",
                 code=lambda_.Code.from_asset("../workload_enforcer"),
                 layers=[quota_periods_layer],
+                log_group=self._function_log_group("WorkloadEnforcerFn"),
                 environment={
                     "USERS_TABLE": users_table.table_name,
                     "USAGE_TABLE": usage_table.table_name,
@@ -1861,7 +2211,11 @@ class SpendControlsStack(Stack):
                     "WORKLOADS_JSON": cdk.Fn.to_json_string(
                         workload_enforcement
                     ),
-                    "DENY_POLICY_NAME": "bedrock-spend-controls-workload-deny",
+                    # The handler derives the inline Deny policy name from
+                    # AWS_REGION + STACK_NAME, so two Regional stacks (or two
+                    # stacks in one Region) enrolling the same role never
+                    # overwrite each other's Deny.
+                    "STACK_NAME": cdk.Aws.STACK_NAME,
                 },
             )
             users_table.grant_read_write_data(workload_enforcer_fn)
@@ -1894,6 +2248,7 @@ class SpendControlsStack(Stack):
             workload_failure_alarm = cw.Alarm(
                 self,
                 "WorkloadEnforcementFailureAlarm",
+                alarm_name=alarm_name_for("workload_enforcement_failure"),
                 metric=cw.Metric(
                     namespace=METRICS_NAMESPACE,
                     metric_name="WorkloadEnforcementFailure",
@@ -1910,6 +2265,11 @@ class SpendControlsStack(Stack):
             operations_alarms["workload_enforcement_failure"] = (
                 workload_failure_alarm
             )
+            errors_alarm(
+                workload_enforcer_fn,
+                "WorkloadEnforcerErrorsAlarm",
+                "workload_enforcer_errors",
+            )
 
         # ------------------------------------------------------------------
         # Enforcement dispatcher: the single enforcement consumer of the
@@ -1923,6 +2283,7 @@ class SpendControlsStack(Stack):
             self,
             "EnforcementDispatchDeadLetterQueue",
             encryption=sqs.QueueEncryption.SQS_MANAGED,
+            enforce_ssl=True,
             retention_period=Duration.days(14),
         )
         dispatcher_fn = lambda_.Function(
@@ -1931,9 +2292,10 @@ class SpendControlsStack(Stack):
             runtime=lambda_.Runtime.PYTHON_3_12,
             memory_size=128,
             timeout=Duration.seconds(30),
-            reserved_concurrent_executions=1,
+            reserved_concurrent_executions=enforcement_concurrency,
             handler="handler.handler",
             code=lambda_.Code.from_asset("../enforcement_dispatcher"),
+            log_group=self._function_log_group("EnforcementDispatcherFn"),
             environment={
                 "REVOCATION_FUNCTION_NAME": revocation_fn.function_name,
                 "WORKLOAD_ENFORCER_FUNCTION_NAME": (
@@ -1984,6 +2346,7 @@ class SpendControlsStack(Stack):
         dispatch_dlq_alarm = cw.Alarm(
             self,
             "EnforcementDispatchDlqAlarm",
+            alarm_name=alarm_name_for("enforcement_dispatch_dlq"),
             metric=dispatch_dlq.metric_approximate_number_of_messages_visible(
                 period=Duration.minutes(5)
             ),
@@ -1997,6 +2360,7 @@ class SpendControlsStack(Stack):
         dispatch_iterator_age_alarm = cw.Alarm(
             self,
             "EnforcementDispatchIteratorAgeAlarm",
+            alarm_name=alarm_name_for("enforcement_dispatch_iterator_age"),
             metric=dispatcher_fn.metric(
                 "IteratorAge",
                 statistic="Maximum",
@@ -2011,6 +2375,11 @@ class SpendControlsStack(Stack):
         operations_alarms["enforcement_dispatch_iterator_age"] = (
             dispatch_iterator_age_alarm
         )
+        errors_alarm(
+            dispatcher_fn,
+            "EnforcementDispatcherErrorsAlarm",
+            "enforcement_dispatcher_errors",
+        )
 
         # A fallback-priced request means an invocation was metered with the
         # synthetic conservative rate instead of a resolved model price.
@@ -2019,6 +2388,7 @@ class SpendControlsStack(Stack):
         pricing_fallback_alarm = cw.Alarm(
             self,
             "PricingFallbackAlarm",
+            alarm_name=alarm_name_for("pricing_fallback"),
             metric=cw.Metric(
                 namespace=METRICS_NAMESPACE,
                 metric_name="FallbackPricedRequests",
@@ -2052,12 +2422,16 @@ class SpendControlsStack(Stack):
                 timeout=Duration.minutes(2),
                 handler="handler.handler",
                 code=lambda_.Code.from_asset("../reconciliation_processor"),
+                log_group=self._function_log_group("SpendReconciliationFn"),
                 environment={
                     "USAGE_TABLE": usage_table.table_name,
                     "SNS_TOPIC_ARN": alert_topic.topic_arn,
                     "METRICS_NAMESPACE": METRICS_NAMESPACE,
                     "RECONCILE_REGION": self.region,
                     "RECONCILE_LAG_DAYS": str(config.reconcile_lag_days),
+                    "RECONCILE_SERVICE_NAMES_JSON": json.dumps(
+                        list(config.reconciliation_service_names)
+                    ),
                     "USAGE_RETENTION_DAYS": str(config.usage_retention_days),
                     "WORKLOAD_TAG_KEY": WORKLOAD_TAG_KEY,
                     "WORKLOADS_JSON": cdk.Fn.to_json_string(
@@ -2095,6 +2469,7 @@ class SpendControlsStack(Stack):
             reconciliation_alarm = cw.Alarm(
                 self,
                 "SpendReconciliationDeltaAlarm",
+                alarm_name=alarm_name_for("reconciliation_delta"),
                 metric=cw.Metric(
                     namespace=METRICS_NAMESPACE,
                     metric_name="ReconciliationDeltaPercent",
@@ -2115,6 +2490,51 @@ class SpendControlsStack(Stack):
                 cw_actions.SnsAction(alert_topic)
             )
             operations_alarms["reconciliation_delta"] = reconciliation_alarm
+            errors_alarm(
+                reconciliation_fn,
+                "SpendReconciliationErrorsAlarm",
+                "reconciliation_errors",
+            )
+            # A run that starts but neither completes nor records a failure
+            # (Lambda timeout, mid-run crash) leaves ReconciliationStarted
+            # without a matching Runs/Failure in the same UTC day.
+            reconciliation_timeout_alarm = cw.Alarm(
+                self,
+                "ReconciliationTimeoutAlarm",
+                alarm_name=alarm_name_for("reconciliation_timeout"),
+                metric=cw.MathExpression(
+                    expression=(
+                        "FILL(started, 0) - FILL(runs, 0) - FILL(failures, 0)"
+                    ),
+                    using_metrics={
+                        name: cw.Metric(
+                            namespace=METRICS_NAMESPACE,
+                            metric_name=metric_name,
+                            statistic="Sum",
+                            period=Duration.days(1),
+                        )
+                        for name, metric_name in (
+                            ("started", "ReconciliationStarted"),
+                            ("runs", "ReconciliationRuns"),
+                            ("failures", "ReconciliationFailure"),
+                        )
+                    },
+                    label="Reconciliation runs started but not finished",
+                    period=Duration.days(1),
+                ),
+                threshold=0,
+                comparison_operator=(
+                    cw.ComparisonOperator.GREATER_THAN_THRESHOLD
+                ),
+                evaluation_periods=1,
+                treat_missing_data=cw.TreatMissingData.NOT_BREACHING,
+            )
+            reconciliation_timeout_alarm.add_alarm_action(
+                cw_actions.SnsAction(alert_topic)
+            )
+            operations_alarms["reconciliation_timeout"] = (
+                reconciliation_timeout_alarm
+            )
             broker_api_fn.add_environment("RECONCILIATION_ENABLED", "true")
             broker_api_fn.add_environment(
                 "RECONCILE_LAG_DAYS", str(config.reconcile_lag_days)
@@ -2122,13 +2542,18 @@ class SpendControlsStack(Stack):
         else:
             broker_api_fn.add_environment("RECONCILIATION_ENABLED", "false")
 
+        unnamed_alarms = sorted(set(operations_alarms) - set(fixed_alarm_names))
+        if unnamed_alarms:
+            raise RuntimeError(
+                "Operations alarms must use alarm_name_for(): "
+                + ", ".join(unnamed_alarms)
+            )
         broker_api_fn.add_environment(
             "OPERATIONS_ALARM_NAMES_JSON",
-            cdk.Fn.to_json_string(
-                {
-                    key: alarm.alarm_name
-                    for key, alarm in operations_alarms.items()
-                }
+            json.dumps(
+                {key: fixed_alarm_names[key] for key in operations_alarms},
+                sort_keys=True,
+                separators=(",", ":"),
             ),
         )
         broker_api_fn.add_to_role_policy(
@@ -2147,6 +2572,7 @@ class SpendControlsStack(Stack):
         # ------------------------------------------------------------------
         # Dashboard
         # ------------------------------------------------------------------
+        # Region-suffixed so a stack per Region can coexist in one account.
         dashboard = cw.Dashboard(
             self,
             "Dashboard",
@@ -2232,6 +2658,7 @@ class SpendControlsStack(Stack):
                         "RevocationSyncSuccess",
                         "RevocationSyncFailure",
                         "RevocationPolicyOverflow",
+                        "RevokedIdentitiesDropped",
                     )
                 ],
             ),
@@ -2307,9 +2734,28 @@ class SpendControlsStack(Stack):
             description="Control-plane role; it cannot invoke Bedrock models",
         )
         cdk.CfnOutput(
+            self, "ModelPricesParameterName",
+            value=model_prices_parameter_name,
+            description=(
+                "SSM parameter holding the resolved model price table "
+                "(deploy-time snapshot, refreshed daily)"
+            ),
+        )
+        cdk.CfnOutput(
             self, "ModelPriceSnapshot",
-            value=model_prices_json,
-            description="Standard on-demand USD-per-MTok prices captured at stack deployment",
+            value=cdk.Fn.join(
+                "",
+                [
+                    "ssm:", model_prices_parameter_name,
+                    " sha256:", price_snapshot_digest,
+                    " models=", price_snapshot_models,
+                ],
+            ),
+            description=(
+                "Standard on-demand prices captured at stack deployment: "
+                "parameter name, snapshot digest, model count "
+                "(aws ssm get-parameter for the full table)"
+            ),
         )
         cdk.CfnOutput(
             self, "ModelFallbackPrice",
@@ -2321,3 +2767,29 @@ class SpendControlsStack(Stack):
             cdk.CfnOutput(self, "DemoUserPoolClientId",
                           value=user_pool_client.user_pool_client_id,
                           description="Secretless app client that programmatic clients use to obtain JWTs")
+
+    def _function_log_group(self, function_id: str) -> logs.LogGroup:
+        """Explicit log group with the configured retention.
+
+        Without one Lambda creates a never-expiring group on first invoke;
+        explicit groups also make the retention visible in the template and
+        are removed with the stack.
+        """
+        return logs.LogGroup(
+            self,
+            f"{function_id}LogGroup",
+            retention=self._log_retention,
+            removal_policy=RemovalPolicy.DESTROY,
+        )
+
+    def _shared_custom_resource_log_group(self) -> logs.LogGroup:
+        """One log group for the AwsCustomResource singleton Lambda.
+
+        Every AwsCustomResource in a stack shares one provider function, so
+        they must agree on a single log group (the first one wins).
+        """
+        if self._custom_resource_log_group is None:
+            self._custom_resource_log_group = self._function_log_group(
+                "AwsSdkCustomResourceProvider"
+            )
+        return self._custom_resource_log_group

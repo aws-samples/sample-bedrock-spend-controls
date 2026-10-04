@@ -42,6 +42,26 @@ function isObject(value: unknown): value is JsonObject {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
+/** RFC 3986 percent-encoding, the form SigV4 canonicalises to. */
+function rfc3986(value: string): string {
+  return encodeURIComponent(value).replace(/[!'()*]/g, (char) => `%${char.charCodeAt(0).toString(16).toUpperCase()}`);
+}
+
+/** Builds the query string for every admin call. `URLSearchParams` is
+ *  deliberately not used: it writes a space as `+` (form encoding) while
+ *  aws4fetch signs the canonical `%20`, so a search for "Jane Doe" would
+ *  be signed for one URL and sent as another and the Function URL would
+ *  refuse it. Undefined and empty values are omitted; keys are sent in the
+ *  order given. */
+export function queryString(params: Record<string, string | number | null | undefined>): string {
+  const pairs: string[] = [];
+  for (const [key, value] of Object.entries(params)) {
+    if (value === undefined || value === null || value === "") continue;
+    pairs.push(`${rfc3986(key)}=${rfc3986(String(value))}`);
+  }
+  return pairs.length === 0 ? "" : `?${pairs.join("&")}`;
+}
+
 function defaultErrorCode(status: number): string {
   if (status === 401) return "unauthorized";
   if (status === 403) return "forbidden";
@@ -98,9 +118,22 @@ export async function transport<T>(
   path: string,
   options: TransportOptions<T> = {},
 ): Promise<TransportResponse<T>> {
+  // Sign-in, token refresh, and the Identity Pool credential exchange all
+  // happen inside authorization(). Their failures are authentication
+  // problems, not broker reachability, and are reported as such.
+  let authorization: Awaited<ReturnType<Session["authorization"]>>;
+  try {
+    authorization = await session.authorization();
+  } catch (caught) {
+    throw new ApiError(
+      caught instanceof Error && caught.message ? caught.message : "The sign-in session could not be refreshed.",
+      0,
+      "auth_error",
+    );
+  }
+
   let response: Response;
   try {
-    const authorization = await session.authorization();
     const headers: Record<string, string> = {
       "X-Quota-User-Token": authorization.idToken,
       ...options.headers,
@@ -234,6 +267,10 @@ export interface PeriodUsage extends UsageTotals {
   window_start: string;
   window_end: string;
   resets_at: string;
+  /** Requests whose USD is known to be incomplete because a dimension had
+   *  no catalog rate. Non-zero means the spend figure is an undercount and
+   *  the pricing catalog needs a repair; older brokers omit the field. */
+  unpriced_requests?: number;
 }
 
 export type CurrentUsage = Record<QuotaPeriod, PeriodUsage>;
@@ -774,6 +811,7 @@ function isPeriodUsage(value: unknown): value is PeriodUsage {
     hasString(value, "window_start") &&
     hasString(value, "window_end") &&
     hasString(value, "resets_at") &&
+    (value.unpriced_requests === undefined || isNonNegativeInteger(value.unpriced_requests)) &&
     isUsageTotals(value);
 }
 
@@ -1138,6 +1176,9 @@ export function apiErrorMessage(caught: unknown): string {
   }
 
   const suffix = caught.requestId ? ` Request ID: ${caught.requestId}.` : "";
+  if (caught.code === "auth_error") {
+    return `Sign-in could not be completed: ${caught.message} Sign in again.${suffix}`;
+  }
   if (caught.status === 0) return `Unable to reach the broker. Check your connection and try again.${suffix}`;
   if (caught.status === 401) return `Your session expired. Sign in again.${suffix}`;
   if (caught.status === 403) return `You are not authorized to perform this action.${suffix}`;
@@ -1149,6 +1190,9 @@ export function apiErrorMessage(caught: unknown): string {
   return `${caught.message}${suffix}`;
 }
 
+/** Upper bound on list pages the live-leases poll follows (50 subjects each). */
+export const LEASE_SNAPSHOT_MAX_PAGES = 10;
+
 export const api = {
   summary: async (cfg: AdminConfig, session: Session): Promise<Summary> =>
     (await transport<Summary>(cfg, session, "GET", "/admin/summary", { validate: isSummary })).data,
@@ -1157,13 +1201,21 @@ export const api = {
     (await transport<Operations>(cfg, session, "GET", "/admin/operations", { validate: isOperations })).data,
 
   reconciliation: async (cfg: AdminConfig, session: Session, limit = 14): Promise<ReconciliationResponse> =>
-    (await transport<ReconciliationResponse>(cfg, session, "GET", `/admin/reconciliation?limit=${limit}`, {
+    (await transport<ReconciliationResponse>(cfg, session, "GET", `/admin/reconciliation${queryString({ limit })}`, {
       validate: isReconciliationResponse,
     })).data,
 
   usageMetrics: async (cfg: AdminConfig, session: Session, days: number): Promise<UsageMetrics> =>
-    (await transport<UsageMetrics>(cfg, session, "GET", `/admin/usage/metrics?days=${days}`, {
+    (await transport<UsageMetrics>(cfg, session, "GET", `/admin/usage/metrics${queryString({ days })}`, {
       validate: isUsageMetrics,
+    })).data,
+
+  // Current break-glass state. Also the fallback source for the emergency
+  // card when GET /admin/operations (CloudWatch-backed) is unavailable, and
+  // the endpoint polled after an activate/recover request until it settles.
+  getEmergencyStop: async (cfg: AdminConfig, session: Session): Promise<EmergencyStopState> =>
+    (await transport<EmergencyStopState>(cfg, session, "GET", "/admin/emergency-stop", {
+      validate: isEmergencyStopState,
     })).data,
 
   getEnforcement: async (cfg: AdminConfig, session: Session): Promise<EnforcementConfig> =>
@@ -1221,28 +1273,44 @@ export const api = {
     session: Session,
     options: ListUsersOptions = {},
   ): Promise<UserListResponse> => {
-    const params = new URLSearchParams({ limit: String(options.limit ?? 25) });
-    if (options.cursor) params.set("cursor", options.cursor);
-    if (options.status) params.set("status", options.status);
-    if (options.query?.trim()) params.set("query", options.query.trim());
-    if (options.granularity) params.set("granularity", options.granularity);
+    const query = queryString({
+      limit: options.limit ?? 25,
+      cursor: options.cursor,
+      status: options.status,
+      query: options.query?.trim(),
+      granularity: options.granularity,
+    });
     return (await transport<UserListResponse>(
       cfg,
       session,
       "GET",
-      `/admin/users?${params.toString()}`,
+      `/admin/users${query}`,
       { validate: isUserListResponse },
     )).data;
   },
 
-  leaseSnapshot: async (cfg: AdminConfig, session: Session): Promise<AdminUserListResponse> =>
-    (await transport<AdminUserListResponse>(
-      cfg,
-      session,
-      "GET",
-      "/admin/users?limit=50&include_usage=false",
-      { validate: isAdminUserListResponse },
-    )).data,
+  // Every subject's lease state for the live-leases panel. The list endpoint
+  // pages at 50, so this follows next_cursor (bounded by LEASE_SNAPSHOT_MAX_PAGES)
+  // rather than showing only the alphabetically first page. The returned
+  // next_cursor is non-null only when the bound was hit with more to read.
+  leaseSnapshot: async (cfg: AdminConfig, session: Session): Promise<AdminUserListResponse> => {
+    const users: AdminUser[] = [];
+    let cursor: string | null = null;
+    for (let page = 0; page < LEASE_SNAPSHOT_MAX_PAGES; page += 1) {
+      const query = queryString({ limit: 50, include_usage: "false", cursor });
+      const response: AdminUserListResponse = (await transport<AdminUserListResponse>(
+        cfg,
+        session,
+        "GET",
+        `/admin/users${query}`,
+        { validate: isAdminUserListResponse },
+      )).data;
+      users.push(...response.users);
+      cursor = response.next_cursor;
+      if (!cursor) break;
+    }
+    return { users, next_cursor: cursor };
+  },
 
   listWorkloads: async (cfg: AdminConfig, session: Session): Promise<WorkloadListResponse> =>
     (await transport<WorkloadListResponse>(
@@ -1283,8 +1351,7 @@ export const api = {
     session: Session,
     userId: string,
   ): Promise<TransportResponse<UserDetailResponse>> => {
-    const params = new URLSearchParams({ user_id: userId });
-    return transport(cfg, session, "GET", `/admin/user?${params.toString()}`, {
+    return transport(cfg, session, "GET", `/admin/user${queryString({ user_id: userId })}`, {
       validate: (value): value is UserDetailResponse =>
         isUserDetailResponse(value) && value.user.user_id === userId,
     });
@@ -1296,19 +1363,19 @@ export const api = {
     userId: string,
     options: UsageHistoryOptions = {},
   ): Promise<UsageHistoryResponse> => {
-    const params = new URLSearchParams({
+    const query = queryString({
       user_id: userId,
-      limit: String(options.limit ?? 25),
+      limit: options.limit ?? 25,
       period: options.period ?? "daily",
+      start: options.start,
+      end: options.end,
+      cursor: options.cursor,
     });
-    if (options.start) params.set("start", options.start);
-    if (options.end) params.set("end", options.end);
-    if (options.cursor) params.set("cursor", options.cursor);
     return (await transport<UsageHistoryResponse>(
       cfg,
       session,
       "GET",
-      `/admin/user/usage-history?${params.toString()}`,
+      `/admin/user/usage-history${query}`,
       {
         validate: (value): value is UsageHistoryResponse =>
           isUsageHistoryResponse(value) && value.user_id === userId &&
@@ -1325,14 +1392,12 @@ export const api = {
     session: Session,
     options: AuditListOptions = {},
   ): Promise<AuditListResponse> => {
-    const params = new URLSearchParams({ limit: String(options.limit ?? 25) });
-    if (options.user_id) params.set("user_id", options.user_id);
-    if (options.cursor) params.set("cursor", options.cursor);
+    const query = queryString({ limit: options.limit ?? 25, user_id: options.user_id, cursor: options.cursor });
     return (await transport<AuditListResponse>(
       cfg,
       session,
       "GET",
-      `/admin/audit?${params.toString()}`,
+      `/admin/audit${query}`,
       {
         validate: (value): value is AuditListResponse =>
           isAuditListResponse(value) &&
@@ -1347,16 +1412,12 @@ export const api = {
     userId: string,
     options: Omit<AuditListOptions, "user_id"> = {},
   ): Promise<UserAuditListResponse> => {
-    const params = new URLSearchParams({
-      user_id: userId,
-      limit: String(options.limit ?? 25),
-    });
-    if (options.cursor) params.set("cursor", options.cursor);
+    const query = queryString({ user_id: userId, limit: options.limit ?? 25, cursor: options.cursor });
     return (await transport<UserAuditListResponse>(
       cfg,
       session,
       "GET",
-      `/admin/user/audit?${params.toString()}`,
+      `/admin/user/audit${query}`,
       {
         validate: (value): value is UserAuditListResponse =>
           isUserAuditListResponse(value) && value.user_id === userId &&
@@ -1378,8 +1439,7 @@ export const api = {
       ...(rate !== undefined ? { rate } : {}),
       ...(trimmedReason ? { reason: trimmedReason } : {}),
     };
-    const params = new URLSearchParams({ user_id: user.user_id });
-    return transport(cfg, session, "PUT", `/admin/user/limits?${params.toString()}`, {
+    return transport(cfg, session, "PUT", `/admin/user/limits${queryString({ user_id: user.user_id })}`, {
       body: normalized,
       headers: mutationHeaders(user),
       validate: (value): value is SetLimitsResponse =>
@@ -1400,8 +1460,7 @@ export const api = {
     status: UserStatus,
     reason: string,
   ): Promise<TransportResponse<SetStatusResponse>> => {
-    const params = new URLSearchParams({ user_id: user.user_id });
-    return transport(cfg, session, "PUT", `/admin/user/status?${params.toString()}`, {
+    return transport(cfg, session, "PUT", `/admin/user/status${queryString({ user_id: user.user_id })}`, {
       body: { status, reason: reason.trim() } satisfies SetStatusRequest,
       headers: mutationHeaders(user),
       validate: (value): value is SetStatusResponse =>
@@ -1426,10 +1485,9 @@ export const api = {
     limits: QuotaLimits,
     reason?: string,
   ): Promise<TransportResponse<ModelBudgetResponse>> => {
-    const params = new URLSearchParams({ user_id: user.user_id, model_id: modelId });
     const trimmedReason = reason?.trim();
     const normalized = normalizeLimits(limits);
-    return transport(cfg, session, "PUT", `/admin/user/model-budget?${params.toString()}`, {
+    return transport(cfg, session, "PUT", `/admin/user/model-budget${queryString({ user_id: user.user_id, model_id: modelId })}`, {
       body: { limits: normalized, ...(trimmedReason ? { reason: trimmedReason } : {}) },
       headers: mutationHeaders(user),
       validate: (value): value is ModelBudgetResponse =>
@@ -1449,9 +1507,8 @@ export const api = {
     modelId: string,
     reason?: string,
   ): Promise<TransportResponse<ModelBudgetResponse>> => {
-    const params = new URLSearchParams({ user_id: user.user_id, model_id: modelId });
     const trimmedReason = reason?.trim();
-    return transport(cfg, session, "DELETE", `/admin/user/model-budget?${params.toString()}`, {
+    return transport(cfg, session, "DELETE", `/admin/user/model-budget${queryString({ user_id: user.user_id, model_id: modelId })}`, {
       body: trimmedReason ? { reason: trimmedReason } : {},
       headers: mutationHeaders(user),
       validate: (value): value is ModelBudgetResponse =>
@@ -1469,8 +1526,7 @@ export const api = {
     userId: string,
     modelId: string,
   ): Promise<ModelUsageResponse> => {
-    const params = new URLSearchParams({ user_id: userId, model_id: modelId });
-    return (await transport<ModelUsageResponse>(cfg, session, "GET", `/admin/user/model-usage?${params.toString()}`, {
+    return (await transport<ModelUsageResponse>(cfg, session, "GET", `/admin/user/model-usage${queryString({ user_id: userId, model_id: modelId })}`, {
       validate: (value): value is ModelUsageResponse =>
         isModelUsageResponse(value) && value.user_id === userId && value.model_id === modelId,
     })).data;

@@ -18,7 +18,7 @@ generated from the JSON by `tools/threat_composer_export.py` for teams that
 work in that tool. `tests/test_threat_model.py` fails when the three
 disagree.
 
-Last updated: 2026-09-15.
+Last updated: 2026-10-04.
 
 ## What this system protects
 
@@ -34,12 +34,12 @@ changes are authorized and audited.
 
 | # | Boundary | Crosses | Implemented by |
 |---|---|---|---|
-| B1 | Application / end user → broker | OIDC JWT in `X-Quota-User-Token`; SigV4 on the `AWS_IAM` Function URL | `gateway/app/auth.py`, `gateway/app/main.py:_authenticate`, `cdk/stacks/spend_controls_stack.py` Function URL + `invoker_principal_arns` |
-| B2 | Broker → STS / IAM | `AssumeRole` with `RoleSessionName = SourceIdentity = sanitized claim`, inline session policy | `gateway/app/broker.py`, `gateway/app/session_policy.py`, `BedrockUserRole` + permissions boundary in the stack |
-| B3 | Vended session → Bedrock | IAM authorization of `bedrock:InvokeModel*` / `CountTokens` on `allowed_model_arns`; invocation log is the metering truth | Role policy, boundary, session policy; Bedrock model-invocation logging |
+| B1 | Application / end user → broker | OIDC JWT in `X-Quota-User-Token` (data-plane audience only); SigV4 on the `AWS_IAM` Function URL | `gateway/app/auth.py`, `gateway/app/main.py:_authenticate`, `cdk/stacks/spend_controls_stack.py` Function URL + `invoker_principal_arns` |
+| B2 | Broker → STS / IAM | `AssumeRole` with `RoleSessionName = SourceIdentity = sanitized claim` (the trust policy requires `sts:SourceIdentity`), inline session policy | `gateway/app/broker.py`, `gateway/app/session_policy.py`, `BedrockUserRole` + permissions boundary in the stack |
+| B3 | Vended session → Bedrock | IAM authorization of `bedrock:InvokeModel*` / `CountTokens` on `allowed_model_arns`, with an explicit deny on application inference profiles, provisioned models, and the unmetered invoke paths; invocation log is the metering truth | Role policy, boundary, session policy; Bedrock model-invocation logging |
 | B4 | Invocation logs → usage processor → DynamoDB | CloudWatch Logs subscription; `identity.arn` and `modelId` from the record; transactional ledger writes | `usage_processor/handler.py` |
 | B5 | DynamoDB streams → enforcement processors → IAM policy versions | `REVOCATION#` sentinels and `CONFIG#EMERGENCY_STOP`; `CreatePolicyVersion` on pre-attached policies; `PutRolePolicy` on workload roles | `enforcement_dispatcher/`, `revocation_processor/`, `emergency_processor/`, `workload_enforcer/` |
-| B6 | Admin UI / API → admin mutations | Shared admin key or admin JWT claim; separate break-glass key; `If-Match` + `Idempotency-Key` | `gateway/app/main.py:_require_admin`, `_require_emergency_admin`, `gateway/app/quota.py` admin mutations, admin-audit table |
+| B6 | Admin UI / API → admin mutations | Shared admin key or admin JWT claim (Identity Pool rules mapping on the same claim); separate break-glass key typed per action; `If-Match` + `Idempotency-Key` | `gateway/app/main.py:_require_admin`, `_require_emergency_admin`, `gateway/app/quota.py` admin mutations, admin-audit table |
 | B7 | Operator / account administrator → out-of-band IAM, SCP, logging config | Console/CLI with account privileges | Not controllable by the sample; `DenyDirectBedrockPolicy`, SCP guidance |
 
 ## Data flow diagram
@@ -104,7 +104,7 @@ from it.
 | DF-11 | B5 | Workload enforcer (5-minute schedule) → Workload IAM roles | Ledger read; iam:PutRolePolicy scoped to the configured role ARNs | inline Bedrock deny for over-budget workloads | A-6, A-3 |
 | DF-12 | B5 | Auto-block sweeper (nightly 00:05 UTC) → Users table, Usage table | Consistent filtered scan; TransactWriteItems conditional on version/status/reason | automatic blocks lifted to active + REVOCATION# sentinel | A-4 |
 | DF-13 | B6 | Administrator (browser) → Admin UI (S3 + CloudFront) -> Cognito PKCE -> Identity Pool -> Broker admin endpoints | OIDC authorization code + PKCE; SigV4 with Identity Pool credentials; admin JWT group claim | quota changes, blocks, enforcement dial, live leases, audit reads | A-4, A-7 |
-| DF-14 | B6 | Administrator / CLI → Broker admin endpoints | SigV4 + X-Admin-Key (Secrets Manager); break-glass key per emergency action; If-Match + Idempotency-Key | admin mutations | A-4, A-5, A-7 |
+| DF-14 | B6 | Administrator / CLI → Broker admin endpoints | SigV4 + X-Quota-Admin-Key (Secrets Manager); break-glass key per emergency action; If-Match + Idempotency-Key | admin mutations | A-4, A-5, A-7 |
 | DF-15 | internal | Broker → Admin audit table | Same transaction as the mutation | immutable audit events and idempotency records | A-7 |
 | DF-16 | internal | Broker → CloudWatch alarms/metrics, SSM roster parameter, Secrets Manager | Read-only: DescribeAlarms, GetMetricData, GetParameter, GetSecretValue at cold start | operations view, workload roster, admin keys | A-5, A-9 |
 | DF-17 | B7 | Spend reconciliation Lambda (opt-in, daily) → AWS Cost Explorer, Usage table | ce:GetCostAndUsage (resource *), ledger read, RECONCILE# write | aggregate and per-workload-tag Bedrock cost for the settled day | A-10, A-3 |
@@ -126,12 +126,20 @@ from it.
 An attacker presents a fabricated or captured token to obtain credentials
 under another identity.
 *Mitigation:* signature verified against the issuer's JWKS (RS/ES) or the
-dev-only HS256 secret; `iss`, `aud` (any of the configured list), `exp`
-enforced — `gateway/app/auth.py:JwtVerifier.verify`. Discovery and JWKS
-URLs must be HTTPS (`test_auth.py::test_oidc_discovery_rejects_non_https_*`).
-The lease deadline is capped at the token's `exp`
-(`main.py:_reserve_permission_lease`, `expires_no_later_than=jwt_expiration`),
-so a replayed token cannot mint credentials that outlive it.
+dev-only HS256 secret; `iss`, `aud`, `exp` enforced —
+`gateway/app/auth.py:JwtVerifier.verify`. Only the first configured
+audience is accepted on `/v1/credentials`; the console client's audience is
+honoured on `/admin/*` alone (`auth.py:accepted_audiences`), so a console
+login cannot vend. Discovery and JWKS URLs must be HTTPS
+(`test_auth.py::test_oidc_discovery_rejects_non_https_*`). The lease
+deadline is capped at the token's `exp` (`main.py:_reserve_permission_lease`,
+`expires_no_later_than=jwt_expiration`), so a replayed token cannot mint
+credentials that outlive it. On the application side, the client library
+keys its per-user cache on a claim it reads **without** verifying the
+signature; the integration guide therefore requires the application to
+verify the token before `client_for`, and `verified_identity=` /
+`client_for_identity` reject a token whose claim differs
+(`examples/refreshable_bedrock.py`, `tests/test_refreshable_credentials.py`).
 *Residual:* a valid token stolen before `exp` is usable until then; there is
 no `jti` replay cache. **Status: Accepted** — the caller must also hold an
 IAM principal allowed on the Function URL (SigV4), so token theft alone is
@@ -204,7 +212,10 @@ set as `SourceIdentity`; the exact stamped value is persisted on the user
 row (`quota.py:record_session`, `source_identity`) so the revocation
 processor never re-derives it. Reverse map `SESSION#<name> → maps_to`.
 `SetSourceIdentity` and `TagSession` are granted only to the broker role on
-the trust policy (stack). **Status: Mitigated** (`tests/test_broker.py`).
+the trust policy, and the trust policy requires `sts:SourceIdentity`
+(`Null: false`), so no `BedrockUserRole` session can exist without a stamped
+identity for metering and revocation to key on (stack).
+**Status: Mitigated** (`tests/test_broker.py`).
 
 **T-06 · Elevation · Session policy widens access.** Priority **High**.
 > A holder of vended credentials whose lease session policy carries Resource
@@ -218,7 +229,13 @@ the trust policy (stack). **Status: Mitigated** (`tests/test_broker.py`).
 policy and the permissions boundary, so `"*"` cannot add a model absent from
 `allowed_model_arns` (`session_policy.py` docstring; stack boundary). The
 role grants exactly `bedrock:CountTokens`, `InvokeModel`,
-`InvokeModelWithResponseStream`. **Status: Mitigated.**
+`InvokeModelWithResponseStream`. Both the role policy and the boundary also
+carry an explicit `Deny` on `application-inference-profile/*` and
+`provisioned-model/*` and on `StartAsyncInvoke` /
+`InvokeModelWithBidirectionalStream` (`vended_session_guardrails` in the
+stack), so even `allowed_model_arns: ["*"]` cannot reach a workload's
+profile, provisioned throughput, or an unmetered invoke path.
+**Status: Mitigated.**
 
 **T-07 · Elevation · Bearer-token bypass of the model allowlist.** Priority **High**.
 > A holder of vended credentials if bedrock:CallWithBearerToken were ever
@@ -282,12 +299,16 @@ it is not trusted. **Status: Mitigated.**
 > resulting in reduced integrity and economy of Bedrock spend and usage
 > ledger.
 
-`StartAsyncInvoke` and `InvokeModelWithBidirectionalStream` authorize under
-`bedrock:InvokeModel*` but produce no invocation-log record.
-*Mitigation:* none possible in the data plane. Documented with the
-recommendation to exclude such models from `allowed_model_arns`
-(README "Metering coverage caveat"; the reconciliation delta runbook lists
-it as a cause). **Status: Accepted.**
+`StartAsyncInvoke` and `InvokeModelWithBidirectionalStream` produce no
+invocation-log record.
+*Mitigation:* the vended role policy and the permissions boundary explicitly
+deny both actions (`vended_session_guardrails` in the stack,
+`tests/test_cdk_stack.py`), so a vended session cannot use them whatever
+`allowed_model_arns` says; the SCP example in DEPLOYMENT.md § Prevent bypass
+denies the same actions for other principals. **Status: Mitigated.**
+*Residual:* any other principal holding these actions (or
+`bedrock-mantle:*`, T-08) spends unmetered unless the SCP is applied — see
+T-26; reconciliation shows the gap as a positive delta.
 
 **T-11 · Tampering · Image generation priced at zero when image delivery is
 off.** Priority **Low**.
@@ -488,12 +509,17 @@ visible for a day through `AutoBlockSweepFailureAlarm` and the console card.
 > reduced integrity and availability of administrative secrets, quota
 > configuration and subject status and enforcement IAM policies.
 
-*Mitigation:* both keys live in Secrets Manager, are read by the Lambda at
-cold start, never reach the browser (`config.js` carries public identifiers
-only; the UI authorizes by admin JWT claim); the break-glass key is entered
-per action and not persisted (`admin-ui`, DEPLOYMENT.md § Operations tab);
-`ADMIN_JWT_CLAIM` empty disables JWT admin so a browser can never be an
-admin without the group. Both compares are constant-time
+*Mitigation:* both keys live in Secrets Manager and are read by the Lambda
+at cold start. The routine key never reaches the browser (`config.js`
+carries public identifiers only; the UI authorizes by admin JWT claim, and
+the Identity Pool's rules mapping on `admin_jwt_claim` / `admin_jwt_value`
+hands AWS credentials only to members of that group, `AmbiguousRoleResolution:
+Deny` for everyone else, so a non-admin login cannot even reach the
+Function URL). The break-glass key is typed by the operator for each
+emergency action, sent in the request header, cleared on submit, excluded
+from autofill, and never stored (`admin-ui`, operations.md § Emergency
+stop); `ADMIN_JWT_CLAIM` empty disables JWT admin so a browser can never be
+an admin without the group. Both compares are constant-time
 (`main.py:_require_admin` and `_require_emergency_admin`,
 `secrets.compare_digest`). **Status: Mitigated.** *Residual:* key rotation is
 manual and requires container recycling (gateway runbook).
@@ -508,7 +534,11 @@ manual and requires container recycling (gateway runbook).
 A user adds themselves to the admin group at the IdP.
 *Mitigation:* the claim/value is operator-configured
 (`admin_jwt_claim`/`admin_jwt_value`); IdP group membership is outside the
-sample. **Status: Accepted.**
+sample. The Identity Pool rules mapping and the broker check the same claim,
+so a user outside the group receives no AWS credentials at all rather than a
+`403`, and the console audience is accepted on `/admin/*` only
+(`auth.py:accepted_audiences`), so even an admin login cannot vend Bedrock
+credentials. **Status: Accepted.**
 
 **T-23 · Repudiation · Unaudited or replayed administrative change.** Priority **Medium**.
 > An administrator with a valid admin credential can change a limit or
@@ -652,8 +682,8 @@ already been compromised at the account level.
 
 | Status | Count | IDs |
 |---|---|---|
-| Mitigated | 19 | T-03, T-04, T-05, T-06, T-07, T-08 (vended sessions), T-09, T-13*, T-14, T-17*, T-18, T-20, T-21, T-23, T-25, T-28, T-29, T-30, T-31 |
-| Accepted | 12 | T-01, T-02, T-10, T-11, T-12, T-15, T-16*, T-19, T-22, T-24, T-26, T-27 |
+| Mitigated | 20 | T-03, T-04, T-05, T-06, T-07, T-08 (vended sessions), T-09, T-10 (vended sessions), T-13*, T-14, T-17*, T-18, T-20, T-21, T-23, T-25, T-28, T-29, T-30, T-31 |
+| Accepted | 11 | T-01, T-02, T-11, T-12, T-15, T-16*, T-19, T-22, T-24, T-26, T-27 |
 | Open | 0 | — |
 
 \* bounded rather than eliminated.

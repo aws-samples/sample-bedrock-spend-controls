@@ -16,15 +16,42 @@ matched literally, never guessed from substrings, so a renamed dimension
 surfaces as a missing rate (alarmed) rather than a silently wrong price.
 """
 
+import base64
+import gzip
+import hashlib
 import json
 import os
 from datetime import datetime, timezone
 from decimal import Decimal
 
 import boto3
+from botocore.exceptions import ClientError
 
 SERVICE_CODE = "AmazonBedrock"
 PRICING_API_REGION = "us-east-1"
+
+# Parameter Store caps Intelligent-Tiering / Advanced parameters at 8 KB.
+# The stored value is the minimized JSON document, gzip-compressed and
+# base64-encoded behind an explicit marker (``COMPRESSED_PREFIX``), so the
+# shipped catalog (~9 KB of JSON) fits in about 1 KB. The resolver refuses
+# to write anything at or above ``PARAMETER_VALUE_MAX_BYTES`` (a margin
+# under the hard cap) so the failure is a clear deploy/refresh error rather
+# than a truncated price table. The usage processor decodes the marked form
+# and still accepts a legacy plain-JSON value (starting with ``{``), so an
+# in-place upgrade keeps metering between the deploy and the first refresh.
+PARAMETER_MAX_BYTES = 8192
+PARAMETER_VALUE_MAX_BYTES = 7800
+COMPRESSED_PREFIX = "gz1:"
+# Length of the hex digest returned to CloudFormation in place of the full
+# snapshot (the full JSON would push the custom-resource response past the
+# 4,096-byte CloudFormation limit).
+_DIGEST_CHARS = 16
+# Inference-profile prefixes the usage processor resolves to the base model
+# when a profile ID has no entry of its own; must stay in sync with
+# usage_processor/handler.py _PROFILE_PREFIXES.
+_PROFILE_PREFIXES = frozenset(
+    {"us", "eu", "apac", "jp", "au", "ca", "sa", "global", "us-gov"}
+)
 
 # ``inferenceType`` -> price-entry key, for the token dimensions priced per
 # 1K tokens in the Price List and stored here per million tokens.
@@ -220,23 +247,200 @@ def _resolve(pricing_client, properties: dict) -> tuple[dict, dict]:
     return snapshot, fallback
 
 
-def handler(event, _context):
+def _compact(value) -> str:
+    return json.dumps(value, sort_keys=True, separators=(",", ":"))
+
+
+def _compact_rates(price: dict) -> dict:
+    """Render whole-number rates as ints (``5.0`` -> ``5``).
+
+    The usage processor coerces every rate with ``float()``, so this is
+    lossless for it and saves two bytes per whole rate in a document that
+    is measured against the 8 KB Parameter Store cap.
+    """
+    return {
+        key: int(rate) if float(rate).is_integer() else float(rate)
+        for key, rate in price.items()
+    }
+
+
+def minimize_snapshot(snapshot: dict) -> tuple[dict, list[str]]:
+    """Drop profile entries the usage processor derives on its own.
+
+    For ``<prefix>.<base-model>`` IDs with no entry, the processor prices at
+    the base model's rates. An explicit entry identical to the base is
+    therefore redundant and is dropped from the stored document (the
+    processor reports such requests as ``base-model`` priced, never as
+    fallback). Entries whose rates differ (Regional uplifts) are kept.
+    Returns the minimized snapshot and the dropped IDs.
+    """
+    kept: dict = {}
+    dropped: list[str] = []
+    for model_id, price in snapshot.items():
+        prefix, separator, base_model = model_id.partition(".")
+        if (
+            separator
+            and prefix in _PROFILE_PREFIXES
+            and snapshot.get(base_model) == price
+        ):
+            dropped.append(model_id)
+            continue
+        kept[model_id] = _compact_rates(price)
+    return kept, dropped
+
+
+def encode_parameter_value(document: str) -> str:
+    """Encode the JSON document as ``gz1:<base64(gzip(document))>``.
+
+    ``mtime=0`` and a fixed compression level make the encoding a pure
+    function of the document, so identical snapshots produce identical
+    parameter values (no spurious parameter versions). The marker lets the
+    reader tell this form from a legacy plain-JSON value unambiguously:
+    base64 output never starts with ``{``.
+    """
+    compressed = gzip.compress(
+        document.encode("utf-8"), compresslevel=9, mtime=0
+    )
+    return COMPRESSED_PREFIX + base64.b64encode(compressed).decode("ascii")
+
+
+def decode_parameter_value(value: str) -> dict:
+    """Inverse of :func:`encode_parameter_value`; also accepts plain JSON.
+
+    Mirrors the usage processor's reader (kept there as a private helper
+    because the two Lambdas are packaged separately). Used by tests to
+    pin both sides to the same contract.
+    """
+    if value.startswith(COMPRESSED_PREFIX):
+        compressed = base64.b64decode(value[len(COMPRESSED_PREFIX):])
+        return json.loads(gzip.decompress(compressed).decode("utf-8"))
+    if value.startswith("{"):
+        return json.loads(value)
+    raise ValueError(
+        "Unrecognised price parameter encoding: expected a value starting "
+        f"with {COMPRESSED_PREFIX!r} or '{{'"
+    )
+
+
+def write_price_parameter(
+    ssm, parameter_name: str, snapshot: dict, fallback: dict
+) -> dict:
+    """Write ``{"models", "fallback", "resolved_at"}`` to Parameter Store.
+
+    This is the only writer of the parameter the usage processor reads, for
+    both the deploy-time custom resource and the daily refresh. The value
+    is stored in the compressed form from :func:`encode_parameter_value`;
+    the parameter is Intelligent-Tiering so a value that outgrows the 4 KB
+    standard tier is promoted automatically (up to 8 KB; a value at or
+    above ``PARAMETER_VALUE_MAX_BYTES`` fails here with an explicit error
+    rather than a truncated table).
+    """
+    stored, dropped = minimize_snapshot(snapshot)
+    resolved_at = datetime.now(timezone.utc).isoformat()
+    document = _compact(
+        {
+            "models": stored,
+            "fallback": _compact_rates(fallback),
+            "resolved_at": resolved_at,
+        }
+    )
+    json_size = len(document.encode("utf-8"))
+    value = encode_parameter_value(document)
+    size = len(value.encode("utf-8"))
+    if size >= PARAMETER_VALUE_MAX_BYTES:
+        raise ValueError(
+            f"Encoded price parameter value is {size} bytes (from a "
+            f"{json_size}-byte JSON document with {len(stored)} stored "
+            f"models); the resolver requires it to stay under "
+            f"{PARAMETER_VALUE_MAX_BYTES} bytes to fit Parameter Store's "
+            f"{PARAMETER_MAX_BYTES}-byte cap with margin. Trim "
+            "catalog_models or price_overrides (Regional profile pins "
+            "identical to their base model are already omitted)."
+        )
+    ssm.put_parameter(
+        Name=parameter_name,
+        Value=value,
+        Type="String",
+        Tier="Intelligent-Tiering",
+        Overwrite=True,
+        Description=(
+            "Bedrock model token prices used by quota metering; "
+            "refreshed daily from the AWS Pricing API"
+        ),
+    )
+    digest = hashlib.sha256(_compact(snapshot).encode("utf-8")).hexdigest()
+    return {
+        "digest": digest[:_DIGEST_CHARS],
+        "models": len(snapshot),
+        "stored": len(stored),
+        "derived": dropped,
+        "resolved_at": resolved_at,
+        # Size of the value as written (the figure Parameter Store caps).
+        "bytes": size,
+        "json_bytes": json_size,
+    }
+
+
+def _delete_price_parameter(ssm, parameter_name: str) -> None:
+    try:
+        ssm.delete_parameter(Name=parameter_name)
+    except ClientError as exc:
+        if exc.response.get("Error", {}).get("Code") != "ParameterNotFound":
+            raise
+
+
+def handler(event, _context, *, pricing_client=None, ssm_client=None):
+    """CloudFormation custom-resource entrypoint.
+
+    Writes the resolved snapshot straight to the SSM parameter named in
+    ``ResourceProperties.ParameterName`` and returns only a short digest,
+    the model count, and the (small) fallback price as attributes. The full
+    snapshot never rides in the response: CloudFormation rejects
+    custom-resource responses over 4,096 bytes, and the catalog alone is
+    larger than that once cache and image dimensions are included.
+    """
     properties = event["ResourceProperties"]
     physical_id = f"bedrock-model-prices-{properties['RegionCode']}"
+    # Delete events for a resource created by an older template version
+    # carry no ParameterName (that version owned no parameter).
+    parameter_name = properties.get("ParameterName", "")
     if event["RequestType"] == "Delete":
+        if parameter_name:
+            ssm = ssm_client or boto3.client("ssm")
+            _delete_price_parameter(ssm, parameter_name)
         return {"PhysicalResourceId": physical_id}
+    if not parameter_name:
+        raise ValueError("ResourceProperties.ParameterName is required")
 
-    client = boto3.client("pricing", region_name=PRICING_API_REGION)
-    snapshot, fallback = _resolve(client, properties)
+    ssm = ssm_client or boto3.client("ssm")
+    pricing = pricing_client or boto3.client(
+        "pricing", region_name=PRICING_API_REGION
+    )
+    snapshot, fallback = _resolve(pricing, properties)
+    written = write_price_parameter(ssm, parameter_name, snapshot, fallback)
+    print(
+        json.dumps(
+            {
+                "level": "info",
+                "message": "Wrote Bedrock model price parameter",
+                "parameter": parameter_name,
+                "models": written["models"],
+                "stored": written["stored"],
+                "derived": written["derived"],
+                "bytes": written["bytes"],
+                "json_bytes": written["json_bytes"],
+                "digest": written["digest"],
+            }
+        )
+    )
     return {
         "PhysicalResourceId": physical_id,
         "Data": {
-            "ModelPricesJson": json.dumps(
-                snapshot, sort_keys=True, separators=(",", ":")
-            ),
-            "FallbackPriceJson": json.dumps(
-                fallback, sort_keys=True, separators=(",", ":")
-            ),
+            "ParameterName": parameter_name,
+            "SnapshotDigest": written["digest"],
+            "ModelCount": str(written["models"]),
+            "ResolvedAt": written["resolved_at"],
+            "FallbackPriceJson": _compact(fallback),
         },
     }
 
@@ -259,30 +463,20 @@ def scheduled_handler(event, _context, *, pricing_client=None, ssm_client=None):
     )
     ssm = ssm_client or boto3.client("ssm")
     snapshot, fallback = _resolve(pricing, event)
-    resolved_at = datetime.now(timezone.utc).isoformat()
-    ssm.put_parameter(
-        Name=parameter_name,
-        Value=json.dumps(
-            {
-                "models": snapshot,
-                "fallback": fallback,
-                "resolved_at": resolved_at,
-            },
-            sort_keys=True,
-            separators=(",", ":"),
-        ),
-        Type="String",
-        Overwrite=True,
-    )
+    written = write_price_parameter(ssm, parameter_name, snapshot, fallback)
     print(
         json.dumps(
             {
                 "level": "info",
                 "message": "Refreshed Bedrock model price parameter",
                 "parameter": parameter_name,
-                "models": len(snapshot),
-                "resolved_at": resolved_at,
+                "models": written["models"],
+                "stored": written["stored"],
+                "bytes": written["bytes"],
+                "json_bytes": written["json_bytes"],
+                "digest": written["digest"],
+                "resolved_at": written["resolved_at"],
             }
         )
     )
-    return {"models": len(snapshot), "resolved_at": resolved_at}
+    return {"models": written["models"], "resolved_at": written["resolved_at"]}

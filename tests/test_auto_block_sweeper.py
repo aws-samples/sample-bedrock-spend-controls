@@ -324,6 +324,116 @@ def test_unexpected_dynamodb_error_alerts_and_raises(
     assert _row(fake_dynamodb, sweeper.STATE_ROW_ID)["failures"][0]["user_id"] == "alice"
 
 
+def test_scan_failure_is_reported_not_swallowed(
+    fake_dynamodb, fake_sns, monkeypatch, capsys
+):
+    """H-4: a failing scan raises the sweep-failure alarm, records the state
+    row and re-raises, instead of surfacing only as a bare Lambda error."""
+    users_table = fake_dynamodb.Table(USERS)
+
+    def failing_scan(**kwargs):
+        raise ClientError(
+            {"Error": {"Code": "ProvisionedThroughputExceededException",
+                       "Message": "slow down"}},
+            "Scan",
+        )
+
+    monkeypatch.setattr(users_table, "scan", failing_scan)
+
+    with pytest.raises(RuntimeError, match="1 row"):
+        _run(fake_dynamodb, fake_sns)
+
+    assert "AUTO-BLOCK SWEEP FAILED" in fake_sns.published[0]["Subject"]
+    message = json.loads(fake_sns.published[0]["Message"])
+    assert message["failures"] == [
+        {"user_id": "<scan>", "error": message["failures"][0]["error"]}
+    ]
+    assert "slow down" in message["failures"][0]["error"]
+    state = _row(fake_dynamodb, sweeper.STATE_ROW_ID)
+    assert state["evaluated"] == 0
+    assert state["failures"][0]["user_id"] == "<scan>"
+    emf = [json.loads(line) for line in capsys.readouterr().out.splitlines() if line]
+    assert any(e.get("AutoBlockSweepFailure") == 1 for e in emf)
+
+
+def test_malformed_row_is_isolated_and_other_rows_still_lift(
+    fake_dynamodb, fake_sns, monkeypatch
+):
+    """H-4: a non-ClientError out of over_budget (bad row data) is a per-row
+    failure, not the end of the sweep."""
+    _seed_user(fake_dynamodb, "alice")
+    _seed_user(fake_dynamodb, "broken")
+    real_over_budget = sweeper.over_budget
+
+    def picky_over_budget(usage_table, item, now, *, warn_threshold):
+        if item["user_id"] == "broken":
+            raise ValueError("limits are not numeric")
+        return real_over_budget(usage_table, item, now, warn_threshold=warn_threshold)
+
+    monkeypatch.setattr(sweeper, "over_budget", picky_over_budget)
+
+    with pytest.raises(RuntimeError, match="1 row"):
+        _run(fake_dynamodb, fake_sns)
+
+    assert _row(fake_dynamodb, "alice")["status"] == "active"
+    assert _row(fake_dynamodb, "broken")["status"] == "blocked"
+    message = json.loads(fake_sns.published[0]["Message"])
+    assert message["lifted_users"] == ["alice"]
+    assert message["failures"] == [
+        {"user_id": "broken", "error": "limits are not numeric"}
+    ]
+
+
+def _cancelled(reasons: list[str] | None, message: str = "Transaction cancelled"):
+    response = {
+        "Error": {"Code": "TransactionCanceledException", "Message": message}
+    }
+    if reasons is not None:
+        response["CancellationReasons"] = [{"Code": code} for code in reasons]
+    return ClientError(response, "TransactWriteItems")
+
+
+def test_only_conditional_check_cancellations_count_as_races():
+    race = sweeper._is_conditional_race
+    assert race(_cancelled(["ConditionalCheckFailed", "None"])) is True
+    assert race(_cancelled(["None", "ConditionalCheckFailed"])) is True
+    assert race(_cancelled(["None", "ThrottlingError"])) is False
+    assert race(_cancelled(["TransactionConflict", "None"])) is False
+    assert race(_cancelled(["ConditionalCheckFailed", "ValidationError"])) is False
+    # No reasons list (older responses, fakes): fall back to the message.
+    assert race(_cancelled(None, "reasons [ConditionalCheckFailed, None]")) is True
+    assert race(_cancelled(None, "reasons [None, ThrottlingError]")) is False
+    assert race(
+        ClientError({"Error": {"Code": "ConditionalCheckFailedException",
+                               "Message": ""}}, "UpdateItem")
+    ) is True
+    assert race(
+        ClientError({"Error": {"Code": "InternalServerError", "Message": ""}},
+                    "TransactWriteItems")
+    ) is False
+
+
+def test_throttled_transaction_is_a_failure_not_a_race(
+    fake_dynamodb, fake_sns, monkeypatch
+):
+    _seed_user(fake_dynamodb, "alice")
+
+    def throttled_transaction(**kwargs):
+        raise _cancelled(["None", "ThrottlingError"])
+
+    monkeypatch.setattr(
+        fake_dynamodb.meta.client, "transact_write_items", throttled_transaction
+    )
+
+    with pytest.raises(RuntimeError, match="1 row"):
+        _run(fake_dynamodb, fake_sns)
+
+    message = json.loads(fake_sns.published[0]["Message"])
+    assert message["raced"] == 0
+    assert message["failures"][0]["user_id"] == "alice"
+    assert _row(fake_dynamodb, "alice")["status"] == "blocked"
+
+
 def test_success_emits_emf_counters(fake_dynamodb, fake_sns, capsys):
     _seed_user(fake_dynamodb, "alice")
 

@@ -6,7 +6,8 @@ row re-evaluation helpers in
 the workload enforcer). **Log group:** `/aws/lambda/<AutoBlockSweeperFn>`.
 **Invocation:** `AutoBlockSweepSchedule` (`cron(5 0 * * ? *)`, 00:05 UTC,
 right after the daily/weekly/monthly windows roll over). 256 MB, 2 min
-timeout, reserved concurrency 1.
+timeout, reserved concurrency 1 (unless `reserve_enforcement_concurrency`
+is `false`).
 
 ## Why it exists
 
@@ -41,14 +42,17 @@ blocked until the month rolls over.
    `Put REVOCATION#<user_id>` with `desired_status: active`. The sentinel is
    what the users-table stream → enforcement dispatcher → revocation
    processor fast path keys on, so the Deny shards converge within seconds.
-   A conditional failure means another writer (vend, admin, usage
-   processor) changed the row first; it is counted as `raced`, not
-   retried.
+   A transaction cancelled by the row's own conditional check means another
+   writer (vend, admin, usage processor) changed the row first; it is
+   counted as `raced`, not retried. Any other cancellation reason
+   (`TransactionConflict`, throttling, validation) is a failure.
 4. Write the run summary to `CONFIG#AUTO_BLOCK_SWEEP` (no TTL) so
    `GET /admin/operations` → `auto_block_sweep` and the console's
    "Auto-block sweep" card show that the job ran and what it did.
-5. Emit EMF counters; on any unexpected DynamoDB error publish
-   `AUTO-BLOCK SWEEP FAILED` and raise so the Lambda error is recorded.
+5. Emit EMF counters; on any unexpected error (the scan itself, a row's
+   evaluation or lift, the state-row write) publish `AUTO-BLOCK SWEEP
+   FAILED`, emit `AutoBlockSweepFailure`, and raise so the Lambda error is
+   recorded. A scan failure appears as `failures[].user_id: "<scan>"`.
 
 `{"dry_run": true}` in the event evaluates and reports without writing rows
 or the state row.
@@ -67,7 +71,7 @@ or the state row.
 |---|---|
 | `USERS_TABLE`, `USAGE_TABLE`, `WARN_THRESHOLD`, `USAGE_RETENTION_DAYS` (sentinel TTL) | Row status flip (`blocked` → `active`) + `REVOCATION#<user>` sentinel, atomically |
 | Blocked user rows; usage rows `<user>`, `<user>#model#<id>`, `RATE#<user>` | `CONFIG#AUTO_BLOCK_SWEEP` `{ran_at, dry_run, evaluated, lifted, still_blocked, admin_blocked, raced, lifted_users[], failures[]}` |
-| Event `{"source": "aws.events"}` or `{"source": "manual", "dry_run": bool}` | EMF `AutoBlockSweepSuccess`, `AutoBlockSweepEvaluated`, `AutoBlockSweepLifted`, `AutoBlockSweepStillBlocked`, `AutoBlockSweepRaced`, `AutoBlockSweepFailure` |
+| Event `{"source": "aws.events"}` or `{"source": "manual", "dry_run": bool}` | EMF (no dimensions) `AutoBlockSweepSuccess`, `AutoBlockSweepEvaluated`, `AutoBlockSweepLifted`, `AutoBlockSweepStillBlocked`, `AutoBlockSweepRaced`, `AutoBlockSweepFailure` |
 | | SNS `AUTO-BLOCK SWEEP FAILED` (failures only; lifts are not notified) |
 | | Return: the same summary as the state row |
 
@@ -75,7 +79,7 @@ or the state row.
 
 | Symptom | Alarm | Notes |
 |---|---|---|
-| DynamoDB error during scan / transaction / state write | [auto-block-sweep-failure](../alarms/auto-block-sweep-failure.md) | Rows already lifted in the pass stay lifted; the rest wait for the next night or a manual pass. |
+| DynamoDB error during scan / transaction / state write | [auto-block-sweep-failure](../alarms/auto-block-sweep-failure.md) and [auto-block-sweeper-errors](../alarms/auto-block-sweeper-errors.md) | Rows already lifted in the pass stay lifted; the rest wait for the next night or a manual pass. |
 | `raced` > 0 | — | Expected under concurrent vends or admin changes; the winner already re-evaluated. |
 | Card says "Never ran" days after deploy | Lambda `Errors` / `Invocations` | The schedule did not fire or the function failed before writing the state row. Check the log group. |
 | Lifted user still denied by IAM | [revocation-sync-failure](../alarms/revocation-sync-failure.md) | The sentinel was written; the revocation processor has not converged. The 5-minute repair schedule also picks it up. |
@@ -89,9 +93,9 @@ or the state row.
   failed night): same command without `dry_run`. Safe to repeat; a second
   pass finds nothing to lift.
 - **Lift one user now:** the admin API (`PUT /admin/user/status` with
-  `{"status":"active"}`) — but that makes the status admin-origin, so a
-  later breach re-blocks it automatically and the *next* reset will **not**
-  auto-lift it. Prefer waiting for the sweep or raising the limit.
+  `{"status":"active"}`). The unblock is admin-origin, but a later breach
+  re-blocks the row with automatic origin, and that block auto-lifts like
+  any other. Prefer waiting for the sweep or raising the limit.
 - **Check the last run without the console:**
   `aws dynamodb get-item --table-name <UsersTable> --key '{"user_id":{"S":"CONFIG#AUTO_BLOCK_SWEEP"}}'`.
 

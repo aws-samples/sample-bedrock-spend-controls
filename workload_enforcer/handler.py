@@ -13,12 +13,22 @@ the next run retries. Workloads without a configured role_arn are metered
 and alerted but cannot be hard-enforced; they surface as
 ``enforcement_ready: false`` in the admin API and as the
 ``WorkloadEnforcementSkipped`` metric here.
+
+Convergence is per IAM principal, not per workload: several workloads may
+share one role, and a role carries the Deny while ANY workload on it is
+blocked. The inline policy name is unique per stack and Region so two
+deployments enforcing the same role never overwrite each other. A role
+that still carries the legacy fixed name is migrated: the legacy policy is
+deleted once the stack-scoped one is in place (or when converging to "no
+deny"). A workload whose row cannot be read keeps its role unchanged rather
+than lifting a Deny on stale information.
 """
 
 from __future__ import annotations
 
 import json
 import os
+import re
 from datetime import datetime, timezone
 from urllib.parse import unquote
 
@@ -36,6 +46,11 @@ BEDROCK_ACTIONS = (
     "bedrock:InvokeModelWithResponseStream",
 )
 DENY_SID = "BedrockQuotaWorkloadDeny"
+# The pre-scoping fixed name. Still recognised so an upgraded stack removes
+# the policies an older enforcer left behind; never written again.
+LEGACY_DENY_POLICY_NAME = "bedrock-spend-controls-workload-deny"
+_POLICY_NAME_MAX_LENGTH = 128  # IAM inline policy name limit
+_POLICY_NAME_INVALID = re.compile(r"[^\w+=,.@-]")
 METRICS_NAMESPACE = os.environ.get(
     "METRICS_NAMESPACE", "BedrockSpendControls"
 )
@@ -43,6 +58,25 @@ METRICS_NAMESPACE = os.environ.get(
 
 def _compact(document: dict) -> str:
     return json.dumps(document, separators=(",", ":"), sort_keys=True)
+
+
+def deny_policy_name() -> str:
+    """The stack-and-Region-scoped inline policy name.
+
+    ``DENY_POLICY_NAME`` wins when the stack passes a non-legacy value.
+    Otherwise the name is derived from ``AWS_REGION`` plus ``STACK_NAME``
+    (or, failing that, ``AWS_LAMBDA_FUNCTION_NAME``), so two stacks or two
+    Regional deployments enforcing the same role each own a distinct policy.
+    """
+    configured = os.environ.get("DENY_POLICY_NAME", "")
+    if configured and configured != LEGACY_DENY_POLICY_NAME:
+        return configured
+    scope = os.environ.get("STACK_NAME") or os.environ.get(
+        "AWS_LAMBDA_FUNCTION_NAME", ""
+    )
+    parts = [LEGACY_DENY_POLICY_NAME, os.environ.get("AWS_REGION", ""), scope]
+    name = "-".join(_POLICY_NAME_INVALID.sub("-", part) for part in parts if part)
+    return name[:_POLICY_NAME_MAX_LENGTH]
 
 
 def deny_policy() -> dict:
@@ -178,6 +212,32 @@ def _set_active(users_table, item: dict) -> bool:
     return True
 
 
+def _desired_status(
+    users_table, usage_table, workload_id: str, now: datetime, result: dict
+) -> str:
+    """``blocked`` or ``active`` for one workload row, lifting a reset block.
+
+    A missing row is ``active``: a workload removed from the table (or never
+    metered) must not keep a Deny on its role. Raises ``ClientError`` so the
+    caller can mark the workload unknown instead of guessing.
+    """
+    item = users_table.get_item(
+        Key={"user_id": workload_id}, ConsistentRead=True
+    ).get("Item")
+    if item is None:
+        return "active"
+    status = str(item.get("status", "active"))
+    if (
+        status == "blocked"
+        and automatic_owned(item)
+        and not _over_budget(usage_table, item, now)
+        and _set_active(users_table, item)
+    ):
+        result["unblocked"] += 1
+        return "active"
+    return status
+
+
 def _notify(sns, subject: str, payload: dict) -> None:
     topic_arn = os.environ.get("SNS_TOPIC_ARN", "")
     if topic_arn:
@@ -241,65 +301,89 @@ def handler(event, context, *, dynamodb=None, iam=None, sns=None) -> dict:
     workloads = json.loads(os.environ["WORKLOADS_JSON"])
     if not workloads:
         return {"enforced": False, "reason": "no-workloads-configured"}
-    policy_name = os.environ.get(
-        "DENY_POLICY_NAME", "bedrock-spend-controls-workload-deny"
-    )
+    policy_name = deny_policy_name()
     users_table = dynamodb.Table(os.environ["USERS_TABLE"])
     usage_table = dynamodb.Table(os.environ["USAGE_TABLE"])
     now = datetime.now(timezone.utc)
 
     result: dict = {
         "enforced": True,
+        "policy_name": policy_name,
         "attached": 0,
         "detached": 0,
         "unchanged": 0,
         "unblocked": 0,
         "skipped_not_ready": 0,
+        "skipped_unknown_status": 0,
         "blocked_workloads": 0,
         "workloads": [],
+        "roles": [],
     }
     failures: list[dict] = []
+
+    # Phase 1: resolve every workload's desired status. A workload whose row
+    # cannot be read is "unknown" and must not lift a Deny on its role.
+    by_principal: dict[str, list[dict]] = {}
     for workload_id in sorted(workloads):
         configuration = workloads[workload_id]
-        item = users_table.get_item(
-            Key={"user_id": workload_id}, ConsistentRead=True
-        ).get("Item")
-        status = str(item.get("status", "active")) if item else "active"
-        if (
-            item is not None
-            and status == "blocked"
-            and automatic_owned(item)
-            and not _over_budget(usage_table, item, now)
-        ):
-            if _set_active(users_table, item):
-                status = "active"
-                result["unblocked"] += 1
-        desired_blocked = status == "blocked"
-        if desired_blocked:
-            result["blocked_workloads"] += 1
         principal_arn = str(configuration.get("role_arn") or "")
-        entry = {
+        entry: dict = {
             "workload_id": workload_id,
-            "status": status,
+            "role_arn": principal_arn,
+            "status": "unknown",
             "enforcement_ready": bool(principal_arn),
         }
-        if not principal_arn:
-            if desired_blocked:
-                result["skipped_not_ready"] += 1
-            result["workloads"].append(entry)
-            continue
         try:
-            if desired_blocked:
-                changed = _attach(iam, principal_arn, policy_name)
-                result["attached" if changed else "unchanged"] += 1
-            else:
-                changed = _detach(iam, principal_arn, policy_name)
-                result["detached" if changed else "unchanged"] += 1
-            entry["changed"] = changed
-        except (ClientError, ValueError) as exc:
+            entry["status"] = _desired_status(
+                users_table, usage_table, workload_id, now, result
+            )
+        except ClientError as exc:
             entry["error"] = str(exc)
             failures.append(entry)
+        if entry["status"] == "blocked":
+            result["blocked_workloads"] += 1
+            if not principal_arn:
+                result["skipped_not_ready"] += 1
         result["workloads"].append(entry)
+        if principal_arn:
+            by_principal.setdefault(principal_arn, []).append(entry)
+
+    # Phase 2: converge each principal once from the union of its workloads.
+    for principal_arn in sorted(by_principal):
+        entries = by_principal[principal_arn]
+        statuses = {entry["status"] for entry in entries}
+        role: dict = {
+            "role_arn": principal_arn,
+            "workload_ids": [entry["workload_id"] for entry in entries],
+            "blocked": "blocked" in statuses,
+        }
+        try:
+            if "blocked" in statuses:
+                changed = _attach(iam, principal_arn, policy_name)
+                legacy_removed = _detach(
+                    iam, principal_arn, LEGACY_DENY_POLICY_NAME
+                )
+                result["attached" if changed else "unchanged"] += 1
+            elif "unknown" in statuses:
+                # A sibling's row could not be read; keep whatever is on the
+                # role until the next run sees fresh state.
+                changed = legacy_removed = False
+                result["skipped_unknown_status"] += 1
+                result["unchanged"] += 1
+            else:
+                changed = _detach(iam, principal_arn, policy_name)
+                legacy_removed = _detach(
+                    iam, principal_arn, LEGACY_DENY_POLICY_NAME
+                )
+                result[
+                    "detached" if (changed or legacy_removed) else "unchanged"
+                ] += 1
+            role["changed"] = changed
+            role["legacy_removed"] = legacy_removed
+        except (ClientError, ValueError) as exc:
+            role["error"] = str(exc)
+            failures.append(role)
+        result["roles"].append(role)
 
     if failures:
         payload = {"failures": failures, "result": result}
@@ -311,7 +395,8 @@ def handler(event, context, *, dynamodb=None, iam=None, sns=None) -> dict:
             payload,
         )
         raise RuntimeError(
-            f"workload enforcement failed for {len(failures)} workload(s)"
+            f"workload enforcement failed for {len(failures)} "
+            "workload(s)/principal(s)"
         )
 
     if result["skipped_not_ready"]:

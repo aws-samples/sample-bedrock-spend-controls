@@ -4,7 +4,7 @@
 the AWS Pricing API (`pricing:GetProducts`) on **2026-09-14**; every unit
 price is in [`cost-estimate-assumptions.json`](cost-estimate-assumptions.json)
 with that date, and the tables below are regenerated with
-`cdk/.venv/bin/python tools/estimate_cost.py docs/cost-estimate-assumptions.json`.
+`python tools/estimate_cost.py docs/cost-estimate-assumptions.json`.
 This is an estimate of the *solution's own* running cost. It excludes the
 Bedrock inference spend the solution meters, and it excludes any AWS free-tier
 allowance beyond the always-free items noted per line.
@@ -23,6 +23,8 @@ allowance beyond the always-free items noted per line.
 | Subjects with rate limits / with model budgets (×2 models) | 0 % / 0 % | 50 % / 20 % |
 | Workload-mode workloads | 0 | 3 |
 | Reconciliation (`reconciliation_enabled`) | off | on |
+| CloudWatch alarms (15 in every deployment, +2 with workloads, +3 with reconciliation) | 15 | 20 |
+| Admin console hosted (`admin_ui`) | yes (demo Cognito) | no (`production.json` leaves `admin_ui: false`; add about $0.05/month for CloudFront and S3 if you host it) |
 | `usage_retention_days` | 35 | 90 |
 | Distinct models invoked | 5 | 12 |
 | Invocation-log record size | 700 B (measured on a real Converse record with payload delivery off) | same |
@@ -41,7 +43,7 @@ DynamoDB request units are derived from the code paths: the metering
 transaction is 3 items (marker Put + subject ledger Update + model ledger
 Update) and transactional writes bill at 2× → 6 WRU per invocation; strongly
 consistent reads bill 1 RRU per 4 KB, counted here as 2 RRU per ledger
-Query (≤ 37 rows) and 1 RRU per GetItem; each vend performs three
+Query (≤ 31 rows) and 1 RRU per GetItem; each vend performs three
 strongly consistent users-row reads, a ledger Query, and four small writes
 (vend-rate counter, lease, `SESSION#` map, `source_identity`).
 
@@ -77,7 +79,7 @@ as a full month, which is an upper bound.
 | CloudWatch Logs storage: invocation logs — 0.00 GB-mo | 0.00 | 14-day retention (stack default) |
 | CloudWatch Logs ingest: Lambda/EMF logs — 0.08 GB | 0.04 | 900 B per EMF record |
 | CloudWatch custom metrics — 197 metric-months | 59.00 | EMF, prorated hourly: 11 per-user streams × 100 users × 2/24 h, plus 105 shared streams |
-| CloudWatch alarms — 8 | 0.80 | standard resolution |
+| CloudWatch alarms — 15 | 1.50 | standard resolution |
 | CloudWatch dashboard — 1 | 0.00 | first 3 dashboards free |
 | CloudWatch GetMetricData — 18,000 metrics | 0.18 | Operations/Overview tabs |
 | SNS — email notifications | 0.00 | first 1 000 email deliveries/month free |
@@ -89,7 +91,7 @@ as a full month, which is an upper bound.
 | CloudFront — 4,500 HTTPS requests | 0.00 | admin UI static assets; data transfer negligible |
 | S3 — admin UI bucket | 0.01 | <1 GB |
 | Cognito user pool — demo IdP | 0.00 | <10 k MAU free |
-| **Total** | **62.75** | |
+| **Total** | **63.45** | |
 
 ### Production: 1 000 users, 1 000 000 invocations / month, 300 s lease
 
@@ -113,7 +115,7 @@ as a full month, which is an upper bound.
 | CloudWatch Logs storage: invocation logs — 0.33 GB-mo | 0.01 | 14-day retention (stack default) |
 | CloudWatch Logs ingest: Lambda/EMF logs — 1.48 GB | 0.74 | 900 B per EMF record |
 | CloudWatch custom metrics — 2,467 metric-months | 740.00 | EMF, prorated hourly: 11 per-user streams × 1,000 users × 5/24 h, plus 175 shared streams |
-| CloudWatch alarms — 10 | 1.00 | standard resolution |
+| CloudWatch alarms — 20 | 2.00 | standard resolution |
 | CloudWatch dashboard — 1 | 0.00 | first 3 dashboards free |
 | CloudWatch GetMetricData — 180,000 metrics | 1.80 | Operations/Overview tabs |
 | SNS — email notifications | 0.00 | first 1 000 email deliveries/month free |
@@ -122,10 +124,7 @@ as a full month, which is an upper bound.
 | SSM Parameter Store — 2 parameters (prices, workload roster) | 0.00 | standard tier, no charge; the roster uses intelligent tiering and is billed as advanced ($0.05/month + API charges) only if it exceeds 4 KB, roughly 12+ workloads |
 | STS AssumeRole | 0.00 | no charge |
 | Cost Explorer API — 120 calls (reconciliation) | 1.20 | $0.01 per request; 1 + workloads per daily run |
-| CloudFront — 45,000 HTTPS requests | 0.04 | admin UI static assets; data transfer negligible |
-| S3 — admin UI bucket | 0.01 | <1 GB |
-| Cognito user pool — demo IdP | 0.00 | <10 k MAU free |
-| **Total** | **764.57** | |
+| **Total** | **765.52** | |
 
 ## What dominates and how to reduce it
 
@@ -142,7 +141,7 @@ every hour of the month, such as a tenant backend calling around the clock,
 is billed the full 11 metric-months: $3.30 at the first-10 000 tier, $1.10
 beyond it. The per-`Model`, service-wide, and operational streams are a
 fixed 105 to 175 in these scenarios ($32 to $53/month). Everything else
-combined — Lambda, DynamoDB, logs, alarms, secrets — is under $25/month for
+combined — Lambda, DynamoDB, logs, alarms, secrets — is about $25/month for
 1 000 users and 1 M invocations.
 
 Options, in order of impact:
@@ -153,7 +152,8 @@ Options, in order of impact:
    only consumers of per-user EMF, and `GET /admin/users?include_usage=true`
    can serve the top users from DynamoDB instead. Removing `["UserId"]` from
    `_emit_emf` in `usage_processor/handler.py` and from `gateway/app/emf.py`
-   cuts the production estimate from ~$765 to ~$77/month. The dashboard's
+   cuts the production estimate from about $766 to about $78/month (a saving
+   of about $688). The dashboard's
    `SEARCH('{BedrockSpendControls,UserId} ...')` widgets would need to
    switch to the `Model` dimension. This is the largest single reduction,
    and it matters most when subjects call Bedrock many hours a day.
@@ -165,8 +165,8 @@ Options, in order of impact:
 4. **Use a shorter lease dial with care.** A 60 s lease quintuples broker
    vends (≈ $37/month of Lambda at 1 000 users × 4 h/day) and DynamoDB vend
    traffic; 300 s is the production default and the cost/latency balance
-   assumed here. 900 s halves vend cost again at the price of a longer
-   post-detection bound.
+   assumed here. 900 s cuts vend volume to one third of the 300 s figure at
+   the price of a longer post-detection bound.
 5. **DynamoDB is cheap and stays cheap.** Model-scoped ledger rows double
    ledger writes (~$4/month at 1 M invocations); strongly consistent reads
    are fractions of a cent per thousand. Storage stays in the free 25 GB

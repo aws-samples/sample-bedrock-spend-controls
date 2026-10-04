@@ -249,6 +249,7 @@ Object.assign(api as Record<string, unknown>, {
     if (expectedGeneration !== enforcement.generation) throw new ApiError("Changed since you loaded it", 409, "version_conflict", { current: enforcement });
     enforcement = { ...enforcement, permission_lease_seconds: seconds, source: "runtime", generation: enforcement.generation + 1, actor: "admin@example.test", reason: reason ?? "", updated_at: new Date().toISOString() };
     return enforcement; },
+  getEmergencyStop: async () => { await delay(); return { state: emergency.state, desired_active: emergency.desired_active, generation: emergency.generation, requested_at: emergency.requested_at }; },
   setEmergencyStop: async (_c: unknown, _s: unknown, req: { action: string; emergencyKey: string }) => { await delay(300);
     if (req.emergencyKey !== "break-glass") throw new ApiError("Emergency key rejected", 403, "forbidden");
     const activate = req.action === "activate";

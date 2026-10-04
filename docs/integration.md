@@ -41,8 +41,10 @@ change.
 
 ### Install
 
-Copy `examples/refreshable_bedrock.py` into your project (or vendor the
-`examples/` package). Dependencies: `boto3`, `httpx`. Python 3.10 or later.
+Copy `examples/refreshable_bedrock.py` into your project; the file is
+self-contained (it carries its own minimal SigV4 signer). Dependencies:
+`boto3` and `httpx` at the versions pinned in `examples/requirements.txt`.
+Python 3.10 or later.
 
 ### The change
 
@@ -59,7 +61,8 @@ def handle_chat(request):
 ```python
 # after
 from refreshable_bedrock import (
-    BedrockSpendControls, QuotaExceededError, UserBlockedError, VendRateLimitedError,
+    AuthenticationError, BedrockSpendControls, EmergencyStopError,
+    QuotaExceededError, UserBlockedError, VendRateLimitedError,
 )
 
 # one per process, created at startup
@@ -70,25 +73,39 @@ spend_controls = BedrockSpendControls(
 )
 
 def handle_chat(request):
-    user = verify_jwt(request.jwt)                          # unchanged
-    bedrock = spend_controls.client_for(request.jwt)        # new: this user's client
+    user = verify_jwt(request.jwt)                          # unchanged, and REQUIRED first
+    bedrock = spend_controls.client_for(request.jwt, verified_identity=user.sub)  # new
     try:
         return bedrock.converse(modelId=MODEL, messages=request.messages)  # unchanged
+    except UserBlockedError as exc:
+        # The common refusal: metering blocked the user before this request.
+        # resets_at is None for admin blocks (no window to wait for).
+        when = f"; resets at {exc.resets_at:%Y-%m-%d %H:%M} UTC" if exc.resets_at else ""
+        return http_403(f"Bedrock access is blocked for this account{when}")
     except QuotaExceededError as exc:
         return http_429(
             f"{exc.breached_period} {exc.breached_dimension} quota exhausted; "
             f"resets at {exc.resets_at:%Y-%m-%d %H:%M} UTC"
         )
-    except UserBlockedError:
-        return http_403("Bedrock access is blocked for this account")
-    except VendRateLimitedError as exc:
+    except (VendRateLimitedError, EmergencyStopError) as exc:
         return http_503(retry_after=exc.retry_after)
+    except AuthenticationError:
+        return http_401("Sign in again")
 ```
 
 `client_for` returns an ordinary boto3 `bedrock-runtime` client. Converse,
 InvokeModel, streaming, CountTokens, the OpenAI-compatible endpoints: all of
 it works unchanged because only the credential object underneath is
 different.
+
+**Pass only verified tokens.** `client_for` reads the identity claim from
+the JWT *without* checking its signature, because the cache key has to be
+known before any broker call; the broker verifies the token again when it
+vends. An unverified token naming another user would therefore be handed
+that user's cached client until the next renewal. Verify the token in your
+authentication layer first, and either pass the identity you established as
+`verified_identity=` (a token whose claim differs raises `ValueError`) or
+use `client_for_identity(identity, jwt)`.
 
 ### What the factory does for you
 
@@ -98,13 +115,19 @@ identity currently active in this process. Each entry holds a
 it, and the newest JWT seen for that identity.
 
 1. **First call for a user.** `client_for(jwt)` reads the identity claim from
-   the JWT (without verifying it; the broker verifies), creates the entry, and
-   returns the client. No network call yet.
+   the JWT (without verifying it; see above), creates the entry outside the
+   factory lock, and returns the client. No network call yet. One boto3
+   session and one `httpx.Client` (pass your own with `http_client=`) are
+   shared by every identity; `close()` releases them.
 2. **First Bedrock call.** boto3 asks the provider for credentials. The
    provider `POST`s to `{BrokerApiUrl}/v1/credentials`, SigV4-signed with
    **your backend's role** (the Function URL is `AWS_IAM`; only roles in
    `invoker_principal_arns` may call it), with the user's JWT in the
    `X-Quota-User-Token` header and a client-generated `X-Quota-Lease-Id`.
+   Each attempt has a 2 s connect / 5 s read timeout; transport errors and
+   non-terminal broker errors are retried up to three attempts in total with
+   backoff, so a dead broker costs about 22 s worst case before the call
+   fails.
 3. **Broker decision.** It verifies the JWT against the issuer's JWKS, loads
    the user's row, and if the user is active and under every enabled quota it
    assumes `BedrockUserRole` with the user's identity as `SourceIdentity` and
@@ -120,22 +143,31 @@ it, and the newest JWT seen for that identity.
    the original deadline.
 5. **Refusal.** When the user is over quota or blocked, the renewal fails
    with a typed error (table below) and no credentials are returned. The
-   Bedrock call that triggered it raises that error.
+   Bedrock call that triggered it raises that error. A terminal refusal is
+   remembered per identity for up to `refusal_cache_seconds` (default 30,
+   shortened to the broker's `Retry-After`, `refresh_after`, or `resets_at`
+   when earlier), so a burst of requests from a blocked user costs one broker
+   call, not one per request. Clock skew between your host and the broker is
+   estimated from the broker's `Date` header (`provider.clock_offset`) and
+   applied to every server timestamp.
 6. **Cleanup.** Identities idle for `idle_ttl_seconds` (default one hour) are
-   dropped, and the table is capped at `max_users` (default 10,000, least
-   recently used first). Call `spend_controls.forget(jwt)` on sign-out if you
-   want it immediate.
+   dropped, and the table is capped at `max_users` (default 1,000, least
+   recently used first; each cached identity costs about 0.25 MiB). Call
+   `spend_controls.forget(jwt_or_identity)` on sign-out if you want it
+   immediate.
 
 ### Using an authentication middleware
 
-Most backends validate the JWT in one place. Bind the user there and keep the
-JWT out of every call site:
+Most backends validate the JWT in one place. Bind the user there, **after**
+verification, and keep the JWT out of every call site:
 
 ```python
 # middleware (FastAPI shown; any framework with per-request context works)
 @app.middleware("http")
 async def bind_quota_user(request, call_next):
-    token = BedrockSpendControls.set_current_user(request.headers.get("authorization", "")[7:])
+    raw = request.headers.get("authorization", "")[7:]
+    claims = verify_jwt(raw)                 # signature, issuer, audience, expiry: reject here
+    token = BedrockSpendControls.set_current_user(raw)   # bind only a verified token
     try:
         return await call_next(request)
     finally:
@@ -145,6 +177,10 @@ async def bind_quota_user(request, call_next):
 bedrock = spend_controls.client_for()      # reads the context variable
 ```
 
+Binding an unverified header would let any caller choose whose cached client
+they receive, so the `verify_jwt` call must come first and must raise on
+failure.
+
 If your code already obtains the Bedrock client from a single helper such as
 `get_bedrock_client()`, replace its body with `return spend_controls.client_for()`
 and no call site changes at all.
@@ -153,15 +189,22 @@ and no call site changes at all.
 
 | Exception | HTTP from broker | Meaning | What to do |
 |---|---|---|---|
-| `QuotaExceededError` | 429 `quota_exceeded` | A `block` threshold was reached at vend time. `breached_period`, `breached_dimension`, `resets_at` are filled in. | Tell the user; retry after `resets_at`. |
-| `UserBlockedError` | 403 `quota_blocked` | Status is `blocked`. Automatic blocks lift alone when the window resets; admin blocks need an operator. | Tell the user; do not retry in a loop. |
-| `VendRateLimitedError` | 429 `lease_rate_limited` / `lease_not_refreshable` | More than `vend_rate_limit_per_minute` vends for this identity in one minute, across every process serving it. `lease_not_refreshable` is a rare concurrent-renewal race. | Usually a provider per request instead of per user, or more replicas per identity than the vend budget allows (see below). Honour `retry_after`. |
-| `BrokerCredentialError` (base) | 5xx, 503 `emergency_stop`, network | Broker unavailable or operator emergency stop. The provider already retried transport errors three times. | Surface as service unavailable. |
-| `botocore` `ClientError` `AccessDeniedException` | none (from Bedrock) | Either the model is not in `allowed_model_arns`, or the user was blocked **while holding valid keys** and the revocation layer cut the session. | Check the model first. Otherwise treat as blocked: the next `client_for` renewal will return the typed error. |
+| `UserBlockedError` | 403 `quota_blocked` | Status is `blocked`. This is the usual refusal, because metering blocks the user between vends. For an automatic block `breached_period`, `breached_dimension`, and `resets_at` are filled in and the block lifts alone when the window resets; for an admin block they are `None` and an operator must act. | Tell the user; do not retry in a loop. |
+| `QuotaExceededError` | 429 `quota_exceeded` | A `block` threshold was reached at vend time (subject period, rate minute, or model budget). `breached_period`, `breached_dimension`, `resets_at` are filled in; there is no `Retry-After`. | Tell the user; retry after `resets_at`. |
+| `VendRateLimitedError` | 429 `lease_rate_limited` / `lease_not_refreshable` | More than `vend_rate_limit_per_minute` vends for this identity in one minute, across every process serving it. `lease_not_refreshable` is a rare concurrent-renewal race. | Usually a provider per request instead of per user, or more replicas per identity than the vend budget allows (see below). Honour `retry_after` / `refresh_after`. |
+| `AuthenticationError` | 401 `authentication_error` | The broker rejected the JWT (expired, wrong issuer or audience, missing claim, `#` in the claim) or the user is not provisioned and auto-provisioning is off. | Re-authenticate the user; for unprovisioned users, create them through the admin API. |
+| `EmergencyStopError` | 503 `emergency_stop` | An operator closed vending. Not terminal: `retry_after` is 60 s and the next refresh retries. | Surface as temporarily unavailable; do not page your own on-call, the operators already know. |
+| `BrokerCredentialError` (base) | 5xx, network | Broker unavailable. The provider already made three attempts with backoff. | Surface as service unavailable. |
+| `botocore` `ClientError` `AccessDeniedException` | none (from Bedrock) | Either the model is not in `allowed_model_arns` (or is an application inference profile, a provisioned model, or an unmetered API, which vended sessions are always denied), or the user was blocked **while holding valid keys** and the revocation layer cut the session. | Check the model first. Otherwise treat as blocked: the credentials stay cached until the lease's refresh window, and the renewal then returns `UserBlockedError`. Call `spend_controls.forget(jwt)` to force an immediate re-vend if you want the typed error now. |
 | `botocore` `ClientError` `ExpiredTokenException` | none | The permission lease deadline passed before boto3 refreshed (clock skew, long pause). | Retry once; boto3 refreshes on the retry. |
 
 All broker errors subclass `botocore.exceptions.CredentialRetrievalError`, so
 existing `except botocore.exceptions.BotoCoreError` handlers still catch them.
+Every `BrokerCredentialError` carries `.status_code`, `.error_type`,
+`.message`, `.terminal`, and the optional `.retry_after` (seconds),
+`.refresh_after`, `.resets_at` (UTC `datetime` or `None`),
+`.breached_period`, and `.breached_dimension`; guard the optional ones before
+formatting them.
 
 ### Multiple instances, threads, async
 
@@ -199,9 +242,9 @@ vend budget above is per identity.
 
 With `auto_provision_users: true` the first vend creates the user with the
 deployment's `default_limits`. With `false` (recommended in production) the
-broker returns `UserBlockedError`-like refusals until an operator creates the
-user through the admin UI or `POST /admin/users`; wire that into your own
-onboarding if you need it automatic.
+broker returns `401 authentication_error` (`AuthenticationError`) until an
+operator creates the user through the admin UI or `POST /admin/users`; wire
+that into your own onboarding if you need it automatic.
 
 ### Reimplementing the provider in another language
 
@@ -235,21 +278,26 @@ deadline and never extends it. On `409 lease_expired` generate a new
 you sent when another process already holds the identity's lease; do not
 reuse it for renewal.
 
-**Refusals.** `403 quota_blocked`, `429 quota_exceeded` (headers
-`X-Quota-Breached-Period`, `X-Quota-Breached-Dimension`, `X-Quota-Resets-At`,
-`Retry-After`), `429 lease_rate_limited` / `lease_not_refreshable`
-(`Retry-After`, `X-Quota-Refresh-After`), `503 emergency_stop`
-(`Retry-After`). Bodies are `{"error": {"type": "...", "message": "..."}}`.
-Treat 403/409/429 as final for this attempt; retry only 5xx and transport
-errors, with backoff.
+**Refusals.** `401 authentication_error`, `403 quota_blocked` (automatic
+blocks carry `X-Quota-Breached-Period`, `X-Quota-Breached-Dimension`,
+`X-Quota-Resets-At`; admin blocks do not), `429 quota_exceeded` (the same
+three headers, no `Retry-After`), `429 lease_rate_limited` /
+`lease_not_refreshable` (`Retry-After`, `X-Quota-Refresh-After`), `503
+quota_state_conflict` (`Retry-After: 1`), `503 emergency_stop`
+(`Retry-After: 60`). Bodies are `{"error": {"type": "...", "code": "...",
+"message": "..."}}`. Treat 401/403/409/429 as final for this attempt; retry
+only 5xx and transport errors, with backoff. The broker's `Date` header is
+the reference clock for every timestamp it returns.
 
 ### What the vended credentials cannot do
 
 They can call only the Runtime actions (`InvokeModel`,
 `InvokeModelWithResponseStream`, `CountTokens`) on the models in
-`allowed_model_arns`, for the lease duration. They cannot list models, call
-other services, or obtain Bedrock bearer tokens. Do not try to reuse them for
-anything else.
+`allowed_model_arns`, for the lease duration. They are explicitly denied
+application inference profiles (the workload path), provisioned models, and
+the unmetered `StartAsyncInvoke` / `InvokeModelWithBidirectionalStream`
+APIs. They cannot list models, call other services, or obtain Bedrock bearer
+tokens. Do not try to reuse them for anything else.
 
 ---
 
@@ -319,10 +367,11 @@ spend real money, insist on providing `role_arn`.
 
 ### Limits
 
-Same-account IAM roles only (not IAM users); about 1,000 workloads per
-account. There is no permission lease on this path,
-so the cut-off after a block is metering lag plus IAM propagation, usually
-well under a minute, with no in-flight deadline as a backstop.
+Same-account IAM roles only (synthesis rejects a `role_arn` from another
+account, a wildcard, or a role shared by two workloads); about 1,000
+workloads per account. There is no permission lease on this path, so the
+cut-off after a block is metering lag plus IAM propagation, usually well
+under a minute, with no in-flight deadline as a backstop.
 
 ---
 
@@ -332,10 +381,13 @@ well under a minute, with no in-flight deadline as a backstop.
 
 - [ ] Backend role ARN is in `invoker_principal_arns`.
 - [ ] `identity_claim` equals the deployment's `jwt_user_claim`.
-- [ ] One `BedrockSpendControls` per process; `client_for(jwt)` per request.
-- [ ] `QuotaExceededError`, `UserBlockedError`, `VendRateLimitedError` mapped
-      to user-facing responses; `AccessDeniedException` from Bedrock treated
-      as a mid-lease block.
+- [ ] One `BedrockSpendControls` per process; `client_for(jwt)` per request,
+      called only with tokens your middleware has already verified
+      (`verified_identity=` or `client_for_identity`).
+- [ ] `UserBlockedError`, `QuotaExceededError`, `VendRateLimitedError`,
+      `AuthenticationError`, `EmergencyStopError` mapped to user-facing
+      responses (guard `resets_at` for `None`); `AccessDeniedException` from
+      Bedrock treated as a mid-lease block.
 - [ ] Users provisioned (auto or via admin API) before go-live.
 
 **Per-workload**

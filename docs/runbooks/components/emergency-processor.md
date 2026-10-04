@@ -5,7 +5,8 @@
 (`batch_size=10`, 1 s window, bisect, 10 retries, DLQ
 `EmergencyStopDeadLetterQueue`) filtered to key `CONFIG#EMERGENCY_STOP`, and
 `EmergencyStopReconciliationSchedule` (`rate(1 minute)`). 256 MB, 2 min
-timeout, reserved concurrency 1.
+timeout, reserved concurrency 1 (unless `reserve_enforcement_concurrency`
+is `false`).
 
 ## What it does
 
@@ -35,14 +36,14 @@ recovery keeps vending closed **until** the deny is inert again.
 | Input | Output |
 |---|---|
 | `CONFIG#EMERGENCY_STOP` row (`desired_active`, `generation`, `request_id`, `actor`, `reason`) | Emergency policy default version; row `state`, `applied_at`, `applied_generation` |
-| | EMF `EmergencyStopActivated`, `EmergencyStopRecovered`, `EmergencyStopFailure` |
+| | EMF (no dimensions) `EmergencyStopActivated`, `EmergencyStopRecovered`, `EmergencyStopFailure` |
 | | SNS `EMERGENCY STOP ACTIVE` / `RECOVERED` / `APPLY FAILED` |
 
 ## Failure modes
 
 | Symptom | Alarm | Notes |
 |---|---|---|
-| IAM error | [emergency-stop-failure](../alarms/emergency-stop-failure.md) | State stuck in `activating`/`recovering`; vending closed either way. |
+| IAM error | [emergency-stop-failure](../alarms/emergency-stop-failure.md) and [emergency-stop-processor-errors](../alarms/emergency-stop-processor-errors.md) | State stuck in `activating`/`recovering`; vending closed either way. |
 | Stream batch lost | [emergency-stop-dlq](../alarms/emergency-stop-dlq.md) | Schedule converges within a minute if the cause cleared. |
 | `already-applied` returned | — | Normal on the schedule when nothing changed. |
 | `state-not-found` | — | No emergency has ever been requested. Normal. |

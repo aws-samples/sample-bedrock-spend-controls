@@ -145,7 +145,17 @@ def _admin_request_args(
             "json": body,
         }
     if args.command == "list-users":
-        return "GET", f"{base}/admin/users", {}
+        params = {
+            name: value
+            for name, value in (
+                ("limit", getattr(args, "limit", None)),
+                ("cursor", getattr(args, "cursor", None)),
+                ("status", getattr(args, "status", None)),
+                ("query", getattr(args, "query", None)),
+            )
+            if value is not None
+        }
+        return "GET", f"{base}/admin/users", ({"params": params} if params else {})
     if args.command in {"emergency-stop", "emergency-recover"}:
         activate = args.command == "emergency-stop"
         return "POST", f"{base}/admin/emergency-stop", {
@@ -190,7 +200,9 @@ def _admin_request_args(
                 }
                 limits[period] = {**existing, **provided}
                 changed = True
-        rate, rate_present = _rate_payload(args)
+        rate, rate_present = _rate_payload(
+            args, current=getattr(args, "current_rate", None)
+        )
         if not changed and not rate_present:
             raise ValueError(
                 "update-user requires at least one quota option"
@@ -254,9 +266,11 @@ def _optional_period(args, period: str) -> dict | None:
 def _parse_thresholds(raw: str | None) -> list[dict] | None:
     """``"50:warn,80:warn,100:block"`` -> API thresholds list.
 
-    Percentages, comma-separated, each ``<percent>:<warn|block>``. Ordering
-    and the at-most-one-trailing-block rule are validated by the server;
-    the client only parses the shape.
+    Whole-number percentages from 1 to 1000, comma-separated, each
+    ``<percent>:<warn|block>`` (``50`` means 50 % of the period limit;
+    ``0.5`` is rejected rather than silently read as half a percent).
+    Ordering and the at-most-one-trailing-block rule are validated by the
+    server; the client only parses the shape.
     """
     if raw is None:
         return None
@@ -267,29 +281,45 @@ def _parse_thresholds(raw: str | None) -> list[dict] | None:
             continue
         percent, _, action = token.partition(":")
         try:
-            at = float(percent) / 100
+            percent_value = int(percent)
         except ValueError as exc:
             raise ValueError(
-                f"threshold {token!r} must look like <percent>:<warn|block>"
+                f"threshold {token!r} must look like <percent>:<warn|block> "
+                f"with a whole-number percentage (for example 50:warn); "
+                f"{percent!r} is not a whole number"
             ) from exc
+        if not 1 <= percent_value <= 1000:
+            raise ValueError(
+                f"threshold {token!r}: the percentage must be between 1 and 1000"
+            )
         if action not in ("warn", "block"):
             raise ValueError(
                 f"threshold {token!r} must end in :warn or :block"
             )
-        entries.append({"at": at, "action": action})
+        entries.append({"at": percent_value / 100, "action": action})
     if not entries:
         raise ValueError("thresholds must contain at least one entry")
     return entries
 
 
-def _rate_payload(args) -> tuple[dict | None, bool]:
-    """Return (rate, present). ``--rpm 0 --tpm 0`` disables both."""
+def _rate_payload(args, current: dict | None = None) -> tuple[dict | None, bool]:
+    """Return (rate, present). ``--disable-rate`` removes both limits.
+
+    ``current`` is the user's existing ``rate`` object (or ``None``) from
+    the preflight read; a limit the caller did not mention keeps its current
+    value instead of being reset to 0 (off).
+    """
     rpm = getattr(args, "rpm", None)
     tpm = getattr(args, "tpm", None)
     if getattr(args, "disable_rate", False):
         return None, True
     if rpm is None and tpm is None:
         return None, False
+    existing = current if isinstance(current, dict) else {}
+    if rpm is None:
+        rpm = existing.get("rpm", 0)
+    if tpm is None:
+        tpm = existing.get("tpm", 0)
     return {"rpm": int(rpm or 0), "tpm": int(tpm or 0)}, True
 
 
@@ -361,12 +391,13 @@ def _execute_admin_command(args, session, request_fn=signed_request):
             if not isinstance(limits, dict):
                 raise RuntimeError("User detail response did not include limits")
             args.current_limits = limits
+            args.current_rate = user.get("rate")
 
     method, url, request_kwargs = _admin_request_args(
         args,
         if_match=if_match,
     )
-    return request_fn(
+    response = request_fn(
         method,
         url,
         region=args.region,
@@ -375,11 +406,76 @@ def _execute_admin_command(args, session, request_fn=signed_request):
         aws_session=session,
         **request_kwargs,
     )
+    if args.command == "list-users" and getattr(args, "all", False):
+        return _follow_user_pages(args, session, response, request_fn)
+    return response
+
+
+def _follow_user_pages(args, session, first_page, request_fn) -> httpx.Response:
+    """Follow ``next_cursor`` and return every user in one synthetic response.
+
+    A failing page is returned as-is so its error body reaches the caller.
+    """
+    users: list = []
+    pages = 0
+    response = first_page
+    while True:
+        if response.status_code >= 400:
+            return response
+        body = _response_body(response)
+        pages += 1
+        users.extend(body.get("users") or [])
+        cursor = body.get("next_cursor")
+        if not cursor:
+            break
+        args.cursor = cursor
+        method, url, request_kwargs = _admin_request_args(args)
+        response = request_fn(
+            method,
+            url,
+            region=args.region,
+            admin_key=args.admin_key,
+            emergency_key=None,
+            aws_session=session,
+            **request_kwargs,
+        )
+    merged = {"users": users, "next_cursor": None, "pages": pages}
+    return httpx.Response(
+        200,
+        json=merged,
+        request=httpx.Request("GET", f"{args.gateway_url.rstrip('/')}/admin/users"),
+    )
+
+
+class _SecretFlagAction(argparse.Action):
+    """Accept a key on the command line, but say why the env var is better."""
+
+    def __call__(self, parser, namespace, values, option_string=None):
+        print(
+            f"warning: {option_string} puts the key in your shell history and "
+            f"process list; prefer the {self.metavar} environment variable",
+            file=sys.stderr,
+        )
+        setattr(namespace, self.dest, values)
 
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="SigV4-signed administrative client for the quota gateway."
+        description="SigV4-signed administrative client for the quota gateway.",
+        epilog=(
+            "Keys come from the environment (ADMIN_KEY, EMERGENCY_ADMIN_KEY) so "
+            "they stay out of shell history. Examples:\n"
+            "  export GATEWAY_URL=https://<id>.lambda-url.us-east-1.on.aws\n"
+            "  export ADMIN_KEY=$(aws secretsmanager get-secret-value "
+            "--secret-id <AdminKeySecretName> --query SecretString --output text)\n"
+            "  python examples/sigv4_gateway.py create-user alice "
+            "--daily-usd 5 --daily-input-tokens 1000000 --daily-output-tokens 200000\n"
+            "  python examples/sigv4_gateway.py update-user alice --rpm 30\n"
+            "  python examples/sigv4_gateway.py list-users --status blocked --all\n"
+            "  EMERGENCY_ADMIN_KEY=... python examples/sigv4_gateway.py "
+            "emergency-stop --reason 'incident 1234'"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument(
         "--gateway-url",
@@ -397,20 +493,31 @@ def _parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--admin-key",
+        action=_SecretFlagAction,
+        metavar="ADMIN_KEY",
         default=os.environ.get("ADMIN_KEY"),
-        help="Routine admin API key (or ADMIN_KEY).",
+        help=(
+            "Routine admin API key. Prefer the ADMIN_KEY environment variable; "
+            "this flag is kept for compatibility and exposes the key in shell "
+            "history and the process list."
+        ),
     )
     parser.add_argument(
         "--emergency-key",
+        action=_SecretFlagAction,
+        metavar="EMERGENCY_ADMIN_KEY",
         default=os.environ.get("EMERGENCY_ADMIN_KEY"),
-        help="Break-glass emergency key (or EMERGENCY_ADMIN_KEY).",
+        help=(
+            "Break-glass emergency key. Prefer the EMERGENCY_ADMIN_KEY "
+            "environment variable; this flag is kept for compatibility."
+        ),
     )
     commands = parser.add_subparsers(dest="command", required=True)
 
     threshold_help = (
-        "Comma-separated <percent>:<warn|block> entries, e.g. "
-        "'50:warn,80:warn,100:block'. Omit the block entry for an "
-        "alert-only period."
+        "Comma-separated <percent>:<warn|block> entries with whole-number "
+        "percentages from 1 to 1000, e.g. '50:warn,80:warn,100:block'. Omit "
+        "the block entry for an alert-only period."
     )
 
     create = commands.add_parser("create-user")
@@ -433,7 +540,24 @@ def _parser() -> argparse.ArgumentParser:
         "--tpm", type=int, help="Uncached input + output tokens per minute (0 = off)"
     )
 
-    commands.add_parser("list-users")
+    list_users = commands.add_parser("list-users")
+    list_users.add_argument(
+        "--limit", type=int, help="Page size, 1 to 1000 (server default 50)."
+    )
+    list_users.add_argument(
+        "--cursor", help="next_cursor from a previous page."
+    )
+    list_users.add_argument(
+        "--status", choices=("active", "blocked"), help="Only users in this status."
+    )
+    list_users.add_argument(
+        "--query", help="Substring match on user ID or display name."
+    )
+    list_users.add_argument(
+        "--all",
+        action="store_true",
+        help="Follow next_cursor and print every page as one result.",
+    )
 
     emergency_stop = commands.add_parser("emergency-stop")
     emergency_stop.add_argument("--reason", required=True)
@@ -458,9 +582,18 @@ def _parser() -> argparse.ArgumentParser:
     update.add_argument("--monthly-output-tokens", type=int)
     update.add_argument("--monthly-thresholds", help=threshold_help)
     update.add_argument("--disable-monthly", action="store_true")
-    update.add_argument("--rpm", type=int, help="Requests per minute (0 = off)")
     update.add_argument(
-        "--tpm", type=int, help="Uncached input + output tokens per minute (0 = off)"
+        "--rpm",
+        type=int,
+        help="Requests per minute (0 = off); the current --tpm is kept",
+    )
+    update.add_argument(
+        "--tpm",
+        type=int,
+        help=(
+            "Uncached input + output tokens per minute (0 = off); the current "
+            "--rpm is kept"
+        ),
     )
     update.add_argument(
         "--disable-rate", action="store_true", help="Remove both rate limits"
@@ -492,11 +625,11 @@ def main() -> None:
     is_emergency = args.command in {"emergency-stop", "emergency-recover"}
     if is_emergency and not args.emergency_key:
         parser.error(
-            "--emergency-key or EMERGENCY_ADMIN_KEY is required for "
+            "EMERGENCY_ADMIN_KEY (or --emergency-key) is required for "
             "break-glass commands"
         )
     if not is_emergency and not args.admin_key:
-        parser.error("--admin-key or ADMIN_KEY is required")
+        parser.error("ADMIN_KEY (or --admin-key) is required")
     session = boto3.Session(
         profile_name=args.profile,
         region_name=args.region,

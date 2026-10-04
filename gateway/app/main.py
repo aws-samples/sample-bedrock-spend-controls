@@ -47,6 +47,7 @@ from .quota import (
     MICRO,
     VALID_PERMISSION_LEASE_SECONDS,
     WORKLOAD_USER_ID_PREFIX,
+    EmergencyVersionConflict,
     EnforcementVersionConflict,
     IdempotencyConflict,
     LeaseExpired,
@@ -65,6 +66,7 @@ app = FastAPI(
     title="Amazon Bedrock Runtime quota broker",
     docs_url=None,
     redoc_url=None,
+    openapi_url=None,
 )
 
 _store: QuotaStore | None = None
@@ -240,6 +242,25 @@ def _quota_headers(user: UserRecord, evaluation=None) -> dict[str, str]:
     return headers
 
 
+def _blocked_response(user: UserRecord) -> JSONResponse:
+    """403 ``quota_blocked`` for a subject whose status is not active.
+
+    An automatic block carries the same ``X-Quota-Breached-*`` and
+    ``X-Quota-Resets-At`` headers as the 429 that created it, so a client
+    refused on a later vend can still tell when the window reopens. An
+    admin block has no window to report, so those headers are omitted.
+    """
+    evaluation = None
+    if user.status_origin == "automatic":
+        evaluation = store().evaluate_user_quota(user)
+    return _error(
+        403,
+        f"User '{user.user_id}' is {user.status}.",
+        "quota_blocked",
+        headers=_quota_headers(user, evaluation),
+    )
+
+
 def _lease_retry_headers(retry_after: datetime) -> dict[str, str]:
     now = datetime.now(timezone.utc)
     seconds = max(0, math.ceil((retry_after - now).total_seconds()))
@@ -319,12 +340,7 @@ async def vend_credentials(request: Request) -> Response:
 
     user = store().refresh_auto_status(user)
     if not user.active:
-        return _error(
-            403,
-            f"User '{user.user_id}' is {user.status}.",
-            "quota_blocked",
-            headers=_quota_headers(user),
-        )
+        return _blocked_response(user)
     evaluation = None
     for _ in range(3):
         evaluation = store().evaluate_user_quota(user)
@@ -352,12 +368,7 @@ async def vend_credentials(request: Request) -> Response:
                 headers=_quota_headers(user, evaluation),
             )
     if not user.active:
-        return _error(
-            403,
-            f"User '{user.user_id}' is {user.status}.",
-            "quota_blocked",
-            headers=_quota_headers(user),
-        )
+        return _blocked_response(user)
     evaluation = store().evaluate_user_quota(user)
     if evaluation.over_budget:
         return _error(
@@ -384,12 +395,14 @@ async def vend_credentials(request: Request) -> Response:
                 headers={"Retry-After": "60"},
             )
         latest_user = store().get_user(user.user_id)
-        if latest_user is None or not latest_user.active:
+        if latest_user is None:
             return _error(
                 403,
                 f"User '{user.user_id}' is blocked.",
                 "quota_blocked",
             )
+        if not latest_user.active:
+            return _blocked_response(latest_user)
         evaluation = store().evaluate_user_quota(latest_user)
         if evaluation.over_budget:
             return _error(
@@ -473,7 +486,9 @@ def _jwt_admin_principal(token: str) -> AdminPrincipal | None:
     if not claim:
         return None
     try:
-        identity = verifier().verify(token)
+        # Admin scope: the console's client id (second JWT_AUDIENCE entry)
+        # is honoured here and nowhere else.
+        identity = verifier().verify(token, scope="admin")
     except JwtError:
         return None
     value = identity.claims.get(claim)
@@ -492,19 +507,28 @@ def _jwt_admin_principal(token: str) -> AdminPrincipal | None:
     return AdminPrincipal(actor=actor, auth_method="jwt")
 
 
+def _shared_key_matches(provided: str | None, expected: str | None) -> bool:
+    """Constant-time shared-key comparison for any header text.
+
+    ``secrets.compare_digest`` raises TypeError (a 500) for ``str`` values
+    with non-ASCII characters, which a header can carry. Compare the UTF-8
+    bytes instead: still constant-time, and a stray character is a plain 403.
+    """
+    if not provided or not expected:
+        return False
+    return secrets.compare_digest(
+        provided.encode("utf-8"), expected.encode("utf-8")
+    )
+
+
 def _require_admin(request: Request) -> JSONResponse | None:
     provided = extract_bearer(request.headers.get("x-quota-admin-key"))
     if not provided:
         authorization = request.headers.get("authorization")
         if authorization and authorization.lower().startswith("bearer "):
             provided = extract_bearer(authorization)
-    expected = admin_key()
     principal = None
-    if (
-        expected
-        and provided
-        and secrets.compare_digest(provided, expected)
-    ):
+    if _shared_key_matches(provided, admin_key()):
         principal = AdminPrincipal(
             actor="admin-shared-key", auth_method="shared-key"
         )
@@ -522,15 +546,20 @@ def _require_emergency_admin(
     request: Request,
 ) -> tuple[JSONResponse | None, str]:
     provided = extract_bearer(request.headers.get("x-quota-emergency-key"))
-    expected = emergency_key()
     # Constant-time compare, same as the routine admin key: the break-glass
     # key must not leak a prefix match through response timing.
-    if (
-        expected
-        and provided
-        and secrets.compare_digest(provided, expected)
-    ):
-        return None, "emergency-shared-key"
+    if _shared_key_matches(provided, emergency_key()):
+        actor = "emergency-shared-key"
+        # The shared key is what authorizes the action; it says nothing about
+        # who held it. When the caller also presents a verified admin JWT
+        # (the console sends its login alongside the typed key), name that
+        # principal in the audit trail. A missing or non-admin token changes
+        # nothing: the key alone still suffices and is recorded as such.
+        token = extract_user_token(request.headers)
+        principal = _jwt_admin_principal(token) if token else None
+        if principal is not None:
+            actor = f"{principal.actor} ({actor})"
+        return None, actor
     return (
         _error(
             403,
@@ -1378,11 +1407,14 @@ def _read_operations_cloudwatch(
                 }
             )
 
+        # The keys the stack registers in OPERATIONS_ALARM_NAMES_JSON for the
+        # revocation path: the processor's own alarms plus the dispatcher
+        # that feeds it (its DLQ and stream iterator age).
         revocation_alarm_keys = {
             "revocation_failure",
             "revocation_overflow",
-            "revocation_dlq",
-            "revocation_iterator_age",
+            "enforcement_dispatch_dlq",
+            "enforcement_dispatch_iterator_age",
         }
         revocation_alarm_states = {
             alarm["key"]: alarm["state"]
@@ -1446,15 +1478,27 @@ USAGE_METRIC_SPECS = (
 )
 USAGE_METRICS_MAX_DAYS = 30
 USAGE_METRICS_MAX_MODELS = 20
-USAGE_METRICS_MAX_USERS = 100
+# Safety cap on identities ranked for top_users. ListMetrics is paginated to
+# the end and every identity is queried (in GetMetricData batches), so the
+# ranking is over all metered identities, not an alphabetical prefix. Beyond
+# the cap the response is marked ``partial``. A Metrics Insights
+# ``GROUP BY UserId`` would be cheaper but only spans two weeks of data,
+# short of this endpoint's 30-day range.
+USAGE_METRICS_MAX_USERS = 2_000
 USAGE_METRICS_TOP_USERS = 5
+# GetMetricData accepts at most 500 MetricDataQueries per call.
+GET_METRIC_DATA_MAX_QUERIES = 500
 
 
-def _list_dimension_values(client, dimension: str, limit: int) -> list[str]:
-    """Distinct values of one EMF dimension via ListMetrics.
+def _list_dimension_values(
+    client, dimension: str, limit: int
+) -> tuple[list[str], bool]:
+    """Distinct values of one EMF dimension via ListMetrics, sorted.
 
-    CloudWatch only lists metrics that received data points in roughly the
-    last two weeks, so a 30-day range can omit identities idle since then.
+    Pages to the end of the listing; the boolean reports whether ``limit``
+    truncated the result. CloudWatch only lists metrics that received data
+    points in roughly the last two weeks, so a 30-day range can omit
+    identities idle since then.
     """
     values: list[str] = []
     seen: set[str] = set()
@@ -1474,10 +1518,37 @@ def _list_dimension_values(client, dimension: str, limit: int) -> list[str]:
                     seen.add(value)
                     values.append(value)
         token = response.get("NextToken")
-        if not token or len(values) >= limit:
+        if not token:
             break
         kwargs["NextToken"] = token
-    return sorted(values)[:limit]
+    values.sort()
+    return values[:limit], len(values) > limit
+
+
+def _get_metric_data_batched(
+    client, queries: list[dict], start_time: datetime, end_time: datetime
+) -> tuple[dict[str, dict], bool]:
+    """Run ``queries`` in GetMetricData batches of 500, keyed by query Id.
+
+    The boolean reports whether any result came back other than Complete.
+    """
+    results: dict[str, dict] = {}
+    incomplete = False
+    for offset in range(0, len(queries), GET_METRIC_DATA_MAX_QUERIES):
+        response = client.get_metric_data(
+            MetricDataQueries=queries[
+                offset : offset + GET_METRIC_DATA_MAX_QUERIES
+            ],
+            StartTime=start_time,
+            EndTime=end_time,
+            ScanBy="TimestampDescending",
+        )
+        for result in response.get("MetricDataResults", []):
+            query_id = str(result.get("Id", ""))
+            results[query_id] = result
+            if result.get("StatusCode") != "Complete":
+                incomplete = True
+    return results, incomplete
 
 
 def _usage_metric_query(query_id: str, metric_name: str,
@@ -1541,10 +1612,10 @@ async def admin_usage_metrics(request: Request, days: int = 14) -> Response:
     }
     try:
         client = cloudwatch_client()
-        models = _list_dimension_values(
+        models, _ = _list_dimension_values(
             client, "Model", USAGE_METRICS_MAX_MODELS
         )
-        user_ids = _list_dimension_values(
+        user_ids, users_truncated = _list_dimension_values(
             client, "UserId", USAGE_METRICS_MAX_USERS
         )
         queries = [
@@ -1571,20 +1642,13 @@ async def admin_usage_metrics(request: Request, days: int = 14) -> Response:
                     f"u{user_index}_requests", "Requests", dimensions
                 )
             )
-        results: dict[str, dict] = {}
-        incomplete = False
-        if queries:
-            response = client.get_metric_data(
-                MetricDataQueries=queries,
-                StartTime=start_time,
-                EndTime=now,
-                ScanBy="TimestampDescending",
-            )
-            for result in response.get("MetricDataResults", []):
-                query_id = str(result.get("Id", ""))
-                results[query_id] = result
-                if result.get("StatusCode") != "Complete":
-                    incomplete = True
+        results, incomplete = _get_metric_data_batched(
+            client, queries, start_time, now
+        )
+        # Identities beyond the cap were never queried, so the ranking
+        # could be missing a heavy spender: say so rather than imply
+        # completeness.
+        incomplete = incomplete or users_truncated
         for key, _ in USAGE_METRIC_SPECS:
             series = _usage_series(
                 results.get(f"t_{key}", {}), day_index, days
@@ -1933,11 +1997,22 @@ async def set_emergency_stop(request: Request) -> Response:
             status_code=202,
         )
     retry = bool(current.get("desired_active")) == desired_active
-    state = store().set_emergency_desired(
-        active=desired_active,
-        actor=emergency_actor,
-        reason=reason.strip(),
-    )
+    try:
+        state = store().set_emergency_desired(
+            active=desired_active,
+            actor=emergency_actor,
+            reason=reason.strip(),
+        )
+    except EmergencyVersionConflict as exc:
+        # Two operators raced (activate against recover, typically). Neither
+        # request is silently dropped or overwritten: the loser gets the
+        # state the winner wrote and decides whether to re-issue.
+        return _error(
+            409,
+            "The emergency-stop state changed concurrently; re-read and retry.",
+            "version_conflict",
+            details={"current_emergency": exc.current},
+        )
     return JSONResponse(
         {**state, "idempotent": False, "retry": retry},
         status_code=202,
@@ -2483,9 +2558,12 @@ async def canonical_set_status(
 # model resource, so ANY model budget breach blocks the subject entirely.
 # Making the deny model-selective would need per-identity resource lists in
 # the 19 revocation shards and blow the 6,144-character shard cap; it is a
-# documented limitation, not a roadmap item. Model budgets are also not part
-# of the credential-vend pre-flight (main.py vend_credentials): at vend time
-# the model is unknown, so pre-flight stays subject-level.
+# documented limitation, not a roadmap item. The credential-vend pre-flight
+# (vend_credentials -> QuotaStore.evaluate_user_quota) evaluates model
+# budgets too: a model ledger already at its cap refuses the vend like a
+# subject-level breach does. What the pre-flight cannot do is predict which
+# model the session will call, so a budget that is merely close to its cap
+# never withholds credentials.
 
 
 def _parse_model_budget(body: dict) -> tuple[dict | None, str]:

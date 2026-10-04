@@ -1,19 +1,23 @@
 # RevocationPolicyOverflowAlarm
 
-**Operations key:** `revocation_overflow` · **Metric:** `RevocationPolicyOverflow` (Sum ≥ 1 over 5 min, 1 period) · **Emitted by:** `revocation_processor/handler.py` — `overflow_count` in the success `_emit`, one per shard whose desired document exceeds `REVOCATION_POLICY_MAX_CHARACTERS` (6 144).
+**Operations key:** `revocation_overflow` · **Alarm name:** `<stack>-revocation-overflow` · **Metric:** `RevocationPolicyOverflow` (Sum ≥ 1 over 5 min, 1 period) · **Emitted by:** `revocation_processor/handler.py` — `overflow_count` in the success `_emit`, one per shard whose desired document exceeds `REVOCATION_POLICY_MAX_CHARACTERS` (6 144).
 
 ## What it means
 
 At least one of the 19 deny shards has more blocked identities hashed into it
 than fit in a 6 144-character managed policy. For that shard the processor
-**keeps the last known-good deny document** rather than writing a truncated
-or empty one (see the comment in the shard loop: replacing it with a no-op
-would instantly restore every blocked identity in the shard). Consequence:
+writes **what fits, deterministically** (`fit_overflowing_shard`): identities
+that are no longer blocked leave the shard (an admin unblock always takes
+effect), identities already denied stay, and new ones are added in sorted
+order until the document is full. The remainder is counted in the
+`RevokedIdentitiesDropped` metric and in `dropped_identities` of the result.
+Consequence:
 
-- Identities already in the shard stay denied.
-- **Newly blocked identities that hash into the overflowing shard are not
-  cut by IAM.** Their sessions run to the permission lease deadline; new
-  vends are still refused by the broker.
+- Identities already in the shard stay denied; unblocked identities are
+  released.
+- **Newly blocked identities that did not fit are not cut by IAM.** Their
+  sessions run to the permission lease deadline; new vends are still refused
+  by the broker.
 
 This is capacity exhaustion, not an error, and it will not self-heal until
 blocked identities are unblocked or the window resets and the automatic
@@ -55,7 +59,8 @@ newly blocked identity with no IAM cut.
      --start-time $(( $(date +%s) - 3600 ))000 --query 'events[-1].message' --output text \
      | python3 -c 'import json,sys; r=json.load(sys.stdin); print(r["overflow_shards"]); [print(s) for s in r["shards"] if s["overflow"]]'
    ```
-   `desired_characters` vs `applied_characters` shows the gap.
+   `desired_characters` vs `applied_characters` shows the gap and
+   `dropped_identities` how many identities fell back to lease expiry.
 2. **Reduce the blocked set.** First force a sweep pass so every automatic
    block that is already under quota lifts on its own (keeping
    `status_origin: automatic`, so it can re-block and re-lift later):
@@ -82,11 +87,13 @@ newly blocked identity with no IAM cut.
 - `RevocationPolicyOverflow` Sum = 0 for one 5-minute period → `OK`.
 - `metrics.recent_overflow_count: 0` and `reconciliation_status: current`
   in `/admin/operations`.
-- The last success log's `shards[]` shows `overflow: false` everywhere and
-  `desired_characters == applied_characters`.
+- The last success log's `shards[]` shows `overflow: false` everywhere,
+  `dropped_identities: 0`, and `desired_characters == applied_characters`;
+  `RevokedIdentitiesDropped` Sum = 0.
 
 ## Related
 
 - [revocation-sync-failure.md](revocation-sync-failure.md)
 - Component: [components/revocation-processor.md](../components/revocation-processor.md)
-- Threat model: T-17 (shard overflow as an enforcement-degradation vector) in [../threat-model.md](../../threat-model.md)
+- Threat model: T-17 (shard overflow as an enforcement-degradation vector) in [../../threat-model.md](../../threat-model.md)
+- Metrics (no dimensions): `RevocationPolicyOverflow`, `RevokedIdentitiesDropped`, `RevokedIdentitiesDesired`

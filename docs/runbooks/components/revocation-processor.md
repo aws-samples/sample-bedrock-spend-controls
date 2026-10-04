@@ -5,7 +5,7 @@
 the enforcement dispatcher (`source: enforcement-dispatch`) and the
 `RevocationReconciliationSchedule` (`rate(<revocation_reconcile_minutes>)`,
 default 5 min, `source: aws.events`). 256 MB, 2 min timeout, reserved
-concurrency 1.
+concurrency 1 (unless `reserve_enforcement_concurrency` is `false`).
 
 ## What it does
 
@@ -19,8 +19,13 @@ strongly consistent **scan** of the users table for rows with
 compare with the current default version and `CreatePolicyVersion
 --set-as-default` only when different, deleting the oldest non-default
 version first when five exist. A shard whose desired document exceeds
-`REVOCATION_POLICY_MAX_CHARACTERS` (6 144) is **left at its last good
-version** and counted as overflow.
+`REVOCATION_POLICY_MAX_CHARACTERS` (6 144) is written with **what fits**
+(`fit_overflowing_shard`: unblocked identities leave, already-denied ones
+stay, new ones are added in sorted order until full), counted as overflow,
+and the identities that did not fit are counted as `dropped_identities`
+(`RevokedIdentitiesDropped`); they rely on lease expiry. Everything in the
+pass, including reading the configuration and the users-table scan, runs
+inside the failure handler, so any error raises `RevocationSyncFailure`.
 
 It never creates, attaches, or detaches policies, and cannot touch the
 role, its trust policy, or the permissions boundary.
@@ -36,16 +41,16 @@ role, its trust policy, or the permissions boundary.
 | Input | Output |
 |---|---|
 | Users-table scan | IAM policy versions on the shards |
-| Env `REVOCATION_POLICY_ARNS_JSON`, `REVOCATION_POLICY_MAX_CHARACTERS` | EMF `RevocationSyncSuccess`, `RevocationSyncFailure`, `RevocationPolicyOverflow`, `RevokedIdentitiesDesired` |
+| Env `REVOCATION_POLICY_ARNS_JSON`, `REVOCATION_POLICY_MAX_CHARACTERS` | EMF (no dimensions) `RevocationSyncSuccess`, `RevocationSyncFailure`, `RevocationPolicyOverflow`, `RevokedIdentitiesDropped`, `RevokedIdentitiesDesired` |
 | | SNS `REVOCATION SYNC FAILED`, `REVOCATION POLICY CAPACITY EXCEEDED` |
-| | Return `{reconciled, blocked_identities, updated_shards, unchanged_shards, overflow_shards, shards[]}` |
+| | Return `{reconciled, blocked_identities, updated_shards, unchanged_shards, overflow_shards, dropped_identities, shards[]}` (each shard: `index, identities, desired_characters, applied_characters, overflow, dropped_identities, changed`) |
 
 ## Failure modes
 
 | Symptom | Alarm | Notes |
 |---|---|---|
-| IAM error mid-loop | [revocation-sync-failure](../alarms/revocation-sync-failure.md) | Shards before the failure were updated; the rest wait for the next pass. Raises so the schedule retries. |
-| Shard too large | [revocation-policy-overflow](../alarms/revocation-policy-overflow.md) | Last-good kept; new identities in that shard rely on the lease. Does **not** raise. |
+| IAM error mid-loop, scan error, or bad configuration | [revocation-sync-failure](../alarms/revocation-sync-failure.md) and [revocation-processor-errors](../alarms/revocation-processor-errors.md) | Shards before the failure were updated; the rest wait for the next pass. Raises so the schedule retries. |
+| Shard too large | [revocation-policy-overflow](../alarms/revocation-policy-overflow.md) | What fits is applied; identities that did not fit (`RevokedIdentitiesDropped`) rely on the lease. Does **not** raise. |
 | Scan cost | — | Full users-table scan per pass. Fine at thousands of rows; at tens of thousands consider a `status` GSI (not implemented). |
 | Identity blocked but never vended | — | No `source_identity` on the row → not in any shard. Harmless: there is no session to cut. |
 

@@ -115,6 +115,52 @@ def test_active_policy_is_unconditional_and_inactive_is_noop():
     ]
 
 
+def test_emergency_documents_are_fixed_size_and_within_managed_policy_limit():
+    """The emergency deny has no variable part (no identity list), so there is
+    nothing to overflow; pin that so a future edit cannot silently grow it
+    past the 6,144-character managed-policy limit the shards guard against."""
+    for active in (True, False):
+        document = emergency._compact(emergency.emergency_policy(active))
+        assert len(document) < 1_024
+        assert len(document) <= 6_144
+
+
+def test_version_rotation_deletes_oldest_non_default_only_when_full(
+    fake_dynamodb, monkeypatch
+):
+    arn = _configure(monkeypatch)
+    _put_state(fake_dynamodb, active=True)
+    iam = FakeIAM(arn)
+    deleted: list[str] = []
+    real_delete = iam.delete_policy_version
+
+    def tracking_delete(PolicyArn, VersionId):  # noqa: N803
+        deleted.append(VersionId)
+        return real_delete(PolicyArn, VersionId)
+
+    iam.delete_policy_version = tracking_delete
+    # Four versions: room for one more, nothing is deleted.
+    for number in range(2, 5):
+        iam.versions[f"v{number}"] = {
+            "Document": emergency.emergency_policy(False),
+            "CreateDate": datetime(2030, 1, number, tzinfo=timezone.utc),
+        }
+    iam.default = "v4"
+
+    emergency.handler(_event(), None, dynamodb=fake_dynamodb, iam=iam, sns=FakeSNS())
+    assert deleted == []
+    assert iam.default == "v5"
+
+    # Five versions and the default is the newest: the oldest non-default
+    # goes, never the default.
+    _put_state(fake_dynamodb, active=False)
+    iam.versions["v1"]["CreateDate"] = datetime(2029, 1, 1, tzinfo=timezone.utc)
+    emergency.handler(_event(), None, dynamodb=fake_dynamodb, iam=iam, sns=FakeSNS())
+    assert deleted == ["v1"]
+    assert iam.default == "v6"
+    assert "Condition" in iam.current()["Statement"][0]
+
+
 def test_activation_applies_role_wide_deny_and_marks_state(
     fake_dynamodb, monkeypatch
 ):

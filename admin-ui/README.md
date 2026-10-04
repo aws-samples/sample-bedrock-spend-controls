@@ -40,9 +40,14 @@ It provides:
   telemetry is shown as unknown or unavailable, never as healthy.
 
 The console never mutates IAM directly and receives no CloudWatch permissions,
-secret ARN, or policy ARN. The emergency key is entered at action time, sent
-only with that request, and never part of `config.js`, API responses, or
-browser storage.
+secret ARN, or policy ARN. The emergency key is typed by the operator into the
+browser for each activate/recover action: it is held in form state only until
+the request is sent, cleared from the form on submit, excluded from browser
+autofill (`autocomplete="new-password"`), and never part of `config.js`, API
+responses, or browser storage. After a request the card polls
+`GET /admin/emergency-stop` every five seconds (up to five minutes) until the
+state settles, and reads the same endpoint when `GET /admin/operations` is
+unavailable so the break-glass buttons do not depend on CloudWatch telemetry.
 
 ## Authentication
 

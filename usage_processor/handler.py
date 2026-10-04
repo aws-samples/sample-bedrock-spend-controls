@@ -22,6 +22,7 @@ import hashlib
 import json
 import os
 import re
+import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
@@ -99,6 +100,10 @@ class InvocationUsage:
     cache_read_tokens: int = 0
     cache_write_tokens: int = 0
     images: int = 0
+    # True when ``images`` is the one-image floor assumed for an image-model
+    # record that carried no count (image data delivery disabled). Such a
+    # request is flagged unpriced so the estimate is never silently zero.
+    image_count_assumed: bool = False
 
     @property
     def window(self) -> str:
@@ -122,16 +127,29 @@ class PricedInvocation:
     """Outcome of pricing one invocation against the catalog."""
 
     cost_micro: int
-    price_source: str  # snapshot | base-model | fallback
-    # Dimensions the record carried but the resolved price had no rate for.
-    # Non-empty means the fallback rate was used for that dimension (when the
-    # fallback has one) or the dimension went unpriced; either way the
-    # request is flagged for repair rather than silently under-counted.
+    # snapshot | base-model | base-model-mismatch | fallback. The mismatch
+    # value means a geographic profile was priced from its base model while
+    # a sibling geographic pin carries a different rate, so the derivation
+    # is probably under-counting; it is flagged like a fallback-priced
+    # request until the profile gets its own pin.
+    price_source: str
+    # Dimensions the record carried but the resolved price had no rate for,
+    # or whose count had to be assumed. Non-empty means the fallback rate was
+    # used for that dimension (when the fallback has one) or the dimension
+    # went unpriced; either way the request is flagged for repair rather
+    # than silently under-counted.
     missing_dimensions: tuple[str, ...] = ()
 
     @property
     def unpriced(self) -> bool:
-        return bool(self.missing_dimensions) or self.price_source == "fallback"
+        return (
+            bool(self.missing_dimensions)
+            or self.price_source in _FLAGGED_PRICE_SOURCES
+        )
+
+
+# Price sources that count toward ``FallbackPricedRequests`` on their own.
+_FLAGGED_PRICE_SOURCES = frozenset({"fallback", "base-model-mismatch"})
 
 
 _dynamodb_resource = None
@@ -216,8 +234,9 @@ def _image_count(record: dict, output_data: dict) -> int:
     account enables image delivery or Bedrock adds an explicit counter.
     Checked in order: an explicit ``output.outputImageCount``, then the
     length of ``output.outputBodyJson.images`` (the Nova Canvas / Stability
-    response shape). Absence yields 0 and the request is flagged as
-    unpriced downstream instead of being silently free.
+    response shape). Absence yields 0; ``_parse_invocation`` then assumes
+    one image for image models and flags the request as unpriced instead
+    of metering it as free.
     """
     explicit = output_data.get("outputImageCount")
     if explicit is not None:
@@ -271,14 +290,18 @@ def _parse_invocation(
         or "outputBodyTokenCount" in output_data
     )
     images = _image_count(record, output_data)
-    if not has_token_metadata and images == 0 and not _is_image_model(model_id):
+    image_count_assumed = False
+    if not has_token_metadata and images == 0:
         # The Responses API logs a second, metadata-less record for the
         # same invocation alongside the token-bearing one. A record with
         # no token metadata on either side has nothing to meter; skipping
         # it also keeps request counts honest. Image models are the
-        # exception: their records carry no token counts, so they are
-        # metered as one image-generation request and flagged for repair.
-        return None
+        # exception: their records carry no token counts (and no body with
+        # image delivery disabled), so they are metered as at least one
+        # generated image and flagged for repair rather than priced at zero.
+        if not _is_image_model(model_id):
+            return None
+        images, image_count_assumed = 1, True
     input_tokens = _non_negative_int(
         input_data.get(
             "inputTokenCount", input_data.get("inputBodyTokenCount", 0)
@@ -328,6 +351,7 @@ def _parse_invocation(
             cache_read_tokens=cache_read_tokens,
             cache_write_tokens=cache_write_tokens,
             images=images,
+            image_count_assumed=image_count_assumed,
         )
 
     identity = record.get("identity")
@@ -346,6 +370,7 @@ def _parse_invocation(
         cache_read_tokens=cache_read_tokens,
         cache_write_tokens=cache_write_tokens,
         images=images,
+        image_count_assumed=image_count_assumed,
     )
 
 
@@ -409,6 +434,29 @@ _PRICE_CACHE_TTL_SECONDS = 900
 _PRICE_RETRY_SECONDS = 60
 _price_cache: dict[str, Any] = {"next_attempt_at": 0.0, "value": None}
 
+# The price resolver (cdk/pricing_resolver/handler.py) stores the parameter
+# as ``gz1:<base64(gzip(json))>`` so the shipped catalog fits Parameter
+# Store's 8 KB cap. Earlier template versions wrote plain JSON; that form is
+# still accepted so an in-place upgrade keeps metering between the deploy
+# and the first refresh. Must stay in sync with the resolver's
+# ``COMPRESSED_PREFIX``.
+_PRICE_PARAMETER_COMPRESSED_PREFIX = "gz1:"
+
+
+def _decode_price_parameter(raw: str) -> dict:
+    """Decode the price parameter value in either supported encoding."""
+    if raw.startswith(_PRICE_PARAMETER_COMPRESSED_PREFIX):
+        compressed = base64.b64decode(
+            raw[len(_PRICE_PARAMETER_COMPRESSED_PREFIX):]
+        )
+        return json.loads(gzip.decompress(compressed).decode("utf-8"))
+    if raw.startswith("{"):
+        return json.loads(raw)
+    raise ValueError(
+        "Unrecognised price parameter encoding: expected a value starting "
+        f"with {_PRICE_PARAMETER_COMPRESSED_PREFIX!r} or '{{'"
+    )
+
 
 def _parameter_prices(
     ssm, now_epoch: float
@@ -419,7 +467,7 @@ def _parameter_prices(
     cache = _price_cache
     if now_epoch >= cache["next_attempt_at"]:
         try:
-            value = json.loads(
+            value = _decode_price_parameter(
                 ssm.get_parameter(Name=parameter_name)["Parameter"]["Value"]
             )
             models = {
@@ -454,10 +502,13 @@ def _parameter_prices(
 # "us.anthropic....". The Pricing API catalogs base model names, so an
 # unmatched profile ID resolves to its base model before the conservative
 # fallback. An explicit profile entry (for example a geographic uplift)
-# always wins over this derivation.
-_PROFILE_PREFIXES = frozenset(
-    {"us", "eu", "apac", "jp", "au", "ca", "sa", "global", "us-gov"}
+# always wins over this derivation. Geographic prefixes may carry a
+# provider uplift over the base rate (Claude: 10 %); ``global`` is priced
+# at the base rate by definition.
+_GEO_PROFILE_PREFIXES = frozenset(
+    {"us", "eu", "apac", "jp", "au", "ca", "sa", "us-gov"}
 )
+_PROFILE_PREFIXES = _GEO_PROFILE_PREFIXES | {"global"}
 
 
 def _price_for(
@@ -465,7 +516,14 @@ def _price_for(
     fallback: dict[str, float],
     model_id: str,
 ) -> tuple[dict[str, float], str]:
-    """Return ({dimension: rate}, price_source) for one model ID."""
+    """Return ({dimension: rate}, price_source) for one model ID.
+
+    A geographic profile derived from its base model is reported as
+    ``base-model-mismatch`` when a sibling geographic pin (``us.<base>`` for
+    an ``eu.<base>`` lookup, and so on) is priced differently from the base:
+    the catalog evidently applies a geographic uplift to this model, so the
+    base rate is an under-count and the profile needs its own pin.
+    """
     exact = prices.get(model_id)
     if exact is not None:
         return exact, "snapshot"
@@ -473,6 +531,14 @@ def _price_for(
     if separator and prefix in _PROFILE_PREFIXES:
         base = prices.get(base_model)
         if base is not None:
+            if prefix in _GEO_PROFILE_PREFIXES and any(
+                sibling is not None and sibling != base
+                for sibling in (
+                    prices.get(f"{other}.{base_model}")
+                    for other in _GEO_PROFILE_PREFIXES
+                )
+            ):
+                return base, "base-model-mismatch"
             return base, "base-model"
     return fallback, "fallback"
 
@@ -495,6 +561,8 @@ def _price_invocation(
     priced at the fallback's rate for that dimension when one exists
     (conservative, like an unknown model) and recorded in
     ``missing_dimensions`` either way so the ledger can be repaired later.
+    An assumed image count is flagged the same way even when the entry
+    prices images: the one-image floor is a lower bound, not a measurement.
     Nothing is ever silently priced at zero.
     """
     rates, price_source = _price_for(prices, fallback, usage.model_id)
@@ -511,6 +579,8 @@ def _price_invocation(
             usd += count * rate / 1_000_000
         else:
             usd += count * rate
+    if usage.image_count_assumed and "image" not in missing:
+        missing.append("image")
     return PricedInvocation(
         cost_micro=_round_up_micro(usd),
         price_source=price_source,
@@ -542,38 +612,51 @@ def limits_from_item(item: dict) -> dict:
     )
 
 
-def _apply_rate_usage(
-    usage_table,
+def _rate_counter_update(
+    usage_table_name: str,
     user_id: str,
     usage: InvocationUsage,
-) -> dict[str, object]:
-    """Increment the subject's per-minute counter and return the new totals.
+) -> dict:
+    """Transaction item incrementing the subject's per-minute counter.
 
     Rows live in the usage table under ``RATE#<user>`` / ``<UTC minute>``
     with a short TTL. Counted per *occurrence* minute, so a late-delivered
     record increments the minute it happened in, never the current one.
-    Only subjects with a positive rpm/tpm pay for this write; the increment
-    itself is not part of the idempotent transaction because a duplicate
-    delivery is already detected before this runs.
+    Only subjects with a positive rpm/tpm pay for this write. It rides in
+    the same transaction as the ledger rows so a failure after the commit
+    (the retry then sees the request marker and skips) cannot lose it.
     """
-    key = rate_row_key(user_id, usage.occurred_at)
     tokens = usage.input_tokens + usage.output_tokens
-    response = usage_table.update_item(
-        Key=key,
-        UpdateExpression=(
-            "ADD requests :one, tokens :t "
-            "SET expires_at = if_not_exists(expires_at, :ttl)"
-        ),
-        ExpressionAttributeValues={
-            ":one": 1,
-            ":t": tokens,
-            # Counter rows only matter for the minute they describe plus a
-            # grace period for late evaluation; keep them briefly.
-            ":ttl": int(usage.occurred_at.timestamp()) + 15 * 60,
-        },
-        ReturnValues="ALL_NEW",
-    )
-    return rate_usage_from_item(response.get("Attributes"), usage.occurred_at)
+    return {
+        "Update": {
+            "TableName": usage_table_name,
+            "Key": {
+                name: _av(value)
+                for name, value in rate_row_key(
+                    user_id, usage.occurred_at
+                ).items()
+            },
+            "UpdateExpression": (
+                "ADD requests :one, tokens :t "
+                "SET expires_at = if_not_exists(expires_at, :ttl)"
+            ),
+            "ExpressionAttributeValues": {
+                ":one": _av(1),
+                ":t": _av(tokens),
+                # Counter rows only matter for the minute they describe
+                # plus a grace period for late evaluation; keep them briefly.
+                ":ttl": _av(int(usage.occurred_at.timestamp()) + 15 * 60),
+            },
+        }
+    }
+
+
+# A TransactionCanceledException that is not a duplicate is usually a
+# transient conflict on a hot ledger row (two invocations metering the same
+# subject). Retry a few times in-function with a short backoff before
+# letting the Logs subscription retry the whole batch.
+_TRANSACTION_RETRY_BACKOFF_SECONDS = (0.05, 0.2, 0.5)
+_sleep = time.sleep
 
 
 def _apply_usage(
@@ -584,16 +667,19 @@ def _apply_usage(
     cost_micro: int,
     *,
     missing_dimensions: tuple[str, ...] = (),
+    rate_limited: bool = False,
 ) -> bool:
     """Apply one invocation exactly once. Returns False for a duplicate.
 
     One transaction writes the ``REQUEST#<id>`` idempotency marker, the
-    subject's daily row, and the subject's per-model daily row
-    (``<subject>#model#<model_id>``). The per-model row feeds model-scoped
-    budgets and is written unconditionally (not only when a model budget
-    exists) so a budget added mid-period includes usage already recorded,
-    matching how weekly/monthly limits behave. This doubles ledger writes per
-    request; see DEPLOYMENT.md for the cost note.
+    subject's daily row, the subject's per-model daily row
+    (``<subject>#model#<model_id>``) and, for rate-limited subjects, the
+    per-minute ``RATE#`` counter (four items, far below the transaction
+    limit). The per-model row feeds model-scoped budgets and is written
+    unconditionally (not only when a model budget exists) so a budget added
+    mid-period includes usage already recorded, matching how weekly/monthly
+    limits behave. This doubles ledger writes per request; see DEPLOYMENT.md
+    for the cost note.
 
     Beyond the quota-bearing counters, the daily rows accumulate the
     non-limited priced dimensions (cache tokens, images) and an
@@ -642,43 +728,50 @@ def _apply_usage(
             }
         }
 
-    try:
-        client.transact_write_items(
-            TransactItems=[
-                {
-                    "Put": {
-                        "TableName": usage_table_name,
-                        "Item": {
-                            **marker_key,
-                            "expires_at": _av(ttl),
-                        },
-                        "ConditionExpression": "attribute_not_exists(user_id)",
-                    }
+    items = [
+        {
+            "Put": {
+                "TableName": usage_table_name,
+                "Item": {
+                    **marker_key,
+                    "expires_at": _av(ttl),
                 },
-                ledger_update(user_id),
-                ledger_update(model_ledger_subject(user_id, usage.model_id)),
-            ]
-        )
-        return True
-    except ClientError as exc:
-        code = exc.response.get("Error", {}).get("Code")
-        if code not in {
-            "TransactionCanceledException",
-            "ConditionalCheckFailedException",
-        }:
-            raise
-        # TransactionCanceledException also represents conflicts, capacity
-        # failures, and validation errors. Confirm the request marker before
-        # classifying the delivery as a duplicate; otherwise let the Logs
-        # subscription retry instead of silently dropping usage.
-        marker = client.get_item(
-            TableName=usage_table_name,
-            Key=marker_key,
-            ConsistentRead=True,
-        )
-        if marker.get("Item"):
-            return False
-        raise
+                "ConditionExpression": "attribute_not_exists(user_id)",
+            }
+        },
+        ledger_update(user_id),
+        ledger_update(model_ledger_subject(user_id, usage.model_id)),
+    ]
+    if rate_limited:
+        items.append(_rate_counter_update(usage_table_name, user_id, usage))
+
+    for pause in (*_TRANSACTION_RETRY_BACKOFF_SECONDS, None):
+        try:
+            client.transact_write_items(TransactItems=items)
+            return True
+        except ClientError as exc:
+            code = exc.response.get("Error", {}).get("Code")
+            if code not in {
+                "TransactionCanceledException",
+                "ConditionalCheckFailedException",
+            }:
+                raise
+            # TransactionCanceledException also represents conflicts,
+            # capacity failures, and validation errors. Confirm the request
+            # marker before classifying the delivery as a duplicate; retry a
+            # conflict briefly; otherwise let the Logs subscription retry
+            # instead of silently dropping usage.
+            marker = client.get_item(
+                TableName=usage_table_name,
+                Key=marker_key,
+                ConsistentRead=True,
+            )
+            if marker.get("Item"):
+                return False
+            if pause is None:
+                raise
+            _sleep(pause)
+    raise AssertionError("unreachable")  # pragma: no cover
 
 
 def _notify(sns, subject: str, payload: dict) -> None:
@@ -748,11 +841,25 @@ def _model_budget_evaluation(usage_table, user: dict, user_id: str, now: datetim
     return evaluate_model_budgets(budgets, usage_by_model, now)
 
 
-def _current_rate_usage(usage_table, user_id: str, now: datetime) -> dict:
+def _current_rate_usage(usage_table, user_id: str, at: datetime) -> dict:
+    """Per-minute counters for the minute containing ``at``."""
     item = usage_table.get_item(
-        Key=rate_row_key(user_id, now), ConsistentRead=True
+        Key=rate_row_key(user_id, at), ConsistentRead=True
     ).get("Item")
-    return rate_usage_from_item(item, now)
+    return rate_usage_from_item(item, at)
+
+
+# ``status_reason`` ends with the window the block was raised in ("in
+# 2026-09-07", "in minute 2026-09-09T12:00"). Blocks are compared without
+# it so a subject that stays over its rate limit minute after minute is
+# not re-blocked (new transaction, REVOCATION# write and SNS message) for
+# every new minute; the stored reason keeps naming the first window.
+_REASON_WINDOW_SUFFIX = re.compile(r" in (?:minute )?\S+$")
+
+
+def _block_scope(reason: str) -> str:
+    """The period, dimension and model scope of an automatic block reason."""
+    return _REASON_WINDOW_SUFFIX.sub("", reason)
 
 
 def _evaluate_quota(
@@ -762,6 +869,7 @@ def _evaluate_quota(
     sns,
     user_id: str,
     *,
+    occurred_at: datetime | None = None,
     _attempt: int = 0,
 ) -> str:
     """Block or warn from all current UTC calendar quota periods.
@@ -775,8 +883,16 @@ def _evaluate_quota(
     auto-block, however far over 100 % it runs. Rate-limit (rpm/tpm)
     breaches use the same blocking path with a distinct reason and, being
     automatic, lift on their own once the minute is under the limit.
+
+    Calendar periods are evaluated at processing time; rate limits are
+    evaluated in the minute the invocation *occurred* (``occurred_at``),
+    which is the minute the ``RATE#`` counter was incremented in. Reading
+    the processing minute instead would miss every burst whose records are
+    delivered after the minute rolled over, which under normal CloudWatch
+    Logs lag is most of them.
     """
     now = datetime.now(timezone.utc)
+    rate_at = occurred_at or now
     user = users_table.get_item(
         Key={"user_id": user_id}, ConsistentRead=True
     ).get("Item")
@@ -785,17 +901,21 @@ def _evaluate_quota(
     current_usage = _current_usage(usage_table, user_id, now)
     rate_limits = rate_limits_from_item(user)
     rate_usage = (
-        _current_rate_usage(usage_table, user_id, now)
+        _current_rate_usage(usage_table, user_id, rate_at)
         if rate_limits_enabled(rate_limits)
         else None
     )
     evaluation = merge_evaluations(
-        evaluate_limits(
-            limits_from_item(user),
-            current_usage,
-            now,
-            rate_limits=rate_limits,
-            rate_usage=rate_usage,
+        merge_evaluations(
+            evaluate_limits(limits_from_item(user), current_usage, now),
+            # Rate limits alone, anchored on the occurrence minute.
+            evaluate_limits(
+                {},
+                {},
+                rate_at,
+                rate_limits=rate_limits,
+                rate_usage=rate_usage,
+            ),
         ),
         # Model-scoped budgets: ANY block breach blocks the subject, because
         # the deny primitives (SourceIdentity shards, role inline deny) are
@@ -812,7 +932,9 @@ def _evaluate_quota(
         if status == "blocked" and not machine_owned:
             return "manually-blocked"
         auto_reason = quota_reason(evaluation)
-        if status != "blocked" or reason != auto_reason:
+        if status != "blocked" or _block_scope(reason) != _block_scope(
+            auto_reason
+        ):
             changed_at = datetime.now(timezone.utc).isoformat()
             observed_version = int(user.get("version", 0))
             values = {
@@ -896,6 +1018,7 @@ def _evaluate_quota(
                         usage_table,
                         sns,
                         user_id,
+                        occurred_at=occurred_at,
                         _attempt=_attempt + 1,
                     )
                 return "concurrent-change"
@@ -945,38 +1068,92 @@ def _evaluate_quota(
         marker = crossing.marker
         if user.get(marker) == crossing.window.key:
             continue
-        users_table.update_item(
-            Key={"user_id": user_id},
-            UpdateExpression="SET #m = :w",
-            ExpressionAttributeNames={"#m": marker},
-            ExpressionAttributeValues={":w": crossing.window.key},
-        )
+        if not _claim_warning_marker(
+            users_table, user_id, marker, crossing.window.key
+        ):
+            # A concurrent invocation claimed this crossing (or one for a
+            # later window) first; it owns the notification.
+            continue
         # Keep the marker set warm locally so two crossings in one pass
         # (50 % and 80 % reached by the same request) each send exactly once.
         user[marker] = crossing.window.key
         scope = f" model {crossing.model_id}" if crossing.model_id else ""
-        _notify(
-            sns,
-            f"[bedrock-spend-controls] WARNING {user_id}{scope} "
-            f"{crossing.period} {crossing.at_bps / 100:g}%",
-            {
-                "user_id": user_id,
-                "period": crossing.period,
-                "threshold": crossing.at_bps / 10_000,
-                "window_start": crossing.window.start.isoformat(),
-                "resets_at": crossing.window.end.isoformat(),
-                "utilization": crossing.ratio,
-                **(
-                    {"model_id": crossing.model_id}
-                    if crossing.model_id is not None
-                    else {"usage": current_usage[crossing.period]}
-                ),
-            },
-        )
+        try:
+            _notify(
+                sns,
+                f"[bedrock-spend-controls] WARNING {user_id}{scope} "
+                f"{crossing.period} {crossing.at_bps / 100:g}%",
+                {
+                    "user_id": user_id,
+                    "period": crossing.period,
+                    "threshold": crossing.at_bps / 10_000,
+                    "window_start": crossing.window.start.isoformat(),
+                    "resets_at": crossing.window.end.isoformat(),
+                    "utilization": crossing.ratio,
+                    **(
+                        {"model_id": crossing.model_id}
+                        if crossing.model_id is not None
+                        else {"usage": current_usage[crossing.period]}
+                    ),
+                },
+            )
+        except Exception:
+            # The marker must not outlive a failed publish, or the warning
+            # is lost for the rest of the window. Release it and let the
+            # Logs subscription retry re-send.
+            _release_warning_marker(
+                users_table, user_id, marker, crossing.window.key
+            )
+            raise
         warned = True
     if warned:
         return "warned"
     return "within-budget"
+
+
+def _claim_warning_marker(
+    users_table, user_id: str, marker: str, window_key: str
+) -> bool:
+    """Record ``window_key`` as the window ``marker`` was sent for.
+
+    Conditional so that exactly one of two invocations evaluating the same
+    crossing publishes. Window keys are ISO dates (or minutes) and compare
+    chronologically as strings, so the condition also refuses to move a
+    marker back to an earlier window when a late log replays an old
+    crossing. Returns False when the condition fails.
+    """
+    try:
+        users_table.update_item(
+            Key={"user_id": user_id},
+            UpdateExpression="SET #m = :w",
+            ConditionExpression="attribute_not_exists(#m) OR #m < :w",
+            ExpressionAttributeNames={"#m": marker},
+            ExpressionAttributeValues={":w": window_key},
+        )
+    except ClientError as exc:
+        code = exc.response.get("Error", {}).get("Code")
+        if code != "ConditionalCheckFailedException":
+            raise
+        return False
+    return True
+
+
+def _release_warning_marker(
+    users_table, user_id: str, marker: str, window_key: str
+) -> None:
+    """Undo ``_claim_warning_marker`` after a failed publish (best effort)."""
+    try:
+        users_table.update_item(
+            Key={"user_id": user_id},
+            UpdateExpression="REMOVE #m",
+            ConditionExpression="#m = :w",
+            ExpressionAttributeNames={"#m": marker},
+            ExpressionAttributeValues={":w": window_key},
+        )
+    except ClientError as exc:
+        code = exc.response.get("Error", {}).get("Code")
+        if code != "ConditionalCheckFailedException":
+            raise
 
 
 def _emit_emf(
@@ -992,12 +1169,16 @@ def _emit_emf(
         int((processed_at - usage.occurred_at).total_seconds() * 1_000),
     )
     # A request is "unpriced" when it used the synthetic fallback rate for
-    # the whole model OR when one of its dimensions had no catalog rate.
-    # Both are operational events (missing snapshot/profile/dimension
-    # mapping) and are never silently priced. FallbackPricedRequests drives
-    # the alarm; UnpricedDimensionRequests is the narrower "known model,
-    # missing dimension" signal.
-    fallback_priced = price_source == "fallback" or bool(missing_dimensions)
+    # the whole model, when a geographic profile was derived from its base
+    # model although a sibling geographic pin is priced differently, OR when
+    # one of its dimensions had no catalog rate. All are operational events
+    # (missing snapshot/profile/dimension mapping) and are never silently
+    # priced. FallbackPricedRequests drives the alarm;
+    # UnpricedDimensionRequests is the narrower "known model, missing
+    # dimension" signal.
+    fallback_priced = price_source in _FLAGGED_PRICE_SOURCES or bool(
+        missing_dimensions
+    )
     record = {
         "_aws": {
             "Timestamp": int(processed_at.timestamp() * 1000),
@@ -1194,6 +1375,13 @@ def handler(
                 unresolved.add(usage.session_name)
                 continue
             user_id = str(mapping["maps_to"])
+        # Per-minute rate counters only for subjects that configured a rate
+        # limit; read the row once (strongly consistent) to decide, so the
+        # counter can ride in the ledger transaction.
+        subject = users_table.get_item(
+            Key={"user_id": user_id}, ConsistentRead=True
+        ).get("Item") or {}
+        rate_limited = rate_limits_enabled(rate_limits_from_item(subject))
         priced = _price_invocation(prices, fallback, usage)
         applied = _apply_usage(
             client,
@@ -1202,6 +1390,7 @@ def handler(
             usage,
             priced.cost_micro,
             missing_dimensions=priced.missing_dimensions,
+            rate_limited=rate_limited,
         )
         if not applied:
             result["duplicates"] += 1
@@ -1216,18 +1405,16 @@ def handler(
                 price_source=priced.price_source,
                 missing_dimensions=priced.missing_dimensions,
             )
-            # Per-minute rate counters only for subjects that configured a
-            # rate limit; read the row once (strongly consistent) to decide.
-            subject = users_table.get_item(
-                Key={"user_id": user_id}, ConsistentRead=True
-            ).get("Item") or {}
-            if rate_limits_enabled(rate_limits_from_item(subject)):
-                _apply_rate_usage(usage_table, user_id, usage)
         # A duplicate delivery may be retrying after accounting committed but
         # status convergence failed. Re-evaluate without incrementing or
         # re-emitting usage so the retry repairs enforcement.
         _evaluate_quota(
-            client, users_table, usage_table, sns, user_id
+            client,
+            users_table,
+            usage_table,
+            sns,
+            user_id,
+            occurred_at=usage.occurred_at,
         )
 
     result["unresolved_sessions"] = sorted(unresolved)
