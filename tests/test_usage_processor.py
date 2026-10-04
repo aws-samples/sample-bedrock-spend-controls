@@ -1,9 +1,11 @@
 import base64
 import copy
 import gzip
+import importlib.util
 import json
 import os
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 import pytest
 from boto3.dynamodb.types import TypeDeserializer
@@ -12,6 +14,7 @@ from botocore.exceptions import ClientError
 import handler as processor
 
 ROLE_NAME = "BedrockUserRole"
+ROOT = Path(__file__).resolve().parents[1]
 _DESERIALIZER = TypeDeserializer()
 
 
@@ -74,16 +77,67 @@ class FakeDynamoClient:
 
 
 class TransientCancellationClient(FakeDynamoClient):
+    """Cancels the first ``failures`` transactions (every one by default)."""
+
+    def __init__(self, resource, failures: int | None = None):
+        super().__init__(resource)
+        self.failures = failures
+        self.attempts = 0
+
     def transact_write_items(self, TransactItems):  # noqa: N803
-        raise ClientError(
-            {
-                "Error": {
-                    "Code": "TransactionCanceledException",
-                    "Message": "transaction conflict",
-                }
-            },
-            "TransactWriteItems",
-        )
+        self.attempts += 1
+        if self.failures is None or self.failures > 0:
+            if self.failures is not None:
+                self.failures -= 1
+            raise ClientError(
+                {
+                    "Error": {
+                        "Code": "TransactionCanceledException",
+                        "Message": "transaction conflict",
+                    }
+                },
+                "TransactWriteItems",
+            )
+        return super().transact_write_items(TransactItems)
+
+
+class RecordingClient(FakeDynamoClient):
+    def __init__(self, resource):
+        super().__init__(resource)
+        self.transactions: list[list[dict]] = []
+
+    def transact_write_items(self, TransactItems):  # noqa: N803
+        self.transactions.append(TransactItems)
+        return super().transact_write_items(TransactItems)
+
+
+class FailingSNS:
+    """Raises on the first ``failures`` publishes, then records them."""
+
+    def __init__(self, failures: int):
+        self.failures = failures
+        self.published: list[dict] = []
+
+    def publish(self, **kwargs):
+        if self.failures > 0:
+            self.failures -= 1
+            raise RuntimeError("sns down")
+        self.published.append(kwargs)
+        return {"MessageId": "fake"}
+
+
+def _freeze(monkeypatch, at: datetime):
+    """Pin ``processor.datetime.now``; move it later via ``FrozenDateTime._now``."""
+
+    class FrozenDateTime(datetime):
+        _now = at
+
+        @classmethod
+        def now(cls, tz=None):
+            return cls._now if tz is not None else cls._now.replace(tzinfo=None)
+
+    monkeypatch.setattr(processor, "datetime", FrozenDateTime)
+    return FrozenDateTime
 
 
 def _subscription(records: list[dict]) -> dict:
@@ -254,7 +308,11 @@ def test_duplicate_delivery_is_idempotent(fake_dynamodb, fake_sns, monkeypatch):
 def test_transient_transaction_cancellation_is_retried_not_dropped(
     fake_dynamodb, monkeypatch
 ):
+    """A cancellation that never clears is raised (so the Logs subscription
+    retries the batch) only after the in-function backoff is exhausted."""
     monkeypatch.setenv("BEDROCK_USER_ROLE_NAME", ROLE_NAME)
+    pauses: list[float] = []
+    monkeypatch.setattr(processor, "_sleep", pauses.append)
     usage = processor.InvocationUsage(
         request_id="retry-me",
         session_name="alice-session",
@@ -263,20 +321,61 @@ def test_transient_transaction_cancellation_is_retried_not_dropped(
         output_tokens=5,
         occurred_at=datetime.now(timezone.utc),
     )
+    client = TransientCancellationClient(fake_dynamodb)
 
     with pytest.raises(ClientError, match="transaction conflict"):
         processor._apply_usage(
-            TransientCancellationClient(fake_dynamodb),
-            os.environ["USAGE_TABLE"],
-            "alice",
-            usage,
-            1,
+            client, os.environ["USAGE_TABLE"], "alice", usage, 1
         )
 
+    assert client.attempts == len(processor._TRANSACTION_RETRY_BACKOFF_SECONDS) + 1
+    assert pauses == list(processor._TRANSACTION_RETRY_BACKOFF_SECONDS)
     row = fake_dynamodb.Table(os.environ["USAGE_TABLE"]).get_item(
         Key={"user_id": "alice", "window": usage.window}
     )
     assert "Item" not in row
+
+
+def test_hot_row_conflict_is_retried_in_function_and_then_commits(
+    fake_dynamodb, monkeypatch
+):
+    monkeypatch.setenv("BEDROCK_USER_ROLE_NAME", ROLE_NAME)
+    pauses: list[float] = []
+    monkeypatch.setattr(processor, "_sleep", pauses.append)
+    usage = processor.InvocationUsage(
+        request_id="conflict-then-commit",
+        session_name="alice-session",
+        model_id="openai.gpt-oss-20b",
+        input_tokens=10,
+        output_tokens=5,
+        occurred_at=datetime.now(timezone.utc),
+    )
+    client = TransientCancellationClient(fake_dynamodb, failures=2)
+
+    applied = processor._apply_usage(
+        client, os.environ["USAGE_TABLE"], "alice", usage, 7
+    )
+
+    assert applied is True
+    assert client.attempts == 3
+    assert pauses == [0.05, 0.2]
+    row = fake_dynamodb.Table(os.environ["USAGE_TABLE"]).get_item(
+        Key={"user_id": "alice", "window": usage.window}
+    )["Item"]
+    assert row["requests"] == 1
+    assert row["cost_micro"] == 7
+    # A duplicate that arrives while the conflict clears is still detected
+    # on the retry path (marker read between attempts), never double-charged.
+    assert (
+        processor._apply_usage(
+            TransientCancellationClient(fake_dynamodb, failures=1),
+            os.environ["USAGE_TABLE"],
+            "alice",
+            usage,
+            7,
+        )
+        is False
+    )
 
 
 def test_unknown_session_and_other_role_are_not_metered(
@@ -851,6 +950,45 @@ def test_broken_parameter_falls_back_to_the_deployment_snapshot(
     assert warning["level"] == "warning"
 
 
+def test_compressed_parameter_value_written_by_the_resolver_is_read(monkeypatch):
+    """Cross-Lambda contract: the processor decodes exactly what the price
+    resolver's writer produces (gzip + base64 behind the ``gz1:`` marker)."""
+    from cdk.pricing_resolver import handler as resolver
+
+    monkeypatch.setenv("PRICES_PARAMETER_NAME", "/quota/model-prices")
+    document = json.dumps({
+        "models": {"m": {"input_per_mtok": 1, "output_per_mtok": 2.5}},
+        "fallback": {"input_per_mtok": 40, "output_per_mtok": 90},
+        "resolved_at": "2026-10-02T00:00:00+00:00",
+    }, sort_keys=True, separators=(",", ":"))
+    encoded = resolver.encode_parameter_value(document)
+    assert encoded.startswith(processor._PRICE_PARAMETER_COMPRESSED_PREFIX)
+    assert not encoded.startswith("{")
+
+    assert processor._parameter_prices(_FakeSsmParameters(value=encoded), 0.0) == (
+        {"m": {"input": 1.0, "output": 2.5}},
+        {"input": 40.0, "output": 90.0},
+    )
+
+
+def test_legacy_plain_json_parameter_value_is_still_read():
+    """An in-place upgrade reads the previous template's plain-JSON value
+    until the first refresh rewrites it in the compressed form."""
+    document = json.dumps({
+        "models": {"m": {"input_per_mtok": 1.0, "output_per_mtok": 2.0}},
+        "fallback": {"input_per_mtok": 40.0, "output_per_mtok": 90.0},
+    })
+    assert processor._decode_price_parameter(document) == json.loads(document)
+    compressed = processor._PRICE_PARAMETER_COMPRESSED_PREFIX + base64.b64encode(
+        gzip.compress(document.encode("utf-8"))
+    ).decode("ascii")
+    assert processor._decode_price_parameter(compressed) == json.loads(document)
+    # Anything else is an error (caught by the caller, which then keeps the
+    # last good value or the deployment snapshot), never a silent misprice.
+    with pytest.raises(ValueError, match="Unrecognised price parameter encoding"):
+        processor._decode_price_parameter("gz0:AAAA")
+
+
 def test_stale_parameter_value_outlives_a_failed_refresh(monkeypatch, capsys):
     monkeypatch.setenv("PRICES_PARAMETER_NAME", "/quota/model-prices")
     ssm = _FakeSsmParameters(
@@ -1398,13 +1536,54 @@ def test_image_model_record_without_image_count_is_metered_and_flagged(
     result = _run(_subscription([record]), fake_dynamodb, fake_sns)
 
     assert result["processed"] == 1
+    assert result["unpriced"] == 1
     row = _today_row(fake_dynamodb)
     assert row["requests"] == 1
-    assert row["images"] == 0
-    # No image count means no image dimension to price: the row is not
-    # flagged missing-dimension (nothing was present), but cost is zero and
-    # the operator sees the request in the ledger.
-    assert row["cost_micro"] == 0
+    # No image count: the processor assumes the one-image floor, prices it
+    # at the catalog rate, and flags the request so the operator knows the
+    # figure is a lower bound rather than a measurement.
+    assert row["images"] == 1
+    assert row["cost_micro"] == 40_000
+    assert row["unpriced_requests"] == 1
+    assert row["missing_dimensions"] == {"image"}
+    emf = _emf_records(capsys)[0]
+    assert emf["PriceSource"] == "snapshot"
+    assert emf["ImagesGenerated"] == 1
+    assert emf["MissingDimensions"] == ["image"]
+    assert emf["FallbackPricedRequests"] == 1
+    assert emf["UnpricedDimensionRequests"] == 1
+
+
+def test_image_model_record_with_a_count_is_not_flagged_as_assumed(
+    fake_dynamodb, fake_sns, monkeypatch, capsys
+):
+    monkeypatch.setenv("BEDROCK_USER_ROLE_NAME", ROLE_NAME)
+    monkeypatch.setenv(
+        "MODEL_PRICES_JSON",
+        json.dumps({
+            "amazon.nova-canvas-v1:0": {
+                "input_per_mtok": 0.0,
+                "output_per_mtok": 0.0,
+                "per_image": 0.04,
+            }
+        }),
+    )
+    _seed_user(fake_dynamodb, "alice", usd=1000)
+    _seed_session(fake_dynamodb, "alice-session", "alice")
+
+    record = _record(request_id="canvas-counted", model="amazon.nova-canvas-v1:0")
+    message = json.loads(record["message"])
+    message["input"] = {"inputContentType": "application/json"}
+    message["output"] = {"outputImageCount": 3}
+    record["message"] = json.dumps(message)
+
+    _run(_subscription([record]), fake_dynamodb, fake_sns)
+
+    row = _today_row(fake_dynamodb)
+    assert row["images"] == 3
+    assert row["cost_micro"] == 120_000
+    assert row["unpriced_requests"] == 0
+    assert _emf_records(capsys)[0]["FallbackPricedRequests"] == 0
 
 
 def test_input_output_only_pricing_is_unchanged_regression(
@@ -1575,6 +1754,168 @@ def test_price_entry_uses_resolver_rate_keys_and_ignores_unknown_keys():
 
 
 # ---------------------------------------------------------------------------
+# Shipped catalog pins and geographic profile pricing
+# ---------------------------------------------------------------------------
+
+_PRICING_PATH = ROOT / "cdk" / "config" / "model-pricing.json"
+_GEO_PREFIXES = ("us", "eu", "apac", "jp", "au")
+
+
+def _shipped_overrides() -> dict:
+    return json.loads(_PRICING_PATH.read_text())["price_overrides"]
+
+
+def test_every_claude_pin_has_cache_rates_and_geo_variants():
+    """Every Claude pin prices prompt-cache reads (10 % of input) and writes
+    (125 % of input), and every base Claude model has a pin for each
+    geographic profile at the 10 % uplift, so no geographic Claude traffic
+    is cache-unpriced or silently derived from the base rate."""
+    overrides = _shipped_overrides()
+    claude = {
+        model_id: entry
+        for model_id, entry in overrides.items()
+        if "anthropic.claude" in model_id
+    }
+    assert claude
+    for model_id, entry in claude.items():
+        rate = entry["input_per_mtok"]
+        assert entry["cache_read_per_mtok"] == round(rate * 0.10, 4), model_id
+        assert entry["cache_write_per_mtok"] == round(rate * 1.25, 4), model_id
+        assert entry["reason"].strip()
+    bases = [model_id for model_id in claude if model_id.startswith("anthropic.")]
+    assert bases
+    for base in bases:
+        for prefix in _GEO_PREFIXES:
+            geo = claude[f"{prefix}.{base}"]
+            assert geo["input_per_mtok"] == round(
+                claude[base]["input_per_mtok"] * 1.1, 4
+            ), f"{prefix}.{base}"
+            assert geo["output_per_mtok"] == round(
+                claude[base]["output_per_mtok"] * 1.1, 4
+            ), f"{prefix}.{base}"
+    nova = overrides["amazon.nova-2-lite-v1:0"]
+    assert nova["cache_read_per_mtok"] == 0.0825
+    assert nova["cache_write_per_mtok"] == 0.0
+    assert "-mantle-" in overrides["xai.grok-4.6"]["reason"]
+
+
+def test_shipped_geo_claude_pins_resolve_as_snapshot_prices():
+    prices = {
+        model_id: processor._rates_from_entry(entry)
+        for model_id, entry in _shipped_overrides().items()
+    }
+    fallback = {"input": 15.0, "output": 75.0}
+    haiku = "anthropic.claude-haiku-4-5-20251001-v1:0"
+    for prefix in _GEO_PREFIXES:
+        rates, source = processor._price_for(prices, fallback, f"{prefix}.{haiku}")
+        assert source == "snapshot"
+        assert rates["input"] == 1.1
+        assert rates["cache_read"] == 0.11
+    # ``global.`` is priced at the base rate by definition: derived, not
+    # flagged, even though the geographic siblings are pinned higher.
+    rates, source = processor._price_for(prices, fallback, f"global.{haiku}")
+    assert (rates["input"], source) == (1.0, "base-model")
+
+
+def test_base_model_derivation_is_flagged_when_sibling_geo_pin_differs(
+    fake_dynamodb, fake_sns, monkeypatch, capsys
+):
+    """Only base and ``us.`` pinned (the pre-fix convention): an ``eu.``
+    call is still priced from the base model, but the ``us.`` pin proves a
+    geographic uplift applies, so the request raises the fallback alarm
+    instead of under-counting silently."""
+    monkeypatch.setenv("BEDROCK_USER_ROLE_NAME", ROLE_NAME)
+    monkeypatch.setenv(
+        "MODEL_PRICES_JSON",
+        json.dumps({
+            "anthropic.claude-opus-4-7": {
+                "input_per_mtok": 5.0,
+                "output_per_mtok": 25.0,
+            },
+            "us.anthropic.claude-opus-4-7": {
+                "input_per_mtok": 5.5,
+                "output_per_mtok": 27.5,
+            },
+        }),
+    )
+    _seed_user(fake_dynamodb, "alice", usd=1000)
+    _seed_session(fake_dynamodb, "alice-session", "alice")
+
+    _run(
+        _subscription([
+            _record(
+                model="eu.anthropic.claude-opus-4-7",
+                input_tokens=1_000_000,
+                output_tokens=1_000_000,
+            )
+        ]),
+        fake_dynamodb,
+        fake_sns,
+    )
+
+    row = _today_row(fake_dynamodb)
+    assert row["cost_micro"] == 30 * processor.MICRO
+    emf = _emf_records(capsys)[0]
+    assert emf["PriceSource"] == "base-model-mismatch"
+    assert emf["FallbackPricedRequests"] == 1
+    assert emf["UnpricedDimensionRequests"] == 0
+    assert emf["MissingDimensions"] == []
+
+
+def test_global_profile_derivation_is_not_flagged_by_geo_siblings(
+    fake_dynamodb, fake_sns, monkeypatch, capsys
+):
+    monkeypatch.setenv("BEDROCK_USER_ROLE_NAME", ROLE_NAME)
+    monkeypatch.setenv(
+        "MODEL_PRICES_JSON",
+        json.dumps({
+            "anthropic.claude-opus-4-7": {
+                "input_per_mtok": 5.0,
+                "output_per_mtok": 25.0,
+            },
+            "us.anthropic.claude-opus-4-7": {
+                "input_per_mtok": 5.5,
+                "output_per_mtok": 27.5,
+            },
+        }),
+    )
+    _seed_user(fake_dynamodb, "alice", usd=1000)
+    _seed_session(fake_dynamodb, "alice-session", "alice")
+
+    _run(
+        _subscription([
+            _record(
+                model="global.anthropic.claude-opus-4-7",
+                input_tokens=1_000_000,
+                output_tokens=1_000_000,
+            )
+        ]),
+        fake_dynamodb,
+        fake_sns,
+    )
+
+    assert _today_row(fake_dynamodb)["cost_micro"] == 30 * processor.MICRO
+    emf = _emf_records(capsys)[0]
+    assert emf["PriceSource"] == "base-model"
+    assert emf["FallbackPricedRequests"] == 0
+
+
+def test_sibling_geo_pin_equal_to_base_is_not_a_mismatch():
+    base = {"input": 1.0, "output": 2.0}
+    prices = {"vendor.model": base, "us.vendor.model": dict(base)}
+    fallback = {"input": 15.0, "output": 75.0}
+    assert processor._price_for(prices, fallback, "eu.vendor.model") == (
+        base,
+        "base-model",
+    )
+    # No sibling pins at all: plain derivation, nothing to compare against.
+    assert processor._price_for({"vendor.model": base}, fallback, "eu.vendor.model") == (
+        base,
+        "base-model",
+    )
+
+
+# ---------------------------------------------------------------------------
 # Thresholds: multi-level warnings, alert-only budgets, rate limits
 # ---------------------------------------------------------------------------
 
@@ -1648,6 +1989,73 @@ def test_one_request_crossing_two_levels_sends_both_once(
     _run(_subscription([_record(request_id="b", input_tokens=1, output_tokens=0)]),
          fake_dynamodb, fake_sns)
     assert len(fake_sns.published) == 2
+
+
+def test_warning_marker_is_released_when_publish_fails(
+    fake_dynamodb, monkeypatch
+):
+    """The marker is claimed before publishing (so concurrent invocations
+    send once) but must not survive a failed publish, or the warning is
+    lost for the rest of the window. The Logs retry re-sends it."""
+    monkeypatch.setenv("BEDROCK_USER_ROLE_NAME", ROLE_NAME)
+    monkeypatch.setenv("SNS_TOPIC_ARN", "arn:aws:sns:us-east-1:1:alerts")
+    monkeypatch.setenv("WARN_THRESHOLD", "0.8")
+    _seed_user(fake_dynamodb, "alice", in_limit=100, out_limit=1000)
+    _seed_session(fake_dynamodb, "alice-session", "alice")
+    users = fake_dynamodb.Table(os.environ["USERS_TABLE"])
+    sns = FailingSNS(failures=1)
+    event = _subscription([_record(request_id="a", input_tokens=80, output_tokens=0)])
+
+    with pytest.raises(RuntimeError, match="sns down"):
+        _run(event, fake_dynamodb, sns)
+
+    assert sns.published == []
+    assert "warning_sent_daily_8000_window" not in users.get_item(
+        Key={"user_id": "alice"}
+    )["Item"]
+
+    # Redelivery: a duplicate for accounting, but the warning goes out now.
+    result = _run(event, fake_dynamodb, sns)
+    assert result["duplicates"] == 1
+    assert [m["Subject"] for m in sns.published] == [
+        "[bedrock-spend-controls] WARNING alice daily 80%"
+    ]
+    assert users.get_item(Key={"user_id": "alice"})["Item"][
+        "warning_sent_daily_8000_window"
+    ] == _today()
+
+    # And a further request at the same level sends nothing new.
+    _run(_subscription([_record(request_id="b", input_tokens=1, output_tokens=0)]),
+         fake_dynamodb, sns)
+    assert len(sns.published) == 1
+
+
+def test_warning_marker_claimed_elsewhere_skips_publish(
+    fake_dynamodb, fake_sns, monkeypatch
+):
+    """The conditional claim loses to a marker already at this window or a
+    later one (another invocation, or a late log replaying an old window),
+    so that invocation publishes nothing and leaves the marker alone."""
+    monkeypatch.setenv("BEDROCK_USER_ROLE_NAME", ROLE_NAME)
+    monkeypatch.setenv("SNS_TOPIC_ARN", "arn:aws:sns:us-east-1:1:alerts")
+    monkeypatch.setenv("WARN_THRESHOLD", "0.8")
+    _seed_user(
+        fake_dynamodb, "alice", in_limit=100, out_limit=1000,
+        warning_sent_daily_8000_window="9999-12-31",
+    )
+    _seed_session(fake_dynamodb, "alice-session", "alice")
+
+    result = _run(
+        _subscription([_record(request_id="a", input_tokens=80, output_tokens=0)]),
+        fake_dynamodb,
+        fake_sns,
+    )
+
+    assert result["processed"] == 1
+    assert fake_sns.published == []
+    assert fake_dynamodb.Table(os.environ["USERS_TABLE"]).get_item(
+        Key={"user_id": "alice"}
+    )["Item"]["warning_sent_daily_8000_window"] == "9999-12-31"
 
 
 def test_alert_only_budget_warns_but_never_blocks(
@@ -1835,6 +2243,167 @@ def test_rate_counter_is_keyed_by_occurrence_minute_not_processing_time(
     assert "Item" in fake_dynamodb.Table(os.environ["USAGE_TABLE"]).get_item(
         Key={"user_id": "RATE#alice", "window": "2026-09-09T08:15"}
     )
+
+
+def test_rpm_fires_when_lag_crosses_minute(fake_dynamodb, fake_sns, monkeypatch):
+    """A burst at 12:00:50 delivered at 12:01:05 is evaluated against the
+    12:00 counter it incremented, not the empty 12:01 one."""
+    occurred = datetime(2026, 9, 9, 12, 0, 50, tzinfo=timezone.utc)
+    _freeze(monkeypatch, datetime(2026, 9, 9, 12, 1, 5, tzinfo=timezone.utc))
+    monkeypatch.setenv("BEDROCK_USER_ROLE_NAME", ROLE_NAME)
+    monkeypatch.setenv("SNS_TOPIC_ARN", "arn:aws:sns:us-east-1:1:alerts")
+    _seed_user(fake_dynamodb, "alice", usd=1000, in_limit=0, out_limit=0, rpm=2, tpm=0)
+    _seed_session(fake_dynamodb, "alice-session", "alice")
+    usage_table = fake_dynamodb.Table(os.environ["USAGE_TABLE"])
+
+    _run(
+        _subscription(
+            [_record(request_id=f"burst-{index}", when=occurred) for index in range(5)]
+        ),
+        fake_dynamodb,
+        fake_sns,
+    )
+
+    user = fake_dynamodb.Table(os.environ["USERS_TABLE"]).get_item(
+        Key={"user_id": "alice"}
+    )["Item"]
+    assert user["status"] == "blocked"
+    assert user["status_origin"] == "automatic"
+    assert user["status_reason"] == (
+        "auto: rpm rate limit reached in minute 2026-09-09T12:00"
+    )
+    assert usage_table.get_item(
+        Key={"user_id": "RATE#alice", "window": "2026-09-09T12:00"}
+    )["Item"]["requests"] == 5
+    assert "Item" not in usage_table.get_item(
+        Key={"user_id": "RATE#alice", "window": "2026-09-09T12:01"}
+    )
+    blocked = [m for m in fake_sns.published if "BLOCKED" in m["Subject"]]
+    assert len(blocked) == 1
+    breach = json.loads(blocked[0]["Message"])["breaches"][0]
+    assert breach["window_start"] == "2026-09-09T12:00:00+00:00"
+    assert breach["usage"] == 2  # the request that crossed the limit
+
+
+def test_rate_block_does_not_refire_each_minute(
+    fake_dynamodb, fake_sns, monkeypatch
+):
+    """A subject still over its rpm in the next minute stays blocked without
+    a new block transaction, REVOCATION# write or SNS message; the stored
+    reason keeps naming the minute the block was raised in."""
+    frozen = _freeze(monkeypatch, datetime(2026, 9, 9, 12, 0, 30, tzinfo=timezone.utc))
+    monkeypatch.setenv("BEDROCK_USER_ROLE_NAME", ROLE_NAME)
+    monkeypatch.setenv("SNS_TOPIC_ARN", "arn:aws:sns:us-east-1:1:alerts")
+    _seed_user(fake_dynamodb, "alice", usd=1000, in_limit=0, out_limit=0, rpm=2, tpm=0)
+    _seed_session(fake_dynamodb, "alice-session", "alice")
+    users = fake_dynamodb.Table(os.environ["USERS_TABLE"])
+    usage_table = fake_dynamodb.Table(os.environ["USAGE_TABLE"])
+
+    _run(
+        _subscription([
+            _record(request_id="a", when=frozen._now),
+            _record(request_id="b", when=frozen._now),
+        ]),
+        fake_dynamodb,
+        fake_sns,
+    )
+    first = users.get_item(Key={"user_id": "alice"})["Item"]
+    assert first["status"] == "blocked"
+    assert first["version"] == 1
+    assert len(fake_sns.published) == 1
+    revocation = users.get_item(Key={"user_id": "REVOCATION#alice"})["Item"]
+
+    frozen._now = datetime(2026, 9, 9, 12, 1, 30, tzinfo=timezone.utc)
+    _run(
+        _subscription([
+            _record(request_id="c", when=frozen._now),
+            _record(request_id="d", when=frozen._now),
+        ]),
+        fake_dynamodb,
+        fake_sns,
+    )
+
+    second = users.get_item(Key={"user_id": "alice"})["Item"]
+    assert second["status"] == "blocked"
+    assert second["version"] == 1
+    assert second["status_reason"] == (
+        "auto: rpm rate limit reached in minute 2026-09-09T12:00"
+    )
+    assert second["status_changed_at"] == first["status_changed_at"]
+    assert len(fake_sns.published) == 1
+    assert users.get_item(Key={"user_id": "REVOCATION#alice"})["Item"] == revocation
+    # Usage in the new minute is still counted.
+    assert usage_table.get_item(
+        Key={"user_id": "RATE#alice", "window": "2026-09-09T12:01"}
+    )["Item"]["requests"] == 2
+
+
+def test_block_scope_ignores_the_window_but_not_the_dimension():
+    assert processor._block_scope(
+        "auto: rpm rate limit reached in minute 2026-09-09T12:00"
+    ) == processor._block_scope(
+        "auto: rpm rate limit reached in minute 2026-09-09T12:01"
+    )
+    assert processor._block_scope(
+        "auto: daily USD quota exhausted for model opus in 2026-09-09"
+    ) == "auto: daily USD quota exhausted for model opus"
+    assert processor._block_scope(
+        "auto: rpm rate limit reached in minute 2026-09-09T12:00"
+    ) != processor._block_scope(
+        "auto: tpm rate limit reached in minute 2026-09-09T12:00"
+    )
+
+
+def test_rate_counter_is_written_in_the_ledger_transaction(
+    fake_dynamodb, fake_sns, monkeypatch
+):
+    monkeypatch.setenv("BEDROCK_USER_ROLE_NAME", ROLE_NAME)
+    _seed_user(fake_dynamodb, "alice", rpm=100)
+    _seed_session(fake_dynamodb, "alice-session", "alice")
+    client = RecordingClient(fake_dynamodb)
+
+    processor.handler(
+        _subscription([_record()]),
+        None,
+        dynamodb=fake_dynamodb,
+        dynamodb_client=client,
+        sns=fake_sns,
+    )
+
+    [items] = client.transactions
+    assert len(items) == 4
+    keys = [_decode_map(item["Update"]["Key"])["user_id"] for item in items if "Update" in item]
+    assert "RATE#alice" in keys
+    assert fake_dynamodb.Table(os.environ["USAGE_TABLE"]).get_item(
+        Key=processor.rate_row_key("alice", datetime.now(timezone.utc))
+    )["Item"]["requests"] == 1
+
+
+def test_rate_counter_not_lost_on_retry(fake_dynamodb, fake_sns, monkeypatch):
+    """A failure after the ledger transaction used to skip the rate counter
+    for good (the retry sees the request marker and stops). The counter now
+    commits with the ledger, and the retry does not double count."""
+    monkeypatch.setenv("BEDROCK_USER_ROLE_NAME", ROLE_NAME)
+    _seed_user(fake_dynamodb, "alice", rpm=100)
+    _seed_session(fake_dynamodb, "alice-session", "alice")
+    when = datetime.now(timezone.utc)
+    event = _subscription([_record(when=when)])
+    counter_key = processor.rate_row_key("alice", when)
+    usage_table = fake_dynamodb.Table(os.environ["USAGE_TABLE"])
+    real_emit = processor._emit_emf
+
+    def explode(*args, **kwargs):
+        raise RuntimeError("after commit")
+
+    monkeypatch.setattr(processor, "_emit_emf", explode)
+    with pytest.raises(RuntimeError, match="after commit"):
+        _run(event, fake_dynamodb, fake_sns)
+    assert usage_table.get_item(Key=counter_key)["Item"]["requests"] == 1
+
+    monkeypatch.setattr(processor, "_emit_emf", real_emit)
+    result = _run(event, fake_dynamodb, fake_sns)
+    assert result["duplicates"] == 1
+    assert usage_table.get_item(Key=counter_key)["Item"]["requests"] == 1
 
 
 # ---------------------------------------------------------------------------
@@ -2047,3 +2616,68 @@ def test_subject_without_model_budgets_pays_no_extra_reads(
     _run(_subscription([_record()]), fake_dynamodb, fake_sns)
     # Only the subject ledger is queried during evaluation.
     assert calls == ["alice"]
+
+
+# ---------------------------------------------------------------------------
+# tools/unpriced_usage.py
+# ---------------------------------------------------------------------------
+
+
+def _unpriced_usage_tool():
+    spec = importlib.util.spec_from_file_location(
+        "unpriced_usage", ROOT / "tools" / "unpriced_usage.py"
+    )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_unpriced_usage_tool_lists_each_subject_day_once_with_its_models(
+    fake_dynamodb,
+):
+    """The subject row and its ``#model#`` rows describe the same requests;
+    the tool prints one line per subject and day and folds the model rows
+    into it instead of listing every unpriced request twice."""
+    tool = _unpriced_usage_tool()
+    table = fake_dynamodb.Table(os.environ["USAGE_TABLE"])
+    table.put_item(Item={
+        "user_id": "alice", "window": "2026-09-09", "requests": 5,
+        "unpriced_requests": 3, "missing_dimensions": {"cache_read"},
+        "cost_micro": 2_500_000, "cache_read_tokens": 10,
+    })
+    table.put_item(Item={
+        "user_id": "alice#model#haiku", "window": "2026-09-09", "requests": 3,
+        "unpriced_requests": 2, "missing_dimensions": {"cache_read"},
+    })
+    table.put_item(Item={
+        "user_id": "alice#model#opus", "window": "2026-09-09", "requests": 2,
+        "unpriced_requests": 1, "missing_dimensions": {"cache_read"},
+    })
+    table.put_item(Item={
+        "user_id": "alice", "window": "2026-09-08", "requests": 4,
+        "unpriced_requests": 0,
+    })
+    table.put_item(Item={
+        "user_id": "bob#model#haiku", "window": "2026-09-01", "requests": 1,
+        "unpriced_requests": 1, "missing_dimensions": {"image"},
+    })
+    table.put_item(Item={"user_id": "REQUEST#r1", "window": "EVENT", "unpriced_requests": 9})
+    table.put_item(Item={"user_id": "RATE#alice", "window": "2026-09-09T12:00", "unpriced_requests": 9})
+
+    rows = tool.collect_rows(table, None)
+
+    assert [(row["user_id"], row["window"]) for row in rows] == [
+        ("bob", "2026-09-01"),
+        ("alice", "2026-09-09"),
+    ]
+    alice = rows[1]
+    assert alice["requests"] == 5
+    assert alice["unpriced_requests"] == 3
+    assert alice["missing_dimensions"] == ["cache_read"]
+    assert alice["cost_usd"] == 2.5
+    assert alice["models"] == ["haiku:2", "opus:1"]
+    # A model row with no surviving subject row is still reported.
+    assert rows[0]["models"] == ["haiku:1"]
+    assert rows[0]["unpriced_requests"] == 1
+
+    assert [row["user_id"] for row in tool.collect_rows(table, "2026-09-09")] == ["alice"]

@@ -1,7 +1,7 @@
 # SpendReconciliationDeltaAlarm
 
 **Deployed only when `reconciliation_enabled: true`.** **Operations key:**
-`reconciliation_delta` · **Metric:** `ReconciliationDeltaPercent` (Maximum >
+`reconciliation_delta` · **Alarm name:** `<stack>-reconciliation-delta` · **Metric:** `ReconciliationDeltaPercent` (Maximum >
 `reconciliation_alarm_percent`, default 10, over 1 day; **2 consecutive
 periods**; missing data = not breaching) · **Emitted by:**
 `reconciliation_processor/handler.py` — the **absolute** percent difference
@@ -62,10 +62,11 @@ coincides with a `pricing_fallback` alarm.
    number to manage against.
 6. **Invocation logging dropped records** (positive). Check the delivery log
    group / S3 bucket and the `usage_processor` `Errors` metric.
-7. **Wrong service names.** The Lambda filters CE on `Amazon Bedrock` and
-   `Amazon Bedrock Service`. If your bill shows
-   Bedrock spend under another `SERVICE` value, set `CE_SERVICE_NAMES_JSON`
-   on the Lambda and open an issue.
+7. **Wrong service names.** The Lambda filters CE on
+   `reconciliation_service_names` (default `Amazon Bedrock` and `Amazon
+   Bedrock Service`), the stack Region, and `RECORD_TYPE = Usage`. If your
+   bill shows Bedrock spend under another `SERVICE` value, set
+   `reconciliation_service_names` in the deployment file and redeploy.
 
 Inspect the runs:
 ```bash
@@ -93,12 +94,14 @@ aws ce get-cost-and-usage --time-period Start=2026-09-12,End=2026-09-13 --granul
 
 - The next two stored runs have `|delta_percent|` under the threshold →
   the alarm returns to `OK` after two daily periods.
-- `ReconciliationRuns` = 1 per day (the schedule is firing) and no
-  `ReconciliationFailure` metric.
+- `ReconciliationRuns` = 1 per day (the schedule is firing), one
+  `ReconciliationStarted` heartbeat per run, and no `ReconciliationFailure`
+  metric.
 
 ## Related
 
 - [configuration.md § Reconciliation](../../configuration.md#reconciliation) and [operations.md § Reading the reconciliation card](../../operations.md#reading-the-reconciliation-card)
 - Component: [components/reconciliation-processor.md](../components/reconciliation-processor.md)
 - Alarm: [pricing-fallback.md](pricing-fallback.md)
-- Metrics: `ReconciliationEstimatedUSD`, `ReconciliationBilledUSD`, `ReconciliationDeltaUSD`, `ReconciliationDeltaPercent`, `ReconciliationTagInactive`, `ReconciliationFailure`
+- [spend-reconciliation-errors.md](spend-reconciliation-errors.md), [reconciliation-timeout.md](reconciliation-timeout.md)
+- Metrics: `ReconciliationStarted`, `ReconciliationRuns`, `ReconciliationFailure` (no dimensions); `ReconciliationEstimatedUSD`, `ReconciliationBilledUSD`, `ReconciliationDeltaUSD`, `ReconciliationDeltaPercent` (aggregate without dimensions and per `Workload`); `ReconciliationTagInactive` (`Workload` only)

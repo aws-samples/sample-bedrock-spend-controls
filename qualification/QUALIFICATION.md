@@ -28,8 +28,9 @@ Record all of these before execution:
 - Account ID:
 - Region:
 - Dedicated sandbox role ARN:
+- Dedicated sandbox managed deny policy ARN:
 - CountTokens-compatible model ID:
-- Role tags proving non-production:
+- Role and policy tags proving non-production:
 - Approver and approval timestamp:
 
 The sandbox role must trust the selected caller for `sts:AssumeRole` and
@@ -38,16 +39,48 @@ dedicated pre-attached managed deny policy safe for temporary
 `CreatePolicyVersion`/default-version changes. Never use an untagged shared or
 production role.
 
+The probe enforces that, and refuses to run live unless all of the following
+hold (it checks them read-only before any mutation):
+
+- Both the role and the managed policy carry the tag
+  `bedrock-spend-controls:qualification=true`.
+- The managed policy has no `aws:cloudformation:*` tags (it must be created
+  by hand for the probe, not by a stack, so it can never be a production
+  deny shard).
+- The managed policy's default version is the probe placeholder document,
+  printed by the dry run under `prerequisites.placeholder_policy_document`
+  (a deny that matches only the source identity
+  `bedrock-spend-controls-qualification-placeholder`, so it affects nobody).
+- The probe only deletes policy versions it created in the current run. If
+  the policy already has five versions, remove old ones yourself first.
+
+Run the dry run first and keep its JSON with the evidence:
+
+```bash
+python qualification/lease_revocation_probe.py \
+  --role-arn arn:aws:iam::<account>:role/<sandbox-role> \
+  --managed-policy-arn arn:aws:iam::<account>:policy/<sandbox-probe-policy> \
+  --model-id <count-tokens-capable-model> \
+  --lease-seconds 60 300 900
+```
+
+Live mode adds `--execute` plus the three confirmation arguments the dry run
+prints under `live_confirmation`. A 900 s lease waits the full 15 minutes
+before checking the denial; the probe asks STS for a 1,200 s session for that
+lease so the keys outlive the deadline and the denial is a lease decision,
+not an expired token.
+
 ## Required live measurements
 
-Run `qualification/lease_revocation_probe.py` against the sandbox role, attach its
-JSON output, and fill in:
+Run `qualification/lease_revocation_probe.py` against the sandbox role with
+`--lease-seconds 60 300 900` (or the subset of dial values you intend to
+allow), attach its JSON output, and fill in:
 
 | Check | Samples | p50 | p95 | Maximum | Pass criterion | Result |
 |---|---:|---:|---:|---:|---|---|
-| 60s lease: denial after deadline |  |  |  |  | New calls denied at the deadline | Pending |
-| 300s lease: denial after deadline |  |  |  |  | New calls denied at the deadline | Pending |
-| 900s lease: denial after deadline |  |  |  |  | New calls denied at the deadline | Pending |
+| 60s lease: denial after deadline (`--lease-seconds 60`) |  |  |  |  | New calls denied at the deadline | Pending |
+| 300s lease: denial after deadline (`--lease-seconds 300`) |  |  |  |  | New calls denied at the deadline | Pending |
+| 900s lease: denial after deadline (`--lease-seconds 900`) |  |  |  |  | New calls denied at the deadline | Pending |
 | Targeted deny propagation (block) |  |  |  |  | Under 300s; a second, unblocked user unaffected | Pending |
 | Deny removal propagation (recovery) |  |  |  |  | Under 300s | Pending |
 | One-hour role-chained session |  |  |  |  | Succeeds | Pending |
@@ -58,6 +91,27 @@ Also measure metering lag separately with the `DetectionLagMilliseconds`
 metric (invocation-log delivery plus processing). Do not fold it into the IAM
 or lease numbers and present the total as one service guarantee — report the
 formula's terms individually.
+
+### End-to-end lease check on a deployed stack
+
+`qualification/lease_stack_qualification.py` exercises the broker itself:
+Cognito sign-in, SigV4 vend, CountTokens before the deadline, AccessDenied
+after it. Run it from the repository root; the default is a dry run that
+prints the plan, and `--live` executes it:
+
+```bash
+python qualification/lease_stack_qualification.py --stack-name <stack> --lease-seconds 300
+python qualification/lease_stack_qualification.py --profile <sandbox> \
+  --stack-name <stack> --lease-seconds 300 --live
+```
+
+`--lease-seconds` must match the stack's current lease dial (60, 300, or
+900); the script checks the vended `expiration` against that window. Clean-up:
+the script deletes the Cognito user it created (`--keep-user` keeps it; a
+pre-existing user is never deleted). The quota row the broker auto-provisions
+for that user (`quota-lease-qualification` by default) stays in the users
+table because the admin API has no delete; block it from the console or CLI
+if you do not want it to remain vendable.
 
 ## Production promotion gates
 

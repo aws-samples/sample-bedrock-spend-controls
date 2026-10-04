@@ -4,7 +4,10 @@
 `reconciliation_processor/handler.py`. **Log group:**
 `/aws/lambda/<SpendReconciliationFn>`. **Invocation:**
 `SpendReconciliationSchedule` — `cron(0 6 * * ? *)` (06:00 UTC daily, after
-Cost Explorer's refresh). 256 MB, 2 min timeout.
+Cost Explorer's refresh). 256 MB, 2 min timeout. The first thing a run does
+is emit the `ReconciliationStarted` heartbeat; a heartbeat without a
+same-day `ReconciliationRuns` or `ReconciliationFailure` is how a Lambda
+timeout becomes visible ([reconciliation-timeout](../alarms/reconciliation-timeout.md)).
 
 ## What it does
 
@@ -16,8 +19,10 @@ Explorer *says* it cost, for one settled UTC day `D-<reconcile_lag_days>`
    with `window = <day>` (users and `workload:*`; `<subject>#model#<id>` rows
    are skipped so per-model ledgers do not double count; `REQUEST#`,
    `RATE#`, `RECONCILE#` rows are not ledgers), sums `cost_micro`, and
-   calls `ce:GetCostAndUsage` for that day filtered to `SERVICE ∈ {Amazon
-   Bedrock, Amazon Bedrock Service}` and `REGION = <stack region>`.
+   calls `ce:GetCostAndUsage` for that day filtered to `SERVICE ∈
+   reconciliation_service_names` (default `Amazon Bedrock`, `Amazon Bedrock
+   Service`), `REGION = <stack region>`, and `RECORD_TYPE = Usage` (credits,
+   refunds, and tax lines excluded).
 2. **Per workload.** For each configured workload, compares its
    `workload:<name>` row with CE filtered additionally on the cost-allocation
    tag `bedrock-spend-controls-workload = <name>` (the tag the stack stamps
@@ -54,10 +59,10 @@ tagged inference profile.
 
 | Input | Output |
 |---|---|
-| `USAGE_TABLE`, `RECONCILE_REGION`, `RECONCILE_LAG_DAYS`, `USAGE_RETENTION_DAYS`, `WORKLOADS_JSON`, `WORKLOAD_TAG_KEY`, `SNS_TOPIC_ARN`, optional `CE_SERVICE_NAMES_JSON` | `RECONCILE#<day>` row: `{run_at, result{day, region, service_names, aggregate{estimated_usd, billed_usd, delta_usd, delta_percent}, workloads[], tag_inactive_workloads[]}, expires_at}` |
-| Event `{"day": "YYYY-MM-DD"}` (optional; overrides D-lag for a manual re-run) | EMF (aggregate, no dimension): `ReconciliationEstimatedUSD`, `ReconciliationBilledUSD`, `ReconciliationDeltaUSD`, `ReconciliationDeltaPercent` (absolute; signed value in the `SignedDeltaPercent` property), `ReconciliationRuns` |
-| | EMF (`Workload` dimension): the same four plus `ReconciliationTagInactive` |
-| | EMF on CE error: `ReconciliationFailure` |
+| `USAGE_TABLE`, `RECONCILE_REGION`, `RECONCILE_LAG_DAYS`, `USAGE_RETENTION_DAYS`, `WORKLOADS_JSON`, `WORKLOAD_TAG_KEY`, `SNS_TOPIC_ARN`, `RECONCILE_SERVICE_NAMES_JSON` (from the `reconciliation_service_names` deployment key; `CE_SERVICE_NAMES_JSON` is accepted as an alias) | `RECONCILE#<day>` row: `{run_at, result{day, region, service_names, aggregate{estimated_usd, billed_usd, delta_usd, delta_percent}, workloads[], tag_inactive_workloads[]}, expires_at}` |
+| Event `{"day": "YYYY-MM-DD"}` (optional; overrides D-lag for a manual re-run) | EMF (no dimension): `ReconciliationStarted` (heartbeat, before any work), then `ReconciliationEstimatedUSD`, `ReconciliationBilledUSD`, `ReconciliationDeltaUSD`, `ReconciliationDeltaPercent` (absolute; signed value in the `SignedDeltaPercent` property), `ReconciliationRuns` |
+| | EMF (`Workload` dimension): the same four USD/percent metrics plus `ReconciliationTagInactive` |
+| | EMF on any error (CE, DynamoDB, configuration): `ReconciliationFailure` (no dimension) |
 | | SNS `RECONCILIATION FAILED`, `RECONCILIATION: cost-allocation tag not active` |
 
 `delta_percent` is the difference relative to `max(estimated, billed)`, so
@@ -72,9 +77,10 @@ so an empty day never alarms.
 | Symptom | Alarm | Notes |
 |---|---|---|
 | `\|delta_percent\|` over threshold two days running | [reconciliation-delta](../alarms/reconciliation-delta.md) | Direction tells you whether spend is unmetered (positive) or over-priced (negative). |
-| `ReconciliationFailure` = 1 | none (SNS message) | CE `DataUnavailableException` (lag too short), throttling, or missing `ce:GetCostAndUsage` when Cost Explorer is not yet enabled on the account. Enable CE in the console once; the first API call can take up to 24 h to succeed. |
+| `ReconciliationFailure` = 1 | [spend-reconciliation-errors](../alarms/spend-reconciliation-errors.md) (the function re-raises) plus an SNS message | CE `DataUnavailableException` (lag too short), throttling, missing `ce:GetCostAndUsage` when Cost Explorer is not yet enabled on the account, or a configuration error. Enable CE in the console once; the first API call can take up to 24 h to succeed. |
 | `ReconciliationTagInactive` = 1 | none (SNS message) | Activate the cost-allocation tag **in the payer account**; CE starts attributing ~24 h after activation and does not backfill. |
-| No `ReconciliationRuns` for a day | none | Schedule disabled or Lambda erroring before the CE call; check the log group. |
+| `ReconciliationStarted` without `ReconciliationRuns` or `ReconciliationFailure` the same day | [reconciliation-timeout](../alarms/reconciliation-timeout.md) | The run timed out (2 min) or crashed mid-way: a very large usage-table scan or a slow CE call. |
+| No `ReconciliationStarted` for a day | none | Schedule disabled or the function not invoked; check `Invocations` and the rule. |
 
 ## Manual operations
 
@@ -94,8 +100,8 @@ so an empty day never alarms.
   workload with spend reports `tag_inactive: true`.
 - **Check what CE calls Bedrock in this account:**
   `aws ce get-dimension-values --dimension SERVICE --search-string Bedrock --time-period Start=<D-30>,End=<today>`.
-  If a value other than the two defaults appears, set
-  `CE_SERVICE_NAMES_JSON` on the function.
+  If a value other than the two defaults appears, add it to
+  `reconciliation_service_names` in the deployment file and redeploy.
 
 ## Related
 

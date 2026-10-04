@@ -1,6 +1,6 @@
 # EnforcementDispatchDlqAlarm
 
-**Operations key:** `enforcement_dispatch_dlq` · **Metric:** SQS `ApproximateNumberOfMessagesVisible` on `EnforcementDispatchDeadLetterQueue` (≥ 1 over 5 min, 1 period) · **Source:** the `DynamoEventSource` on `EnforcementDispatcherFn` (`batch_size=100`, `max_batching_window=5s`, `retry_attempts=10`, `bisect_batch_on_error=True`).
+**Operations key:** `enforcement_dispatch_dlq` · **Alarm name:** `<stack>-enforcement-dispatch-dlq` · **Metric:** SQS `ApproximateNumberOfMessagesVisible` on `EnforcementDispatchDeadLetterQueue` (≥ 1 over 5 min, 1 period) · **Source:** the `DynamoEventSource` on `EnforcementDispatcherFn` (`batch_size=100`, `max_batching_window=5s`, `retry_attempts=10`, `bisect_batch_on_error=True`).
 
 ## What it means
 
@@ -36,7 +36,8 @@ firing — that means the schedule path is broken too.
      --filter-pattern 'ERROR' --start-time $(( $(date +%s) - 3600 ))000 --query 'events[].message' --output text | tail -5
    ```
 2. **Downstream function throttled** (`TooManyRequestsException` on
-   `Invoke`). Both downstream functions have `reserved_concurrent_executions=1`;
+   `Invoke`). Both downstream functions have `reserved_concurrent_executions=1`
+   (unless `reserve_enforcement_concurrency` is `false`);
    `InvocationType="Event"` queues asynchronously so this is rare, but the
    async queue can reject when the function is disabled or its async
    invocation is misconfigured.
@@ -50,7 +51,7 @@ firing — that means the schedule path is broken too.
 1. Read the DLQ envelope to learn the batch and failure condition:
    ```bash
    DLQ_URL=$(aws cloudformation describe-stack-resources --stack-name BedrockSpendControls \
-     --logical-resource-id EnforcementDispatchDeadLetterQueue --query 'StackResources[0].PhysicalResourceId' --output text)
+     --query "StackResources[?starts_with(LogicalResourceId,'EnforcementDispatchDeadLetterQueue')].PhysicalResourceId | [0]" --output text)
    aws sqs receive-message --queue-url "$DLQ_URL" --max-number-of-messages 1 --query 'Messages[0].Body' --output text | python3 -m json.tool
    ```
 2. Fix the invoke permission or downstream availability.
@@ -75,4 +76,5 @@ firing — that means the schedule path is broken too.
 
 - [enforcement-dispatch-iterator-age.md](enforcement-dispatch-iterator-age.md)
 - [emergency-stop-dlq.md](emergency-stop-dlq.md) — the other stream consumer
+- [enforcement-dispatcher-errors.md](enforcement-dispatcher-errors.md)
 - Component: [components/enforcement-dispatcher.md](../components/enforcement-dispatcher.md)

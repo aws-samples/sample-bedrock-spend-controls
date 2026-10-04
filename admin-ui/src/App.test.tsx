@@ -4,6 +4,7 @@ import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
   Dashboard,
+  highestUtilization,
   LimitsDialog,
   mergeCanonicalUser,
   mergeRefreshedUsers,
@@ -11,7 +12,9 @@ import {
   QuotaUsage,
   StatusDialog,
   statusEnforcementMessage,
+  statusFlipMessage,
   UsersPanel,
+  utilizationLevel,
 } from "./App";
 import { ApiError, api, isAutomaticBlock, type AdminUser, type AuditEvent, type CurrentUsage, type Operations, type QuotaPeriod, type Summary, type UsageMetrics, type UserRow, type WorkloadEntry, type WorkloadListResponse } from "./api";
 import type { Session } from "./auth";
@@ -225,6 +228,42 @@ describe("quota presentation", () => {
     expect(document.querySelector(".progress-critical")).toBeInTheDocument();
   });
 
+  it("colours usage by the period's configured thresholds, not a fixed 80/100", () => {
+    // Default list (80 % warn, 100 % block) when the row carries none.
+    expect(utilizationLevel(0.79)).toBe("normal");
+    expect(utilizationLevel(0.8)).toBe("warning");
+    expect(utilizationLevel(1)).toBe("critical");
+    // A 50 % warn / 150 % block list moves both bands.
+    const wide = [{ at: 0.5, action: "warn" as const }, { at: 1.5, action: "block" as const }];
+    expect(utilizationLevel(0.49, wide)).toBe("normal");
+    expect(utilizationLevel(0.5, wide)).toBe("warning");
+    expect(utilizationLevel(1.2, wide)).toBe("warning");
+    expect(utilizationLevel(1.5, wide)).toBe("critical");
+    // Alert-only: nothing blocks, so 100 %+ is a warning, never "critical".
+    const alertOnly = [{ at: 0.8, action: "warn" as const }, { at: 1, action: "warn" as const }];
+    expect(utilizationLevel(1.3, alertOnly)).toBe("warning");
+
+    const { rerender } = render(<QuotaUsage current={12} format={String} limit={10} thresholds={alertOnly} />);
+    expect(document.querySelector(".progress-warning")).toBeInTheDocument();
+    expect(document.querySelector(".progress-critical")).not.toBeInTheDocument();
+    rerender(<QuotaUsage current={9} format={String} limit={10} thresholds={wide} />);
+    expect(document.querySelector(".progress-warning")).toBeInTheDocument();
+    rerender(<QuotaUsage current={16} format={String} limit={10} thresholds={wide} />);
+    expect(document.querySelector(".progress-critical")).toBeInTheDocument();
+
+    // The "Highest" badge follows the same rule for the period it reports.
+    const soft: UserRow = { ...alice, limits: { ...alice.limits, daily: { ...alice.limits.daily!, thresholds: alertOnly } }, current_usage: { ...currentUsage, daily: currentUsageRow("daily", { cost_usd: 11 }) } };
+    expect(highestUtilization(soft)).toEqual({ period: "daily", percent: 110, level: "warning" });
+    expect(highestUtilization(alice)).toEqual({ period: "daily", percent: 50, level: "normal" });
+  });
+
+  it("flags usage rows whose spend is undercounted by unpriced requests", () => {
+    const partiallyPriced: UserRow = { ...alice, current_usage: { ...currentUsage, daily: currentUsageRow("daily", { unpriced_requests: 3 }) } };
+    render(<UsersPanel cfg={cfg} enforcement={summary.enforcement} error="" loading={false} onSummaryRefresh={vi.fn()} onUserChanged={vi.fn()} session={session} stale={false} users={[partiallyPriced]} />);
+    expect(screen.getByRole("status")).toHaveTextContent("3 unpriced requests this daily window · spend undercounted");
+    expect(screen.getByRole("status")).toHaveClass("ops-status-amber");
+  });
+
   it("switches the displayed calendar usage while surfacing highest utilization", async () => {
     const actor = userEvent.setup();
     render(<UsersHarness />);
@@ -259,6 +298,10 @@ describe("limit safety dialog", () => {
       },
     };
     render(<LimitsDialog apiError="" busy={false} onClose={vi.fn()} onSave={onSave} user={withThresholds} />);
+
+    // Reset times are the broker's UTC calendar boundaries, labelled as such.
+    expect(screen.getByText("Resets 2026-09-03 00:00 UTC")).toBeInTheDocument();
+    expect(screen.getByText("Resets 2026-09-07 00:00 UTC")).toBeInTheDocument();
 
     // Stored thresholds render as percentages in order.
     expect(screen.getByLabelText("Daily threshold 1 percent")).toHaveValue(50);
@@ -621,6 +664,39 @@ describe("status safety dialog", () => {
     expect(screen.getByText("active", { selector: ".status-badge" })).toBeInTheDocument();
   });
 
+  it("closes the confirmation when a version conflict shows the status already flipped", async () => {
+    const actor = userEvent.setup();
+    const elsewhere = canonical({ status: "blocked", status_reason: "Blocked from the CLI", status_origin: "admin", version: 2 });
+    vi.spyOn(api, "setStatus").mockRejectedValue(new ApiError("Changed", 409, "version_conflict", { current_user: elsewhere }, "flip-request"));
+    render(<UsersHarness />);
+
+    await actor.click(screen.getByRole("button", { name: "Block Alice Example" }));
+    await actor.type(screen.getByLabelText(/Reason/), "Policy request");
+    await actor.click(screen.getByRole("button", { name: "Block user" }));
+
+    // Not silently re-rendered as "Confirm unblock": closed, with the reason why.
+    await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument());
+    expect(screen.getByRole("alert")).toHaveTextContent("Alice Example is already blocked (changed by admin: Blocked from the CLI). The confirmation was closed; the latest state is shown. Request ID: flip-request.");
+    expect(screen.getByText("blocked", { selector: ".status-badge" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Unblock Alice Example" })).toBeEnabled();
+    expect(statusFlipMessage({ ...alice, status: "blocked", status_origin: "", status_reason: "" }, null)).toBe("Alice Example is already blocked (changed by another session: no reason recorded). The confirmation was closed; the latest state is shown.");
+  });
+
+  it("keeps the confirmation open when a version conflict leaves the status direction unchanged", async () => {
+    const actor = userEvent.setup();
+    const renamed = canonical({ name: "Alice Renamed", version: 2 });
+    vi.spyOn(api, "setStatus").mockRejectedValue(new ApiError("Changed", 409, "version_conflict", { current_user: renamed }));
+    render(<UsersHarness />);
+
+    await actor.click(screen.getByRole("button", { name: "Block Alice Example" }));
+    await actor.type(screen.getByLabelText(/Reason/), "Policy request");
+    await actor.click(screen.getByRole("button", { name: "Block user" }));
+
+    const dialog = await screen.findByRole("dialog", { name: "Confirm block" });
+    expect(within(dialog).getByText("Alice Renamed")).toBeInTheDocument();
+    expect(within(dialog).getByRole("alert")).toHaveTextContent(/changed since you opened it/);
+  });
+
   it("rejects a version-conflict payload for a different identity", async () => {
     const actor = userEvent.setup();
     const wrongUser = canonical({ user_id: "tenant/bob", name: "Bob", version: 2 });
@@ -658,7 +734,14 @@ describe("independent dashboard refresh state", () => {
     await actor.click(screen.getByRole("button", { name: "Refresh data" }));
 
     expect(screen.queryByText("Cached users · refresh failed")).not.toBeInTheDocument();
-    expect(await screen.findByRole("button", { name: /until a fresh enforcement summary loads/ })).toBeDisabled();
+    // Block/unblock stays available without a fresh summary; the dialog
+    // falls back to generic enforcement copy instead of the lease window.
+    await actor.click(screen.getByRole("button", { name: "Block Alice Example" }));
+    const dialog = await screen.findByRole("dialog", { name: "Confirm block" });
+    await waitFor(() => expect(within(dialog).getByText("Enforcement", { selector: "strong" })).toBeInTheDocument());
+    expect(within(dialog).getByText(/bounded overspend is limited/)).not.toHaveTextContent("5 min");
+    expect(within(dialog).getByText(/enforcement summary is unavailable right now/)).toBeInTheDocument();
+    await actor.click(within(dialog).getByRole("button", { name: "Cancel" }));
 
     await openTab(actor, "Overview");
     expect(await screen.findByText("Cached summary · refresh failed")).toBeInTheDocument();
@@ -767,6 +850,25 @@ describe("server-side user pagination", () => {
     await actor.selectOptions(screen.getByLabelText("Filter users"), "blocked");
     await waitFor(() => expect(listUsers).toHaveBeenCalledTimes(5));
     expect(listUsers.mock.calls[4][2]).toMatchObject({ cursor: null, query: "bob", status: "blocked" });
+  });
+
+  it("distinguishes an empty page with more pages from an empty population", async () => {
+    const actor = userEvent.setup();
+    vi.spyOn(api, "summary").mockResolvedValue(summary);
+    vi.spyOn(api, "operations").mockResolvedValue(operations);
+    vi.spyOn(api, "listUsersPage")
+      .mockResolvedValueOnce({ users: [], next_cursor: "cursor-one" })
+      .mockResolvedValueOnce({ users: [bob], next_cursor: null });
+    render(<Dashboard cfg={cfg} onSignOut={vi.fn()} session={session} />);
+    await openTab(actor, "Users");
+
+    expect(await screen.findByText("No users on this page")).toBeInTheDocument();
+    expect(screen.getByText(/try Next/)).toBeInTheDocument();
+    expect(screen.queryByText("No users yet")).not.toBeInTheDocument();
+    const next = screen.getByRole("button", { name: "Next" });
+    expect(next).toBeEnabled();
+    await actor.click(next);
+    expect(await screen.findByRole("button", { name: "Bob Example" })).toBeInTheDocument();
   });
 
   it("keeps the current page visible when Next fails", async () => {
@@ -981,7 +1083,7 @@ describe("filtered detail and precision edge cases", () => {
     });
   });
 
-  it("disables drawer status changes until a fresh enforcement summary is available", async () => {
+  it("keeps drawer status changes available when the summary fails, with generic enforcement copy", async () => {
     const actor = userEvent.setup();
     vi.spyOn(api, "summary").mockRejectedValue(new ApiError("Summary unavailable", 503, "service_unavailable"));
     vi.spyOn(api, "operations").mockResolvedValue(operations);
@@ -992,8 +1094,16 @@ describe("filtered detail and precision edge cases", () => {
 
     await actor.click(await screen.findByRole("button", { name: "Alice Example" }));
     const drawer = screen.getByRole("dialog", { name: "Alice Example" });
-    expect(within(drawer).getByRole("button", { name: /Status change unavailable/ })).toBeDisabled();
-    expect(screen.queryByRole("dialog", { name: "Confirm block" })).not.toBeInTheDocument();
+    const block = within(drawer).getByRole("button", { name: "Block user" });
+    expect(block).toBeEnabled();
+    expect(within(drawer).queryByRole("button", { name: /Status change unavailable/ })).not.toBeInTheDocument();
+    await actor.click(block);
+    const dialog = await screen.findByRole("dialog", { name: "Confirm block" });
+    expect(within(dialog).getByText("Enforcement", { selector: "strong" })).toBeInTheDocument();
+    expect(within(dialog).getByText(/prevents new credentials from being issued/)).not.toHaveTextContent(/after detection/);
+    expect(within(dialog).getByText(/enforcement summary is unavailable right now/)).toBeInTheDocument();
+    expect(statusEnforcementMessage(null, "blocked", alice)).not.toMatch(/\d+ min/);
+    expect(statusEnforcementMessage(null, "active", alice)).toMatch(/Unblocking allows new credentials/);
   });
 });
 

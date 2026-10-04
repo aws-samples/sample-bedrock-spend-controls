@@ -454,3 +454,175 @@ def test_conflict_guidance_is_emitted_and_http_failure_is_preserved(capsys):
     captured = capsys.readouterr()
     assert '"code": "version_conflict"' in captured.out
     assert "Review the current user" in captured.err
+
+
+# ---------------------------------------------------------------------------
+# Pre-publication review fixes (M-12 and CLI lows).
+# ---------------------------------------------------------------------------
+
+from examples.sigv4_gateway import _parse_thresholds, _rate_payload  # noqa: E402
+
+
+def _user_detail(url, *, rate=None, version=4):
+    return _json_response(
+        200,
+        url,
+        {
+            "user": {
+                "user_id": "alice",
+                "version": version,
+                "limits": {
+                    "daily": {"usd": 5, "input_tokens": 100, "output_tokens": 50},
+                    "weekly": None,
+                    "monthly": None,
+                },
+                "rate": rate,
+            }
+        },
+        headers={"ETag": f'"{version}"'},
+    )
+
+
+@pytest.mark.parametrize(
+    ("argv", "current_rate", "expected"),
+    [
+        (["--rpm", "30"], {"rpm": 10, "tpm": 5000}, {"rpm": 30, "tpm": 5000}),
+        (["--tpm", "9000"], {"rpm": 10, "tpm": 5000}, {"rpm": 10, "tpm": 9000}),
+        (["--rpm", "30"], None, {"rpm": 30, "tpm": 0}),
+        (["--rpm", "0", "--tpm", "0"], {"rpm": 10, "tpm": 5000}, {"rpm": 0, "tpm": 0}),
+    ],
+)
+def test_update_user_rate_merges_with_the_current_rate(argv, current_rate, expected):
+    args = _parser().parse_args([
+        "--gateway-url", "https://example.test", "update-user", "alice", *argv,
+    ])
+    calls = []
+
+    def request_fn(method, url, **kwargs):
+        calls.append((method, url, kwargs))
+        if method == "GET":
+            return _user_detail(url, rate=current_rate)
+        return _json_response(200, url, {"updated": True})
+
+    args.admin_key = "secret"
+    _execute_admin_command(args, object(), request_fn=request_fn)
+
+    mutation = calls[1][2]
+    assert mutation["json"]["rate"] == expected
+    assert mutation["json"]["limits"]["daily"] == {"usd": 5, "input_tokens": 100, "output_tokens": 50}
+
+
+def test_disable_rate_still_removes_both_limits():
+    args = _parser().parse_args([
+        "--gateway-url", "https://example.test", "update-user", "alice", "--disable-rate",
+    ])
+    assert _rate_payload(args, current={"rpm": 10, "tpm": 5000}) == (None, True)
+    assert _rate_payload(args.__class__(), current={"rpm": 10}) == (None, False)
+
+
+def test_thresholds_are_whole_percentages_between_1_and_1000():
+    assert _parse_thresholds("50:warn, 80:warn,100:block") == [
+        {"at": 0.5, "action": "warn"},
+        {"at": 0.8, "action": "warn"},
+        {"at": 1.0, "action": "block"},
+    ]
+    assert _parse_thresholds("1000:block") == [{"at": 10.0, "action": "block"}]
+    with pytest.raises(ValueError, match="whole-number percentage"):
+        _parse_thresholds("0.5:warn")
+    with pytest.raises(ValueError, match="between 1 and 1000"):
+        _parse_thresholds("0:warn")
+    with pytest.raises(ValueError, match="between 1 and 1000"):
+        _parse_thresholds("1001:block")
+    with pytest.raises(ValueError, match="must end in :warn or :block"):
+        _parse_thresholds("50:alert")
+
+
+def test_list_users_accepts_filters_and_pagination_flags():
+    args = _parser().parse_args([
+        "--gateway-url", "https://example.test", "list-users",
+        "--limit", "200", "--cursor", "abc", "--status", "blocked", "--query", "ali",
+    ])
+    method, url, kwargs = _admin_request_args(args)
+    assert (method, url) == ("GET", "https://example.test/admin/users")
+    assert kwargs["params"] == {"limit": 200, "cursor": "abc", "status": "blocked", "query": "ali"}
+
+    plain = _parser().parse_args(["--gateway-url", "https://example.test", "list-users"])
+    assert _admin_request_args(plain) == ("GET", "https://example.test/admin/users", {})
+    with pytest.raises(SystemExit):
+        _parser().parse_args(["--gateway-url", "https://example.test", "list-users", "--status", "paused"])
+
+
+def test_list_users_all_follows_next_cursor_and_merges_pages():
+    args = _parser().parse_args([
+        "--gateway-url", "https://example.test", "list-users", "--all", "--status", "active",
+    ])
+    args.admin_key = "secret"
+    calls = []
+    pages = {
+        None: {"users": [{"user_id": "a"}, {"user_id": "b"}], "next_cursor": "c2"},
+        "c2": {"users": [{"user_id": "c"}], "next_cursor": "c3"},
+        "c3": {"users": [], "next_cursor": None},
+    }
+
+    def request_fn(method, url, **kwargs):
+        calls.append(kwargs.get("params", {}))
+        return _json_response(200, url, pages[kwargs.get("params", {}).get("cursor")])
+
+    response = _execute_admin_command(args, object(), request_fn=request_fn)
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "users": [{"user_id": "a"}, {"user_id": "b"}, {"user_id": "c"}],
+        "next_cursor": None,
+        "pages": 3,
+    }
+    assert [call.get("cursor") for call in calls] == [None, "c2", "c3"]
+    assert all(call["status"] == "active" for call in calls)
+    response.raise_for_status()  # synthetic response is a complete httpx.Response
+
+
+def test_list_users_all_returns_a_failing_page_unchanged():
+    args = _parser().parse_args(["--gateway-url", "https://example.test", "list-users", "--all"])
+    args.admin_key = "secret"
+    calls = 0
+
+    def request_fn(method, url, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return _json_response(200, url, {"users": [{"user_id": "a"}], "next_cursor": "bad"})
+        return _json_response(400, url, {"error": {"type": "invalid_request_error", "message": "Invalid cursor."}})
+
+    response = _execute_admin_command(args, object(), request_fn=request_fn)
+    assert response.status_code == 400
+    assert response.json()["error"]["message"] == "Invalid cursor."
+
+
+def test_secret_flags_warn_on_the_command_line_but_not_from_the_environment(capsys, monkeypatch):
+    monkeypatch.delenv("ADMIN_KEY", raising=False)
+    args = _parser().parse_args([
+        "--gateway-url", "https://example.test", "--admin-key", "shh", "list-users",
+    ])
+    assert args.admin_key == "shh"
+    assert "--admin-key puts the key in your shell history" in capsys.readouterr().err
+
+    monkeypatch.setenv("ADMIN_KEY", "from-env")
+    args = _parser().parse_args(["--gateway-url", "https://example.test", "list-users"])
+    assert args.admin_key == "from-env"
+    assert capsys.readouterr().err == ""
+
+    monkeypatch.setenv("EMERGENCY_ADMIN_KEY", "glass")
+    args = _parser().parse_args([
+        "--gateway-url", "https://example.test", "emergency-stop", "--reason", "x",
+    ])
+    assert args.emergency_key == "glass"
+    assert capsys.readouterr().err == ""
+
+
+def test_help_text_prefers_environment_variables_over_key_flags():
+    text = _parser().format_help()
+    assert "ADMIN_KEY" in text and "EMERGENCY_ADMIN_KEY" in text
+    examples = [line for line in text.splitlines() if "python examples/sigv4_gateway.py" in line]
+    assert examples, "help should include usage examples"
+    assert not any("--admin-key" in line or "--emergency-key" in line for line in examples)
+    assert "kept for compatibility" in text

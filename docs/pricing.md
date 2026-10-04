@@ -10,23 +10,42 @@ that the estimate tracks the bill, enable reconciliation
 
 | Source | Used for | Refresh |
 |---|---|---|
-| AWS Price List (`pricing:GetProducts`) | Every model listed in `catalog_models` | Resolved at `cdk deploy`; re-resolved daily by `PriceRefreshFn` into the `ModelPricesParameter` SSM parameter |
+| AWS Price List (`pricing:GetProducts`) | Every model listed in `catalog_models` | Resolved at `cdk deploy` by `PriceResolverFn`; re-resolved daily (`rate(1 day)`) by `PriceRefreshFn` into the SSM parameter named by the `ModelPricesParameterName` output (`/bedrock-spend-controls/<stack>/model-prices`) |
 | `price_overrides` in `cdk/config/model-pricing.json` | Models the Price List does not publish (models billed through AWS Marketplace, geographic inference profiles with a different rate) | Redeploy |
 | `fallback_price` | Any model ID not resolved by the two sources above | Redeploy; raised at deploy time to at least the highest known rate per dimension |
 
-The usage processor reads the SSM parameter with a 15-minute cache and keeps
-the last good value if a read fails. Updating prices affects future
-invocations only: existing daily aggregates and blocked statuses are not
-repriced.
+The SSM parameter is Intelligent-Tiering and holds the JSON table compressed:
+the value is `gz1:` followed by base64-encoded gzip (`encode_parameter_value`
+in `cdk/pricing_resolver/handler.py`), so the shipped catalog fits well below
+the 8 KB advanced-parameter limit. Read it with
+`aws ssm get-parameter --name <ModelPricesParameterName> --query Parameter.Value --output text | cut -c5- | base64 -d | gunzip`.
+The `ModelPriceSnapshot` output is a digest only
+(`ssm:<name> sha256:<digest> models=<count>`); the custom resource returns
+`ParameterName`, `SnapshotDigest`, `ModelCount`, `ResolvedAt`, and
+`FallbackPriceJson`, never the table itself.
 
-Resolution order for one invocation-log record:
+The usage processor reads the parameter with a 15-minute cache and keeps
+the last good value if a read fails. It has no built-in price table: if the
+parameter is unreadable at a cold start every request is priced at the
+fallback and the `pricing_fallback` alarm fires. Updating prices affects
+future invocations only: existing daily aggregates and blocked statuses are
+not repriced.
 
-1. Exact match on the `modelId` the log carries (a pinned profile ID such as
-   `us.<model>` wins over its base model).
+Resolution order for one invocation-log record (`PriceSource` in the EMF
+log line):
+
+1. Exact match on the `modelId` the log carries (`snapshot`): a pinned
+   profile ID such as `us.<model>` wins over its base model.
 2. The base foundation model after stripping a geographic or cross-Region
-   prefix (`us.`, `eu.`, `apac.`, `global.`, ...).
-3. `fallback_price`. Requests priced this way emit `FallbackPricedRequests`
-   and raise the `pricing_fallback` alarm
+   prefix (`us.`, `eu.`, `apac.`, `jp.`, `au.`, `global.`, ...)
+   (`base-model`). When a *sibling* geographic pin for the same base model
+   is priced differently from the base (for example `eu.<model>` is pinned
+   but the record says `apac.<model>`), the base rate is probably wrong for
+   this profile too: the request is still priced at the base rate but
+   reported as `base-model-mismatch`, which counts in `FallbackPricedRequests`
+   so the missing geography gets pinned.
+3. `fallback_price` (`fallback`). Requests priced this way emit
+   `FallbackPricedRequests` and raise the `pricing_fallback` alarm
    ([runbooks/alarms/pricing-fallback.md](runbooks/alarms/pricing-fallback.md)).
 
 ## `cdk/config/model-pricing.json`
@@ -68,9 +87,15 @@ Validation at synthesis:
   fails the resolve rather than averaging.
 
 The shipped file is the reference for current values; do not copy prices
-from documentation. Review the fallback whenever you allow a more expensive
-model or a modality that is not billed by input/output tokens: it is
-conservative, not a universal upper bound.
+from documentation. It carries 54 pins. Every Claude pin, including the
+`us.`, `eu.`, `apac.`, `jp.`, `au.`, and `global.` inference-profile IDs,
+is pinned explicitly with its own token pair (`global.` at the base rate,
+the regional profiles 10 % above it), `cache_read_per_mtok` (10 % of the
+input rate) and `cache_write_per_mtok` (125 % of the input rate), so
+geographic profiles are never derived from the base model; Nova 2 Lite
+carries its published cache rates the same way. Review the fallback whenever you allow
+a more expensive model or a modality that is not billed by input/output
+tokens: it is conservative, not a universal upper bound.
 
 ## Priced dimensions
 
@@ -102,10 +127,13 @@ the input-token limit.
 - **Image generation with image delivery disabled.** The stack-managed
   logging configuration sets `imageDataDeliveryEnabled: false`. An image
   model record then carries no token counts and no body, so the processor
-  meters the request (`requests`, `images: 0`) but prices it at `$0` and
-  raises no flag. Enable image data delivery on the invocation-logging
-  configuration, or keep image models out of `allowed_model_arns` if their
-  spend must be enforced.
+  cannot know how many images were generated: it assumes **one** image,
+  prices it at the entry's `per_image` rate, counts `images: 1`, flags the
+  row (`unpriced_requests`, `missing_dimensions: ["image"]`), and emits
+  `FallbackPricedRequests` so the `pricing_fallback` alarm fires. A request
+  that produced several images is under-counted. Enable image data delivery
+  on the invocation-logging configuration, or keep image models out of
+  `allowed_model_arns` if their spend must be enforced.
 - **Image size and quality tiers.** The log reports a count only. The
   resolver uses the smallest standard text-to-image rate; premium or larger
   generations are under-counted unless you pin the higher rate in
@@ -118,13 +146,18 @@ the input-token limit.
   at all. Do not include such models in `allowed_model_arns` if strict
   accounting matters.
 - **Service tiers** (flex, priority), provisioned throughput, batch
-  inference, and separately billed tools are outside the estimate.
+  inference, and separately billed tools (web search, code execution, and
+  similar tool calls billed per use) are outside the estimate: the
+  invocation log carries no field for them, so their spend never reaches the
+  ledger and is never flagged as unpriced. Reconciliation is the only place
+  it shows up.
 
 ## Unpriced dimensions
 
 When a record carries a dimension its resolved entry has no rate for (a
 cache-enabled call to a model whose pin lacks `cache_*_per_mtok`, an image
-count against an entry without `per_image`), the processor:
+count against an entry without `per_image`, an image record without a
+count), the processor:
 
 1. prices that dimension at the fallback's rate for it (the fallback carries
    every dimension any known model prices, at the highest known rate);
@@ -134,11 +167,14 @@ count against an entry without `per_image`), the processor:
    raise the `pricing_fallback` alarm.
 
 Nothing is silently priced at zero. The admin API returns
-`unpriced_requests` on every usage response, and `tools/unpriced_usage.py`
-lists the affected rows:
+`unpriced_requests` on every usage response, the console shows an amber
+warning on the subject when it is above zero, and `tools/unpriced_usage.py`
+lists the affected rows, one line per subject and day with a `models`
+column naming the models involved (per-model ledger rows are folded in, not
+listed separately):
 
 ```bash
-cdk/.venv/bin/python tools/unpriced_usage.py \
+python tools/unpriced_usage.py \
   --table "$(aws cloudformation describe-stacks --stack-name BedrockSpendControls \
       --query "Stacks[0].Outputs[?OutputKey=='UsageTableName'].OutputValue | [0]" --output text)" \
   --since 2026-09-01
@@ -173,9 +209,9 @@ The export records the catalog version and publication timestamp.
 input/output token rate and computes `price_per_million_tokens`; it does not
 map Price List model names to Bedrock Runtime IDs. Keep those aliases
 explicit in `catalog_models`. Do not paste the whole export into the price
-configuration: it spans many Regions and units and would exceed the 4 KB
-standard SSM parameter limit. Use it for discovery, then map only the exact
-Runtime IDs the deployment allows.
+configuration: it spans many Regions and units and would exceed the 8 KB
+SSM parameter limit even compressed. Use it for discovery, then map only the
+exact Runtime IDs the deployment allows.
 
 References: [Amazon Bedrock pricing](https://aws.amazon.com/bedrock/pricing/),
 [global cross-Region inference pricing](https://docs.aws.amazon.com/bedrock/latest/userguide/global-cross-region-inference.html).

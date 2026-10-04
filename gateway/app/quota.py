@@ -100,6 +100,12 @@ def validate_user_id(user_id: str) -> str:
         user_id.startswith(prefix) for prefix in RESERVED_USER_ID_PREFIXES
     ):
         raise ValueError("user identity uses a reserved internal prefix")
+    # '#' is the ledger key separator: the per-model ledger for subject
+    # ``bob`` and model ``m`` lives under ``bob#model#m``, so an identity
+    # containing '#' could alias another subject's rows. '/', '@' and ':'
+    # (path-like, email and tenant-scoped identities) stay allowed.
+    if "#" in user_id:
+        raise ValueError("user identity must not contain '#'")
     return user_id
 
 
@@ -278,6 +284,18 @@ class VersionConflict(Exception):
 
 class IdempotencyConflict(Exception):
     """An idempotency key was already used for a different request."""
+
+
+class EmergencyVersionConflict(Exception):
+    """The emergency-stop row changed between the read and the write.
+
+    ``current`` is the state observed after the failed write so the API can
+    return it alongside the 409.
+    """
+
+    def __init__(self, current: dict):
+        super().__init__("emergency state changed concurrently")
+        self.current = current
 
 
 class EnforcementVersionConflict(Exception):
@@ -928,7 +946,8 @@ class QuotaStore:
     ) -> dict:
         now = now or datetime.now(timezone.utc)
         current = self.get_emergency_state()
-        generation = int(current.get("generation", 0)) + 1
+        observed_generation = int(current.get("generation", 0))
+        generation = observed_generation + 1
         request_id = str(uuid.uuid4())
         state = "activating" if active else "recovering"
         item = {
@@ -954,7 +973,23 @@ class QuotaStore:
                 "expires_at": window_ttl_epoch(now),
             }
         )
-        self._users.put_item(Item=item)
+        # The state write is conditional on the generation read above, so two
+        # operators racing activate against recover cannot silently overwrite
+        # each other: the loser sees the winner's state and decides again.
+        kwargs: dict = {"Item": item}
+        if observed_generation == 0:
+            kwargs["ConditionExpression"] = "attribute_not_exists(generation)"
+        else:
+            kwargs["ConditionExpression"] = "generation = :expected"
+            kwargs["ExpressionAttributeValues"] = {
+                ":expected": observed_generation
+            }
+        try:
+            self._users.put_item(**kwargs)
+        except ClientError as exc:
+            if not self._is_conditional_failure(exc):
+                raise
+            raise EmergencyVersionConflict(self.get_emergency_state()) from exc
         return dict(item)
 
     def mark_emergency_applied(

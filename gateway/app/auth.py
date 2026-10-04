@@ -13,11 +13,14 @@ Two verification modes:
 - **Shared secret (dev/test)** — set ``JWT_SHARED_SECRET`` to verify HS256
   tokens without an IdP. Never use in production.
 
-``iss`` and ``aud`` are enforced when configured; ``exp`` always is.
+``iss`` and ``aud`` are enforced when configured; ``exp`` always is. The
+first configured audience is the data plane's; any further entries are
+honoured only when verifying for the admin routes (see ``AudienceScope``).
 """
 
 import json
 from dataclasses import dataclass
+from typing import Literal
 from urllib.error import URLError
 from urllib.parse import urlparse
 from urllib.request import urlopen
@@ -27,6 +30,20 @@ import jwt as pyjwt
 from .config import settings
 
 USER_TOKEN_HEADER = "x-quota-user-token"  # nosec B105  # header name, not a credential
+
+# Which route family a token is being verified for. ``JWT_AUDIENCE`` is a
+# comma-separated list whose FIRST entry is the data-plane audience; any
+# further entries (the admin console's public client id, appended by the
+# stack) are accepted only on ``/admin/*``. A console login must never be
+# enough to vend credentials on ``/v1/credentials``.
+AudienceScope = Literal["data-plane", "admin"]
+
+# Signature algorithms accepted per JWK key type when the JWKS entry does
+# not advertise an ``alg`` of its own.
+_ALGORITHMS_BY_KEY_TYPE = {
+    "RSA": ["RS256", "RS384", "RS512"],
+    "EC": ["ES256", "ES384", "ES512"],
+}
 
 
 class JwtError(Exception):
@@ -125,17 +142,59 @@ class JwtVerifier:
                 )
             _require_https(jwks_url, "JWT JWKS URL")
             self._jwks_client = pyjwt.PyJWKClient(jwks_url, cache_keys=True)
-        return self._jwks_client.get_signing_key_from_jwt(token).key
+        try:
+            return self._jwks_client.get_signing_key_from_jwt(token)
+        except pyjwt.PyJWTError as exc:
+            raise JwtError(f"invalid token: {exc}") from exc
 
-    def verify(self, token: str) -> Identity:
-        # Comma-separated audiences: the token must match any one of them.
-        # A deployment may accept both the data-plane audience and the
-        # admin UI's public client id from the same corporate IdP.
+    @staticmethod
+    def _allowed_algorithms(signing_key) -> list[str]:
+        """Pin ``algorithms`` to what the resolved JWKS entry can verify.
+
+        PyJWT raises a bare ``TypeError`` ("Expecting a PEM-formatted key")
+        when a token's ``alg`` header names a family the key does not belong
+        to (ES256 header against an RSA key). Pinning to the JWK's own
+        ``alg``, or the key type's family, turns that into a clean
+        ``InvalidAlgorithmError`` -> 401 and also rules out the other
+        families for this key.
+        """
+        advertised = getattr(signing_key, "algorithm_name", None)
+        if isinstance(advertised, str) and advertised:
+            return [advertised]
+        key_type = getattr(signing_key, "key_type", None)
+        if key_type in _ALGORITHMS_BY_KEY_TYPE:
+            return list(_ALGORITHMS_BY_KEY_TYPE[key_type])
+        key = getattr(signing_key, "key", signing_key)
+        from cryptography.hazmat.primitives.asymmetric import ec, rsa
+
+        if isinstance(key, rsa.RSAPublicKey):
+            return list(_ALGORITHMS_BY_KEY_TYPE["RSA"])
+        if isinstance(key, ec.EllipticCurvePublicKey):
+            return list(_ALGORITHMS_BY_KEY_TYPE["EC"])
+        return [*_ALGORITHMS_BY_KEY_TYPE["RSA"], *_ALGORITHMS_BY_KEY_TYPE["EC"]]
+
+    @staticmethod
+    def accepted_audiences(scope: AudienceScope) -> list[str]:
+        """Audiences a token may carry for the given route family.
+
+        ``JWT_AUDIENCE`` is comma-separated: the first entry is the
+        data-plane audience and the only one honoured on
+        ``/v1/credentials``; the remaining entries (the admin console's
+        public client id, when deployed) are additionally accepted on
+        ``/admin/*``. With a single configured audience both scopes are
+        identical. Empty = ``aud`` not enforced.
+        """
         audiences = [
             audience.strip()
             for audience in settings.jwt_audience.split(",")
             if audience.strip()
         ]
+        if scope == "admin" or not audiences:
+            return audiences
+        return audiences[:1]
+
+    def verify(self, token: str, scope: AudienceScope = "data-plane") -> Identity:
+        audiences = self.accepted_audiences(scope)
         options = {"require": ["exp"], "verify_aud": bool(audiences)}
         try:
             if settings.jwt_shared_secret:
@@ -148,10 +207,11 @@ class JwtVerifier:
                     options=options,
                 )
             else:
+                signing_key = self._signing_key(token)
                 claims = pyjwt.decode(
                     token,
-                    self._signing_key(token),
-                    algorithms=["RS256", "ES256", "RS384", "ES384", "RS512"],
+                    getattr(signing_key, "key", signing_key),
+                    algorithms=self._allowed_algorithms(signing_key),
                     audience=audiences or None,
                     issuer=settings.jwt_issuer or None,
                     options=options,
@@ -163,6 +223,11 @@ class JwtVerifier:
         except pyjwt.InvalidIssuerError:
             raise JwtError("token issuer does not match this gateway")
         except pyjwt.PyJWTError as e:
+            raise JwtError(f"invalid token: {e}")
+        except (TypeError, ValueError) as e:
+            # Key/algorithm family mismatches and malformed key material
+            # surface from the crypto backend as plain Python errors; they
+            # are a bad token, not a gateway fault.
             raise JwtError(f"invalid token: {e}")
 
         user_id = claims.get(settings.jwt_user_claim)

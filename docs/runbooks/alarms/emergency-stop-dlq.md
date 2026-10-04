@@ -1,6 +1,6 @@
 # EmergencyStopDlqAlarm
 
-**Operations key:** `emergency_dlq` · **Metric:** SQS `ApproximateNumberOfMessagesVisible` on `EmergencyStopDeadLetterQueue` (≥ 1 over 5 min, 1 period) · **Source:** the `DynamoEventSource` on `EmergencyStopProcessorFn` (`retry_attempts=10`, `bisect_batch_on_error=True`, `on_failure=SqsDlq`).
+**Operations key:** `emergency_dlq` · **Alarm name:** `<stack>-emergency-dlq` · **Metric:** SQS `ApproximateNumberOfMessagesVisible` on `EmergencyStopDeadLetterQueue` (≥ 1 over 5 min, 1 period) · **Source:** the `DynamoEventSource` on `EmergencyStopProcessorFn` (`retry_attempts=10`, `bisect_batch_on_error=True`, `on_failure=SqsDlq`).
 
 ## What it means
 
@@ -38,7 +38,8 @@ path failed transiently but the schedule converged the state.
 1. Inspect the DLQ message. It is the Lambda "failure destination" envelope,
    not the raw stream record:
    ```bash
-   DLQ_URL=$(aws sqs get-queue-url --queue-name "$(aws sqs list-queues --queue-name-prefix BedrockSpendControls-EmergencyStopDeadLetterQueue --query 'QueueUrls[0]' --output text | awk -F/ '{print $NF}')" --query QueueUrl --output text)
+   DLQ_URL=$(aws cloudformation describe-stack-resources --stack-name BedrockSpendControls \
+     --query "StackResources[?starts_with(LogicalResourceId,'EmergencyStopDeadLetterQueue')].PhysicalResourceId | [0]" --output text)
    aws sqs receive-message --queue-url "$DLQ_URL" --max-number-of-messages 1 --visibility-timeout 30 \
      --query 'Messages[0].Body' --output text | python3 -m json.tool
    ```
@@ -65,4 +66,5 @@ path failed transiently but the schedule converged the state.
 - [emergency-stop-failure.md](emergency-stop-failure.md)
 - [enforcement-dispatch-dlq.md](enforcement-dispatch-dlq.md) — the other
   stream consumer's DLQ; the users-table stream has exactly two consumers.
+- [emergency-stop-processor-errors.md](emergency-stop-processor-errors.md)
 - Component: [components/emergency-processor.md](../components/emergency-processor.md)

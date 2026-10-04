@@ -10,14 +10,15 @@ by a principal allowed to invoke the URL (`invoker_principal_arns`).
 
 | Route family | Additional header | Who |
 |---|---|---|
-| `POST /v1/credentials` | `X-Quota-User-Token: <end-user JWT>` | Application backends listed in `invoker_principal_arns` |
-| `/admin/*` (routine) | `X-Quota-Admin-Key: <shared key>` from `AdminKeySecretArn`, **or** `X-Quota-User-Token: <admin JWT>` whose `admin_jwt_claim` contains `admin_jwt_value` | CLI and backends (key); console (JWT) |
-| `POST /admin/emergency-stop` | `X-Quota-Emergency-Key: <break-glass key>` from `EmergencyKeySecretArn` | Operators only; routine credentials are refused |
+| `POST /v1/credentials` | `X-Quota-User-Token: <end-user JWT>` with the data-plane audience (the first entry of `jwt_audience`) | Application backends listed in `invoker_principal_arns` |
+| `/admin/*` (routine) | `X-Quota-Admin-Key: <shared key>` from `AdminKeySecretArn`, **or** `X-Quota-User-Token: <admin JWT>` whose `admin_jwt_claim` contains `admin_jwt_value`. The console client's audience is accepted here and nowhere else, so a console login cannot vend | CLI and backends (key); console (JWT) |
+| `POST /admin/emergency-stop` | `X-Quota-Emergency-Key: <break-glass key>` from `EmergencyKeySecretArn`; an admin JWT may accompany it (the console sends its login), in which case the audited `actor` is `<admin sub> (emergency-shared-key)` instead of `emergency-shared-key` | Operators only; routine credentials are refused |
 | `GET /healthz` | none | Anyone who can invoke the URL |
 
 A missing or wrong admin credential returns `403 forbidden`. `Authorization:
 Bearer` is not used for these tokens because the header carries the SigV4
-signature.
+signature. No OpenAPI document is served (`/openapi.json` returns 404); this
+page is the reference.
 
 From a shell, `awscurl` signs requests (`BROKER_API_URL` is the `BrokerApiUrl`
 output without its trailing `/`):
@@ -31,15 +32,21 @@ awscurl --service lambda --region "$AWS_REGION" -H "X-Quota-Admin-Key: $ADMIN_KE
 
 - **Identities are query parameters.** Exact-user routes take
   `?user_id=<raw claim value>`, supplied exactly once and URL-encoded once by
-  the HTTP client before signing. Identities may contain `/`, `@`, or `:`.
-  The `workload:` prefix and internal `#` prefixes (`SESSION#`, `VEND#`,
-  `REVOCATION#`, `CONFIG#`, ...) are reserved.
+  the HTTP client before signing. Identities may contain `/`, `@`, or `:`
+  but never `#` (the ledger key separator): a claim containing `#` is
+  refused with `401` at vend and `400 invalid_request_error` on admin
+  routes. The `workload:` prefix and internal `#` prefixes (`SESSION#`,
+  `VEND#`, `REVOCATION#`, `CONFIG#`, ...) are reserved.
 - **Mutations** accept `Idempotency-Key` (1 to 256 characters; a UUID) and,
   where noted, `If-Match` with the user's ETag or integer version. Both are
   optional on the wire; see [operations.md](operations.md#safe-routine-writes)
   for why you should always send them.
-- **Mutation responses** return the complete canonical `user`, an `ETag`
-  header (`"<version>"`), and `X-Request-Id`.
+- **Mutation responses** on the user routes return the complete canonical
+  `user`, an `ETag` header (`"<version>"`), and `X-Request-Id`. The two
+  deployment-wide mutations differ: `PUT /admin/enforcement` returns the
+  configuration with `ETag` = generation and no `user` or `X-Request-Id`;
+  `POST /admin/emergency-stop` returns the control state with no `ETag` and
+  takes no `Idempotency-Key` or `If-Match`.
 - **Reasons.** Bodies accept an optional `reason` string; omitted or blank
   reasons are stored as `not provided`. The emergency route requires one.
 - **Errors** use one envelope:
@@ -94,14 +101,14 @@ and `X-Quota-Enabled-Periods` (comma-separated). Refusals add:
 
 | Status | `type` | Extra headers | Meaning |
 |---|---|---|---|
-| 401 | `authentication_error` | | JWT missing, invalid, expired, wrong issuer/audience, or claim missing |
+| 401 | `authentication_error` | | JWT missing, invalid, expired, wrong issuer/audience (including a console-client audience), claim missing or containing `#`, or the user is not provisioned and auto-provisioning is off |
 | 400 | `invalid_lease` | | Malformed `X-Quota-Lease-Id` |
-| 403 | `quota_blocked` | quota headers | Subject status is `blocked` |
-| 429 | `quota_exceeded` | `X-Quota-Breached-Period`, `X-Quota-Breached-Dimension`, `X-Quota-Resets-At` | A block threshold was reached at vend time; the subject is now blocked |
+| 403 | `quota_blocked` | automatic blocks: `X-Quota-Breached-Period`, `X-Quota-Breached-Dimension`, `X-Quota-Resets-At`; admin blocks: none of these | Subject status is `blocked`. No `Retry-After` |
+| 429 | `quota_exceeded` | `X-Quota-Breached-Period`, `X-Quota-Breached-Dimension`, `X-Quota-Resets-At` | A block threshold (subject period, rate minute, or model budget) was reached at vend time. Usually the subject is blocked in the same request; when the breach is only seen by the re-check that follows the lease reservation, the vend is refused without a status change and metering or the next vend blocks it. No `Retry-After` |
 | 429 | `lease_rate_limited` | `Retry-After`, `X-Quota-Refresh-After` | More than `vend_rate_limit_per_minute` vends for this identity |
 | 429 | `lease_not_refreshable` | `Retry-After`, `X-Quota-Refresh-After` | A concurrent renewal left no lease to join (rare race); retry after `Retry-After` |
 | 409 | `lease_expired` | | The supplied `lease_id` has expired; start a new lease |
-| 503 | `quota_state_conflict` | `Retry-After: 1` | Concurrent status change; retry once |
+| 503 | `quota_state_conflict` | `Retry-After: 1` plus the quota headers | Concurrent status change; retry once |
 | 503 | `emergency_stop` | `Retry-After: 60` | Vending closed by the emergency stop |
 | 5xx | `broker_error` | | STS `AssumeRole` failure |
 
@@ -142,7 +149,7 @@ Response: `{"users": [...], "next_cursor"}`. Each user carries `user_id`,
 `name`, `status`, `status_origin`, `status_reason`, `limits`, `rate`,
 `model_budgets`, `lease` (generation and timing, no lease ID), `version`,
 `created_at`, `updated_at`, and, with usage, `today` plus `current_usage`
-per enabled period.
+for `daily`, `weekly`, and `monthly` (every period, enabled or not).
 
 ### `GET /admin/user?user_id=`
 
@@ -151,10 +158,13 @@ not_found` for unknown subjects.
 
 ### `PUT /admin/user/limits?user_id=`
 
-Replace limits. Body: `{"limits": {daily|weekly|monthly: {...} | null},
+Update limits. Body: `{"limits": {daily|weekly|monthly: {...} | null},
 "rate": {"rpm", "tpm"}, "reason"}`; either `limits` or `rate` may be sent
-alone. Headers: `If-Match`, `Idempotency-Key`. The subject's automatic
-status is reconciled immediately against the new limits.
+alone. A period omitted from `limits` keeps its current value; a period
+sent without `thresholds` keeps its existing thresholds list; `null`
+disables `weekly` or `monthly` (never `daily`). Headers: `If-Match`,
+`Idempotency-Key`. The subject's automatic status is reconciled immediately
+against the new limits.
 
 Responses: `200` with the canonical user and new `ETag`; `400`; `404`; `409
 version_conflict` (`details.current_user`); `409 idempotency_conflict`;
@@ -198,9 +208,10 @@ window start (`YYYY-MM-DD`) and defaults to the current one. Response fields:
 ### `GET /admin/user/usage-history?user_id=&period=&start=&end=&limit=&cursor=`
 
 Retained windows for one subject, newest first, bounded by
-`usage_retention_days`. A range outside retention returns `400
-usage_range_outside_retention` with `oldest_available_date` and
-`latest_available_date` in `details`.
+`usage_retention_days`. `start` and `end` are ISO dates (`YYYY-MM-DD`);
+malformed dates or `start` after `end` return `400 invalid_date_range`. A
+range outside retention returns `400 usage_range_outside_retention` with
+`oldest_available_date` and `latest_available_date` in `details`.
 
 ### `GET /admin/user/audit?user_id=&limit=&cursor=`
 
@@ -212,10 +223,10 @@ Routine audit events for one subject (`limit` 1 to 100).
 |---|---|---|
 | `GET /admin/summary` | | Today's aggregate usage; `enforcement` (`mode: layered`, effective lease and its source, refresh, vend rate limit, shard layout, `total_users`, `blocked_users`, `blocked_user_ids`, `subjects` split into `users` and `workloads` with `configured`, `metering_only`, `unregistered`, `awaiting_traffic` counts); `observability` (metrics namespace, detection-lag metric) |
 | `GET /admin/workloads` | | `{"workloads": [...], "roster_source", "tag_key"}`. Each workload: `workload_id`, `name`, `model`, `profile_arn`, `role_arn`, `enforcement_ready`, `registered` (present in the deployed roster), and `subject` (the metered row with usage, or `null` until the first invocation) |
-| `GET /admin/usage/metrics` | `days` (1 to 30, default 14) | Daily per-model `EstimatedCostUSD`, `Requests`, `InputTokens`, `OutputTokens` series and `top_users` (each with `granularity`) from CloudWatch EMF; `status` is `available`, `partial`, or `unavailable` |
-| `GET /admin/audit` | `user_id`, `limit` (1 to 100), `cursor` | Global routine audit events |
+| `GET /admin/usage/metrics` | `days` (1 to 30, default 14) | Daily per-model `EstimatedCostUSD`, `Requests`, `InputTokens`, `OutputTokens` series (up to 20 models) and `top_users` (each with `granularity`) ranked over every identity with EMF data, up to 2,000; from CloudWatch EMF, observability only. `status` is `available`, `partial` (some queries failed or more than 2,000 identities exist, so the ranking may miss a heavy spender), or `unavailable` |
+| `GET /admin/audit` | `user_id`, `limit` (1 to 100), `cursor` | Global routine audit events (create, limits, status, model budgets). Lease-dial and emergency changes are stored as `CONFIG#...AUDIT#` rows in the users table and are not part of this feed |
 | `GET /admin/operations` | | Operations tab payload ([operations.md](operations.md#operations-tab)) |
-| `GET /admin/reconciliation` | `limit` (1 to 90, default 14) | `{"enabled", "lag_days", "runs", "latest"}`, or `{"enabled": false, "message"}` when reconciliation is not deployed |
+| `GET /admin/reconciliation` | `limit` (default 14; values outside 1 to 90 are clamped, not rejected) | `{"enabled", "lag_days", "runs", "latest"}`, or `{"enabled": false, "runs": [], "message"}` when reconciliation is not deployed |
 
 ## Enforcement dial
 
@@ -227,11 +238,14 @@ Returns `permission_lease_seconds` (effective), `source`, `generation`,
 
 ### `PUT /admin/enforcement`
 
-Body: `{"permission_lease_seconds": 60 | 300 | 900, "reason": "..."}`.
-Headers: `If-Match` (generation), `Idempotency-Key`. Applies to new vends
-immediately. Responses: `200` with the new configuration and `ETag`; `400`;
-`409 version_conflict` (`details.current_enforcement`); `409
-idempotency_conflict`.
+Body: `{"permission_lease_seconds": 60 | 300 | 900, "reason": "..."}`
+(`reason` required). Headers: `If-Match` (generation), `Idempotency-Key`.
+Applies to new vends immediately. Responses: `200` with
+`{"permission_lease_seconds", "source": "runtime", "generation", "actor",
+"reason", "updated_at"}` and `ETag` = the new generation (no `user`, no
+`X-Request-Id`); `400`; `409 version_conflict` (`details.current_enforcement`,
+`ETag` of the current generation); `409 idempotency_conflict`; `503
+transaction_unavailable` (retry).
 
 ## Emergency stop
 
@@ -252,28 +266,36 @@ Break-glass authorization (`X-Quota-Emergency-Key`). Body:
 
 Returns `202` with the control state plus `idempotent` (already in the
 requested stable state) and `retry` (same action requested again while
-converging). `400 confirmation_required` when the phrase does not match the
-action; `400 invalid_request_error` for a missing reason; `403 forbidden`
-without the key. The emergency processor converges IAM asynchronously; poll
-`GET /admin/emergency-stop` until `state` is `active` or `inactive`.
+converging). No `Idempotency-Key`, `If-Match`, `ETag`, or `user`: the
+confirmation phrase and the state machine are the safeguards. `400
+confirmation_required` when the phrase does not match the action; `400
+invalid_request_error` for a missing reason; `403 forbidden` without the
+key; `409 version_conflict` with `details.current_emergency` when another
+operator changed the state concurrently (typically activate against
+recover): re-read and decide whether to re-issue. The audited `actor` is
+`emergency-shared-key`, or `<admin sub> (emergency-shared-key)` when an
+admin JWT accompanied the key. The emergency processor converges IAM
+asynchronously; poll `GET /admin/emergency-stop` until `state` is `active`
+or `inactive` (the console polls every 5 seconds for up to 5 minutes).
 
 ## Error codes
 
 | Status | `type` | Where |
 |---|---|---|
-| 400 | `invalid_request_error` | Bad body, query, `If-Match`, or `Idempotency-Key` |
+| 400 | `invalid_request_error` | Bad body, query, `If-Match`, `Idempotency-Key`, or an identity containing `#` |
+| 400 | `invalid_date_range` | Usage history: malformed `start`/`end`, or `start` after `end` |
 | 400 | `usage_range_outside_retention` | Usage history requested before `usage_retention_days` |
 | 400 | `confirmation_required` | Emergency stop phrase mismatch |
 | 400 | `invalid_lease` | Vend: malformed lease ID |
-| 401 | `authentication_error` | Vend: JWT rejected |
+| 401 | `authentication_error` | Vend: JWT rejected, or user not provisioned |
 | 403 | `forbidden` | Admin credential missing or wrong |
 | 403 | `quota_blocked` | Vend: subject blocked |
 | 404 | `not_found` | Unknown subject or model budget |
 | 409 | `user_already_exists` | Create on an existing identity |
-| 409 | `version_conflict` | Stale `If-Match` |
+| 409 | `version_conflict` | Stale `If-Match`; enforcement generation changed; concurrent emergency-stop change |
 | 409 | `idempotency_conflict` | `Idempotency-Key` reused with a different request |
 | 409 | `lease_expired` | Vend: expired lease ID |
 | 429 | `quota_exceeded`, `lease_rate_limited`, `lease_not_refreshable` | Vend refusals |
 | 503 | `emergency_stop`, `quota_state_conflict` | Vend: closed or racing |
-| 503 | `transaction_unavailable` | Admin: DynamoDB transaction cancelled for a non-conditional reason; retry |
+| 503 | `transaction_unavailable` | Admin mutations (create, limits, status, model budget, enforcement dial): DynamoDB transaction cancelled for a non-conditional reason; retry |
 | 5xx | `broker_error` | Vend: STS failure |

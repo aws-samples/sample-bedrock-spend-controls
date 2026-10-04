@@ -1,6 +1,6 @@
 # RevocationSyncFailureAlarm
 
-**Operations key:** `revocation_failure` · **Metric:** `RevocationSyncFailure` (Sum ≥ 1 over 5 min, 1 period) · **Emitted by:** `revocation_processor/handler.py` in the `except (ClientError, RuntimeError, ValueError)` around the shard loop.
+**Operations key:** `revocation_failure` · **Metric:** `RevocationSyncFailure` (Sum ≥ 1 over 5 min, 1 period) · **Alarm name:** `<stack>-revocation-failure` · **Emitted by:** `revocation_processor/handler.py` in the `except (ClientError, RuntimeError, ValueError)` that wraps the whole pass: configuration (`REVOCATION_POLICY_ARNS_JSON`), the users-table scan, and the shard loop.
 
 ## What it means
 
@@ -38,13 +38,15 @@ is 60 s** or no identities are currently blocked. Check both in
      --filter-pattern '{ $.RevocationSyncFailure = 1 }' \
      --start-time $(( $(date +%s) - 3600 ))000 --query 'events[].message' --output text | tail -3
    ```
-2. **`managed policy has no removable non-default version`** — a shard has
-   five versions and none but the default can be deleted. Only possible if
-   someone set a default by hand; fix with `aws iam delete-policy-version` on
-   a non-default version.
+2. **Policy-version housekeeping** — a shard already holds five versions and
+   the processor deletes the oldest non-default one before writing. Deleting
+   a version that an operator set as default by hand fails with
+   `DeleteConflict`; fix with `aws iam delete-policy-version` on a
+   non-default version, or set the newest version as default.
 3. **Users-table scan failure** (`_blocked_identities` does a
    `ConsistentRead` scan) — `ProvisionedThroughputExceeded` is impossible on
-   the on-demand table, but a DynamoDB outage surfaces here.
+   the on-demand table, but a DynamoDB outage surfaces here, with the metric
+   and the SNS message (not only a silent Lambda error).
 4. **`at least one revocation policy ARN is required`** — the
    `REVOCATION_POLICY_ARNS_JSON` env is empty. Deployment defect; redeploy.
 
@@ -61,7 +63,7 @@ is 60 s** or no identities are currently blocked. Check both in
      --projection-expression 'user_id, source_identity' --output table
    # What shard 0 currently denies
    ARN=$(aws cloudformation describe-stack-resources --stack-name BedrockSpendControls \
-     --logical-resource-id QuotaRevocationPolicy0 --query 'StackResources[0].PhysicalResourceId' --output text)
+     --query "StackResources[?starts_with(LogicalResourceId,'QuotaRevocationPolicy0')].PhysicalResourceId | [0]" --output text)
    aws iam get-policy-version --policy-arn "$ARN" \
      --version-id "$(aws iam get-policy --policy-arn "$ARN" --query Policy.DefaultVersionId --output text)" \
      --query PolicyVersion.Document
@@ -73,8 +75,9 @@ is 60 s** or no identities are currently blocked. Check both in
    aws lambda invoke --function-name <RevocationProcessorFn> \
      --payload '{"source":"aws.events"}' --cli-binary-format raw-in-base64-out /dev/stdout
    ```
-   The result JSON reports `updated_shards`, `unchanged_shards`,
-   `overflow_shards`.
+   The result JSON reports `blocked_identities`, `updated_shards`,
+   `unchanged_shards`, `overflow_shards`, `dropped_identities`, and
+   `shards[]`.
 4. **If IAM cannot be repaired quickly and blocked identities are actively
    spending**, shorten the exposure with the runtime dial:
    `PUT /admin/enforcement {"permission_lease_seconds": 60, "reason": "..."}`.
@@ -96,4 +99,5 @@ is 60 s** or no identities are currently blocked. Check both in
 - [revocation-policy-overflow.md](revocation-policy-overflow.md)
 - [enforcement-dispatch-dlq.md](enforcement-dispatch-dlq.md)
 - Component: [components/revocation-processor.md](../components/revocation-processor.md)
-- Metrics: `RevocationSyncSuccess`, `RevocationSyncFailure`, `RevocationPolicyOverflow`, `RevokedIdentitiesDesired`
+- [revocation-processor-errors.md](revocation-processor-errors.md) — the Lambda `Errors` alarm that fires alongside this one, because the processor re-raises
+- Metrics (no dimensions): `RevocationSyncSuccess`, `RevocationSyncFailure`, `RevocationPolicyOverflow`, `RevokedIdentitiesDesired`, `RevokedIdentitiesDropped`

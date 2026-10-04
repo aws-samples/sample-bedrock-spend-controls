@@ -59,17 +59,35 @@ def test_audience_enforced_when_configured(monkeypatch):
     assert identity.user_id == "alice"
 
 
-def test_any_configured_audience_accepted(monkeypatch):
-    """Comma-separated audiences: data-plane and admin-UI clients coexist."""
+def test_console_audience_is_accepted_only_in_admin_scope(monkeypatch):
+    """Comma-separated audiences: the first is the data plane's, later
+    entries (the admin console's client id) count only for /admin/*. A
+    console login must not be enough to vend credentials."""
     monkeypatch.setenv("JWT_AUDIENCE", "data-plane-client, admin-ui-client")
     monkeypatch.setattr(auth_module, "settings", Settings())
+    data_plane = make_jwt(extra={"aud": "data-plane-client"})
+    console = make_jwt(extra={"aud": "admin-ui-client"})
 
-    for audience in ("data-plane-client", "admin-ui-client"):
-        identity = JwtVerifier().verify(make_jwt(extra={"aud": audience}))
-        assert identity.user_id == "alice"
-
+    assert JwtVerifier().verify(data_plane).user_id == "alice"
     with pytest.raises(JwtError, match="audience"):
-        JwtVerifier().verify(make_jwt(extra={"aud": "another-app"}))
+        JwtVerifier().verify(console)
+
+    for token in (data_plane, console):
+        assert JwtVerifier().verify(token, scope="admin").user_id == "alice"
+
+    for scope in ("data-plane", "admin"):
+        with pytest.raises(JwtError, match="audience"):
+            JwtVerifier().verify(make_jwt(extra={"aud": "another-app"}), scope=scope)
+
+
+def test_single_audience_behaves_the_same_in_both_scopes(monkeypatch):
+    monkeypatch.setenv("JWT_AUDIENCE", "only-client")
+    monkeypatch.setattr(auth_module, "settings", Settings())
+    assert JwtVerifier.accepted_audiences("data-plane") == ["only-client"]
+    assert JwtVerifier.accepted_audiences("admin") == ["only-client"]
+    token = make_jwt(extra={"aud": "only-client"})
+    for scope in ("data-plane", "admin"):
+        assert JwtVerifier().verify(token, scope=scope).user_id == "alice"
 
 
 def test_issuer_enforced_when_configured(monkeypatch):
@@ -169,3 +187,66 @@ def test_rs256_via_jwks(monkeypatch):
     # HS256 tokens must NOT be accepted on the JWKS path (alg confusion).
     with pytest.raises(JwtError):
         JwtVerifier(jwks_client=FakeJwksClient()).verify(make_jwt())
+
+
+def _jwks_path(monkeypatch):
+    monkeypatch.setenv("JWT_SHARED_SECRET", "")
+    monkeypatch.setenv("JWT_ISSUER", "https://idp.example.com")
+    monkeypatch.setattr(auth_module, "settings", Settings())
+
+
+def test_alg_header_mismatching_the_jwks_key_type_is_a_401_not_a_500(monkeypatch):
+    """An ES256 token resolved against an RSA JWKS key used to escape PyJWT
+    as a bare TypeError ("Expecting a PEM-formatted key") -> 500. It is a
+    bad token and must surface as JwtError."""
+    from cryptography.hazmat.primitives.asymmetric import ec, rsa
+
+    rsa_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    ec_key = ec.generate_private_key(ec.SECP256R1())
+    _jwks_path(monkeypatch)
+    es_token = make_jwt("ec-user", algorithm="ES256", key=ec_key,
+                        extra={"iss": "https://idp.example.com"})
+
+    class RsaSigningKey:  # bare key object, as older PyJWK fakes expose it
+        key = rsa_key.public_key()
+
+    class RsaJwksClient:
+        def get_signing_key_from_jwt(self, tok):
+            return RsaSigningKey()
+
+    with pytest.raises(JwtError, match="invalid token"):
+        JwtVerifier(jwks_client=RsaJwksClient()).verify(es_token)
+
+    # A JWKS entry advertising its own alg pins verification to it: an RS512
+    # token signed with the very same key is still refused.
+    rs512 = make_jwt("rsa-user", algorithm="RS512", key=rsa_key,
+                     extra={"iss": "https://idp.example.com"})
+    rs256 = make_jwt("rsa-user", algorithm="RS256", key=rsa_key,
+                     extra={"iss": "https://idp.example.com"})
+
+    class AdvertisedKey:
+        key = rsa_key.public_key()
+        algorithm_name = "RS256"
+        key_type = "RSA"
+
+    class AdvertisedJwksClient:
+        def get_signing_key_from_jwt(self, tok):
+            return AdvertisedKey()
+
+    assert JwtVerifier(jwks_client=AdvertisedJwksClient()).verify(rs256).user_id == "rsa-user"
+    with pytest.raises(JwtError, match="invalid token"):
+        JwtVerifier(jwks_client=AdvertisedJwksClient()).verify(rs512)
+
+
+def test_jwks_lookup_failures_are_jwt_errors(monkeypatch):
+    """Unknown kid / malformed header from PyJWKClient -> 401, not 500."""
+    import jwt as pyjwt
+
+    _jwks_path(monkeypatch)
+
+    class MissingKidClient:
+        def get_signing_key_from_jwt(self, tok):
+            raise pyjwt.PyJWKClientError("Unable to find a signing key")
+
+    with pytest.raises(JwtError, match="invalid token"):
+        JwtVerifier(jwks_client=MissingKidClient()).verify(make_jwt())

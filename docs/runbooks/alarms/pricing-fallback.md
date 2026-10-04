@@ -1,12 +1,15 @@
 # PricingFallbackAlarm
 
-**Operations key:** `pricing_fallback` · **Metric:** `FallbackPricedRequests` (Sum ≥ 1 over 5 min, 1 period; missing data = not breaching) · **Emitted by:** `usage_processor/handler.py` `_emit_emf` — `1` when `price_source == "fallback"` **or** `missing_dimensions` is non-empty.
+**Operations key:** `pricing_fallback` · **Alarm name:** `<stack>-pricing-fallback` · **Metric:** `FallbackPricedRequests` (Sum ≥ 1 over 5 min, 1 period; missing data = not breaching) · **Emitted by:** `usage_processor/handler.py` `_emit_emf` — `1` when `price_source` is `fallback` or `base-model-mismatch`, **or** `missing_dimensions` is non-empty.
 
 ## What it means
 
 At least one metered invocation was priced with the synthetic conservative
-rate instead of a resolved catalog price. Two distinct situations set the
-metric:
+rate instead of a resolved catalog price, or at a rate the catalog cannot
+vouch for. `PriceSource` takes one of four values: `snapshot` (exact pin),
+`base-model` (geographic or cross-Region prefix stripped, base model
+priced), `base-model-mismatch`, and `fallback`. Three distinct situations set
+the metric:
 
 1. **Unknown model** (`PriceSource: fallback`). The `modelId` in the
    invocation log has no exact entry, no base-model entry after stripping a
@@ -15,13 +18,23 @@ metric:
    raised at deploy to at least the highest known rate). This
    **over-estimates** and can block a
    subject earlier than the bill would justify.
-2. **Known model, missing dimension** (`PriceSource: snapshot` or
+2. **Geographic profile derived from its base model while a sibling pin
+   disagrees** (`PriceSource: base-model-mismatch`, `UnpricedDimensionRequests:
+   0`). The `modelId` is, say, `apac.<model>`; the catalog has no `apac.` pin
+   but does pin `us.<model>` or `eu.<model>` at a rate different from the
+   base model, so the base-model derivation is probably wrong for this
+   Region too. The request is priced at the base rate and flagged so you pin
+   the missing geography.
+3. **Known model, missing dimension** (`PriceSource: snapshot` or
    `base-model`, `MissingDimensions: [...]`, `UnpricedDimensionRequests: 1`).
    The record carried prompt-cache tokens or an image count that the model's
    catalog entry has no rate for. That dimension was priced at the fallback's
    rate for it when one exists (the resolver builds the fallback per
    dimension), otherwise at zero — and the subject's daily row was flagged
    (`unpriced_requests`, `missing_dimensions`). This may **under-estimate**.
+   An image-model record that carries no image count (image data delivery
+   disabled) is assumed to be **one** image and flagged
+   `MissingDimensions: ["image"]`, so the alarm does catch that case.
 
 Neither is silent mispricing; both are catalog gaps to close. The typical
 trigger is a model billed through AWS Marketplace (for example Anthropic
@@ -46,13 +59,14 @@ only the USD figure is imprecise.
 3. **Prompt caching enabled on a Marketplace model** (Anthropic) whose
    `price_overrides` entry has only the token pair —
    `MissingDimensions: ["cache_read"]` / `["cache_write"]`.
-4. **Image generation** against an entry with no `per_image` rate, or
-   image-data delivery is disabled so the record has no image count (then
-   `images: 0` and cost `$0` with **no** flag — see the caveats in
-   [pricing.md](../../pricing.md#priced-dimensions); the alarm does not catch
-   that case).
-5. **Price refresh failing**, so the SSM parameter is stale. Check the
-   `PriceRefreshFn` `Errors` metric — it is not alarmed separately.
+4. **Image generation** against an entry with no `per_image` rate, or with
+   image-data delivery disabled so the record has no image count (one image
+   is assumed, `MissingDimensions: ["image"]`; see the caveats in
+   [pricing.md](../../pricing.md#priced-dimensions)).
+5. **Price refresh failing**, so the SSM parameter is stale, or unreadable
+   at a cold start, in which case every model is priced at the fallback.
+   Check the `PriceRefreshFn` `Errors` metric — it is not alarmed
+   separately.
 
 Find which models and dimensions:
 ```bash
@@ -61,7 +75,9 @@ aws logs start-query --log-group-name /aws/lambda/<UsageProcessorFn> \
   --query-string 'filter FallbackPricedRequests = 1 | stats count() as requests, sum(EstimatedCostUSD) as usd by Model, PriceSource, MissingDimensions | sort requests desc'
 # then aws logs get-query-results --query-id <id>
 ```
-Ledger rows already flagged: `tools/unpriced_usage.py --table <UsageTableName>`.
+Ledger rows already flagged: `tools/unpriced_usage.py --table <UsageTableName>`
+prints one row per subject and day with a `models` column listing the models
+involved.
 
 ## Remediation
 
@@ -72,7 +88,7 @@ Ledger rows already flagged: `tools/unpriced_usage.py --table <UsageTableName>`.
    `cache_write_per_mtok`, `per_image`, plus a `reason`. Redeploy; the daily
    refresh also picks up catalog-driven changes without a redeploy.
 2. **Verify the resolver can price it** before deploying:
-   `cdk/.venv/bin/python tools/bedrock_price_catalog.py --region <region>
+   `python3 tools/bedrock_price_catalog.py --region <region>
    --metering-compatible` lists the rows the Price List publishes.
 3. **Decide on repair.** Historical daily aggregates are never repriced
    automatically. If the fallback *over*-estimated and blocked a subject,
@@ -86,7 +102,8 @@ Ledger rows already flagged: `tools/unpriced_usage.py --table <UsageTableName>`.
 ## How to verify recovery
 
 - New invocations of the model log `PriceSource: snapshot` (or
-  `base-model`) with `MissingDimensions: []`.
+  `base-model`) with `MissingDimensions: []`; no `base-model-mismatch` or
+  `fallback`.
 - `FallbackPricedRequests` Sum = 0 over a 5-minute period → `OK`
   (`treat_missing_data=NOT_BREACHING`, so a quiet period clears it too).
 
@@ -94,4 +111,4 @@ Ledger rows already flagged: `tools/unpriced_usage.py --table <UsageTableName>`.
 
 - [pricing.md](../../pricing.md): priced dimensions, unpriced dimensions, and the catalog file
 - Component: [components/pricing-resolver.md](../components/pricing-resolver.md), [components/usage-processor.md](../components/usage-processor.md)
-- Metrics: `FallbackPricedRequests`, `UnpricedDimensionRequests`
+- Metrics: `FallbackPricedRequests` (dimensions `UserId`, `Model`, and none), `UnpricedDimensionRequests` (`Model` and none)

@@ -1,6 +1,6 @@
 # AutoBlockSweepFailureAlarm
 
-**Operations key:** `auto_block_sweep_failure` · **Always deployed.** · **Metric:** `AutoBlockSweepFailure` (Sum ≥ 1 over 1 day, 1 period; missing data = not breaching) · **Emitted by:** `auto_block_sweeper/handler.py` when the nightly pass hits an unexpected DynamoDB error (scan, lift transaction, or state-row write).
+**Operations key:** `auto_block_sweep_failure` · **Alarm name:** `<stack>-auto-block-sweep-failure` · **Always deployed.** · **Metric:** `AutoBlockSweepFailure` (Sum ≥ 1 over 1 day, 1 period; missing data = not breaching) · **Emitted by:** `auto_block_sweeper/handler.py` when the nightly pass hits an unexpected DynamoDB error (scan, lift transaction, or state-row write).
 
 ## What it means
 
@@ -32,9 +32,11 @@ unblocked by a manual pass at any time.
    per lift. Both tables are on-demand, so this is rare, but a burst of
    several hundred lifts right after a monthly reset can hit it.
 2. **`TransactionCanceledException` for a reason other than a lost race.**
-   Conditional failures are counted as `raced`, never as failures; anything
-   else (item size, a second sentinel writer racing in the same
-   transaction) surfaces here.
+   Only a transaction cancelled by the row's own `ConditionalCheckFailed`
+   (another writer changed version, status, or reason first) counts as
+   `raced`; a cancellation for `TransactionConflict`, throttling, item size,
+   or validation is a failure and lands here, so a throttled night is never
+   mistaken for a busy one.
 3. **IAM drift on the sweeper role** (`AccessDeniedException`) after a
    manual policy edit.
 
@@ -58,8 +60,9 @@ aws logs filter-log-events --log-group-name /aws/lambda/<AutoBlockSweeperFn> \
      --payload '{"source":"manual"}' --cli-binary-format raw-in-base64-out /dev/stdout
    ```
    The result JSON lists `lifted`, `still_blocked`, `raced` and `failures`.
-3. If one user must be unblocked before that, use the admin API — but note
-   that makes the status admin-origin, and admin blocks never auto-lift.
+3. If one user must be unblocked before that, use the admin API. That
+   unblock is admin-origin, which only matters if they are still over quota:
+   a later automatic re-block has automatic origin again and lifts normally.
 
 ## How to verify recovery
 
@@ -80,3 +83,5 @@ aws logs filter-log-events --log-group-name /aws/lambda/<AutoBlockSweeperFn> \
 - Component: [components/auto-block-sweeper.md](../components/auto-block-sweeper.md)
 - [revocation-policy-overflow.md](revocation-policy-overflow.md) — the failure mode the sweep prevents.
 - [revocation-sync-failure.md](revocation-sync-failure.md) — if lifted users are still denied.
+- [auto-block-sweeper-errors.md](auto-block-sweeper-errors.md) — the Lambda `Errors` alarm that fires alongside this one, because the sweeper re-raises.
+- Metrics (no dimensions): `AutoBlockSweepSuccess`, `AutoBlockSweepEvaluated`, `AutoBlockSweepLifted`, `AutoBlockSweepStillBlocked`, `AutoBlockSweepRaced`, `AutoBlockSweepFailure`

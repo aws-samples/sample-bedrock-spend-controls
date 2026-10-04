@@ -1,0 +1,15 @@
+# Everything `python -m pytest tests/` and `cdk synth` need, in one place:
+# the CDK app (cdk/requirements.txt), the broker (gateway/requirements.txt),
+# the client examples (examples/requirements.txt), and pytest.
+#
+#   python -m venv .venv && . .venv/bin/activate
+#   pip install -r requirements-dev.txt
+aws-cdk-lib==2.261.0
+constructs==10.6.0
+boto3==1.43.47
+botocore==1.43.47
+fastapi==0.115.14
+httpx==0.28.1
+PyJWT[crypto]==2.15.0
+uvicorn==0.34.3
+pytest==9.1.1

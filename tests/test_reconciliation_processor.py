@@ -196,8 +196,72 @@ def test_cost_explorer_failure_emits_failure_metric_and_raises(fake_dynamodb, mo
 
 def test_service_names_can_be_overridden(fake_dynamodb, monkeypatch):
     _env(monkeypatch)
+    monkeypatch.delenv("RECONCILE_SERVICE_NAMES_JSON", raising=False)
     monkeypatch.setenv("CE_SERVICE_NAMES_JSON", '["Amazon Bedrock", "Claude 3 (Amazon Bedrock Edition)"]')
     ce = FakeCostExplorer(aggregate=1.0)
     result = reconciler.handler({"day": DAY}, None, dynamodb=fake_dynamodb, ce=ce, sns=FakeSNS())
     assert result["service_names"] == ["Amazon Bedrock", "Claude 3 (Amazon Bedrock Edition)"]
     assert ce.calls[0]["Filter"]["And"][0]["Dimensions"]["Values"] == result["service_names"]
+
+    # RECONCILE_SERVICE_NAMES_JSON is the documented name and takes precedence.
+    monkeypatch.setenv("RECONCILE_SERVICE_NAMES_JSON", '["Amazon Bedrock Service"]')
+    result = reconciler.handler({"day": DAY}, None, dynamodb=fake_dynamodb, ce=ce, sns=FakeSNS())
+    assert result["service_names"] == ["Amazon Bedrock Service"]
+
+
+def test_default_service_names_apply_without_override(fake_dynamodb, monkeypatch):
+    _env(monkeypatch)
+    monkeypatch.delenv("RECONCILE_SERVICE_NAMES_JSON", raising=False)
+    monkeypatch.delenv("CE_SERVICE_NAMES_JSON", raising=False)
+    result = reconciler.handler({"day": DAY}, None, dynamodb=fake_dynamodb, ce=FakeCostExplorer(), sns=FakeSNS())
+    assert result["service_names"] == list(reconciler.DEFAULT_SERVICE_NAMES)
+
+
+def test_cost_explorer_filter_restricts_to_usage_records(fake_dynamodb, monkeypatch):
+    """Credits and refunds must not shrink the billed figure."""
+    _env(monkeypatch, workloads={"workload:payments": {"name": "payments", "profile_arn": "a", "role_arn": ""}})
+    ce = FakeCostExplorer(aggregate=1.0)
+    reconciler.handler({"day": DAY}, None, dynamodb=fake_dynamodb, ce=ce, sns=FakeSNS())
+    usage_only = {"Dimensions": {"Key": "RECORD_TYPE", "Values": ["Usage"], "MatchOptions": ["EQUALS"]}}
+    assert len(ce.calls) == 2  # aggregate + one workload
+    for call in ce.calls:
+        assert usage_only in call["Filter"]["And"]
+        assert call["Filter"]["And"].count(usage_only) == 1
+
+
+def test_started_heartbeat_precedes_the_run_and_store_failure_alerts(fake_dynamodb, monkeypatch, capsys):
+    """H-4: ReconciliationStarted fires first (the only timeout signal) and a
+    store_result error still emits ReconciliationFailure plus the alert."""
+    _env(monkeypatch)
+    usage = fake_dynamodb.Table(os.environ["USAGE_TABLE"])
+    original_put = usage.put_item
+
+    def failing_put(Item, **kwargs):  # noqa: N803
+        if str(Item.get("user_id", "")).startswith(reconciler.RECONCILE_PREFIX):
+            raise ClientError({"Error": {"Code": "InternalServerError", "Message": "boom"}}, "PutItem")
+        return original_put(Item=Item, **kwargs)
+
+    monkeypatch.setattr(usage, "put_item", failing_put)
+    sns = FakeSNS()
+
+    with pytest.raises(ClientError, match="boom"):
+        reconciler.handler({"day": DAY}, None, dynamodb=fake_dynamodb, ce=FakeCostExplorer(aggregate=1.0), sns=sns)
+
+    emf = _emf(capsys)
+    assert emf[0]["ReconciliationStarted"] == 1
+    assert emf[0]["Day"] == DAY
+    failure = next(e for e in emf if "ReconciliationFailure" in e)
+    assert failure["ReconciliationFailure"] == 1
+    assert failure["error_type"] == "ClientError"
+    assert not any("ReconciliationRuns" in e for e in emf)
+    assert "RECONCILIATION FAILED" in sns.published[0]["Subject"]
+
+
+def test_configuration_error_is_a_reported_failure(fake_dynamodb, monkeypatch, capsys):
+    _env(monkeypatch)
+    monkeypatch.setenv("RECONCILE_SERVICE_NAMES_JSON", "[]")
+    sns = FakeSNS()
+    with pytest.raises(ValueError, match="at least one service"):
+        reconciler.handler({"day": DAY}, None, dynamodb=fake_dynamodb, ce=FakeCostExplorer(), sns=sns)
+    assert any(e.get("ReconciliationFailure") == 1 for e in _emf(capsys))
+    assert "RECONCILIATION FAILED" in sns.published[0]["Subject"]

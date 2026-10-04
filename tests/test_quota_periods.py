@@ -6,6 +6,7 @@ from bedrock_spend_controls.quota_periods import (
     aggregate_daily_rows,
     calendar_window,
     evaluate_limits,
+    normalize_thresholds,
     quota_reason,
 )
 
@@ -120,3 +121,66 @@ def test_null_period_and_zero_dimensions_are_not_enforced():
     )
     assert not evaluation.over_budget
     assert evaluation.maximum_ratio == 0
+
+
+@pytest.mark.parametrize(
+    "entry",
+    [
+        {"at": float("inf"), "action": "warn"},
+        {"at": float("-inf"), "action": "warn"},
+        {"at": float("nan"), "action": "warn"},
+        {"at_bps": float("inf"), "action": "warn"},
+        {"at_bps": float("nan"), "action": "block"},
+    ],
+)
+def test_non_finite_thresholds_are_rejected_as_values(entry):
+    """``json.loads`` lets ``Infinity``/``NaN`` through; converting them to
+    basis points raised OverflowError/ValueError out of the API (500)."""
+    with pytest.raises(ValueError, match=r"thresholds\[0\]\.at"):
+        normalize_thresholds([entry])
+
+
+def test_warn_threshold_reached_exactly_is_reported():
+    """57 of 100 against a 57 % threshold: ``0.57 * 10_000`` is 5699.99...
+    in floating point, so the ratio comparison missed the crossing. The
+    integer comparison the block check uses is exact."""
+    now = datetime(2026, 9, 9, 12, tzinfo=timezone.utc)
+    usage = aggregate_daily_rows(
+        [{"window": "2026-09-09", "input_tokens": 57}], now
+    )
+    evaluation = evaluate_limits(
+        {
+            "daily": {
+                "usd_micro": 0,
+                "input_tokens": 100,
+                "output_tokens": 0,
+                "thresholds": normalize_thresholds(
+                    [{"at": 0.57, "action": "warn"}, {"at": 1.0, "action": "block"}]
+                ),
+            },
+            "weekly": None,
+            "monthly": None,
+        },
+        usage,
+        now,
+    )
+    assert [(w.period, w.at_bps) for w in evaluation.warnings] == [("daily", 5700)]
+    assert not evaluation.over_budget
+
+    below = evaluate_limits(
+        {
+            "daily": {
+                "usd_micro": 0,
+                "input_tokens": 100,
+                "output_tokens": 0,
+                "thresholds": normalize_thresholds(
+                    [{"at": 0.57, "action": "warn"}, {"at": 1.0, "action": "block"}]
+                ),
+            },
+            "weekly": None,
+            "monthly": None,
+        },
+        aggregate_daily_rows([{"window": "2026-09-09", "input_tokens": 56}], now),
+        now,
+    )
+    assert below.warnings == ()

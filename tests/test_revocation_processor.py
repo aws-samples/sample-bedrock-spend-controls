@@ -210,13 +210,22 @@ def test_identities_are_distributed_across_policy_shards(
 def test_policy_overflow_fails_open_for_that_shard_and_alerts(
     fake_dynamodb, monkeypatch
 ):
+    """M-5: a full shard still honours unblocks and keeps what fits.
+
+    ``existing-blocked`` was admin-unblocked (no longer in the table) and
+    must leave the shard even though the desired set overflows; the one
+    desired identity already denied stays; the rest are dropped and counted.
+    """
     policy_arns = ["arn:aws:iam::111122223333:policy/shard-0"]
-    _configure(monkeypatch, policy_arns, max_chars=300)
+    first = "x" * 60 + "0"
+    # Room for exactly one 61-character identity.
+    max_chars = len(revoker._compact(revoker.deny_policy([first])))
+    _configure(monkeypatch, policy_arns, max_chars=max_chars)
     for index in range(10):
         _seed_user(fake_dynamodb, f"user-{index}", "x" * 60 + str(index))
     iam = FakeIAM(policy_arns)
     iam.policies[policy_arns[0]]["versions"]["v1"]["Document"] = (
-        revoker.deny_policy(["existing-blocked"])
+        revoker.deny_policy(["existing-blocked", first])
     )
     sns = FakeSNS()
 
@@ -225,8 +234,76 @@ def test_policy_overflow_fails_open_for_that_shard_and_alerts(
     )
 
     assert result["overflow_shards"] == [0]
-    assert _identities(iam.current(policy_arns[0])) == ["existing-blocked"]
+    assert result["dropped_identities"] == 9
+    assert result["shards"][0]["dropped_identities"] == 9
+    assert result["shards"][0]["changed"] is True
+    assert _identities(iam.current(policy_arns[0])) == [first]
     assert "CAPACITY EXCEEDED" in sns.published[0]["Subject"]
+
+    # Idempotent: the same state rewrites nothing.
+    repeat = revoker.handler(
+        _event(), None, dynamodb=fake_dynamodb, iam=iam, sns=FakeSNS()
+    )
+    assert repeat["unchanged_shards"] == 1
+    assert _identities(iam.current(policy_arns[0])) == [first]
+
+
+def test_overflow_adds_new_identities_in_sorted_order_until_full():
+    current = {"c", "zzz-unblocked"}
+    desired = ["b", "c", "a", "d"]
+    # Fits three short identities, not four.
+    max_chars = len(revoker._compact(revoker.deny_policy(["a", "b", "c"])))
+    applied, dropped = revoker.fit_overflowing_shard(current, desired, max_chars)
+    assert applied == ["a", "b", "c"]
+    assert dropped == ["d"]
+    # A foreign/hand-edited document contributes nothing but breaks nothing.
+    assert revoker._identities_in({"Statement": [{"Effect": "Deny"}]}) == set()
+    assert revoker._identities_in(revoker.deny_policy([])) == set()
+
+
+def test_scan_failure_emits_failure_metric_alerts_and_raises(
+    fake_dynamodb, monkeypatch, capsys
+):
+    """H-4: the users-table scan sits inside the failure path."""
+    policy_arns = ["arn:aws:iam::111122223333:policy/shard-0"]
+    _configure(monkeypatch, policy_arns)
+    users_table = fake_dynamodb.Table(os.environ["USERS_TABLE"])
+
+    def failing_scan(**kwargs):
+        raise ClientError(
+            {"Error": {"Code": "ProvisionedThroughputExceededException",
+                       "Message": "slow down"}},
+            "Scan",
+        )
+
+    monkeypatch.setattr(users_table, "scan", failing_scan)
+    iam = FakeIAM(policy_arns)
+    sns = FakeSNS()
+
+    with pytest.raises(ClientError, match="slow down"):
+        revoker.handler(
+            _event(), None, dynamodb=fake_dynamodb, iam=iam, sns=sns
+        )
+
+    assert iam.created == []  # no shard was touched on stale information
+    assert "SYNC FAILED" in sns.published[0]["Subject"]
+    emf = json.loads(capsys.readouterr().out)
+    assert emf["RevocationSyncFailure"] == 1
+
+
+def test_missing_policy_arns_is_a_reported_failure(
+    fake_dynamodb, monkeypatch, capsys
+):
+    _configure(monkeypatch, [])
+    sns = FakeSNS()
+
+    with pytest.raises(ValueError, match="at least one"):
+        revoker.handler(
+            _event(), None, dynamodb=fake_dynamodb, iam=FakeIAM([]), sns=sns
+        )
+
+    assert "SYNC FAILED" in sns.published[0]["Subject"]
+    assert json.loads(capsys.readouterr().out)["RevocationSyncFailure"] == 1
 
 
 def test_iam_failure_alerts_and_raises_for_stream_retry(

@@ -91,8 +91,8 @@ the seven trust boundaries used by the threat model, rendered as
 - Python 3.12 or later on the deploy host with `pip3` available. The broker
   is bundled on the host with pinned manylinux wheels; Docker or Finch is
   used only as an automatic fallback (`CDK_DOCKER=finch` for Finch).
-- For the integration library in your application: Python 3.10 or later,
-  `boto3`, `httpx`.
+- For the integration library in your application: Python 3.10 or later
+  with the pinned `boto3` and `httpx` from `examples/requirements.txt`.
 
 ## Quick deploy (demo)
 
@@ -148,20 +148,26 @@ from refreshable_bedrock import BedrockSpendControls, QuotaExceededError, UserBl
 spend_controls = BedrockSpendControls(BROKER_API_URL, region="us-east-1")
 
 def handle_chat(request):
-    user = verify_jwt(request.jwt)                      # unchanged
+    user = verify_jwt(request.jwt)                      # unchanged; verify BEFORE client_for
     bedrock = spend_controls.client_for(request.jwt)    # new
     try:
         return bedrock.converse(modelId=MODEL, messages=request.messages)  # unchanged
-    except QuotaExceededError as exc:
-        return http_429(f"Quota exhausted, resets at {exc.resets_at:%H:%M} UTC")
-    except UserBlockedError:
+    except (QuotaExceededError, UserBlockedError) as exc:
+        # UserBlockedError is the usual refusal: metering blocked the user
+        # earlier. QuotaExceededError means the vend itself crossed the limit.
+        # resets_at is None for admin blocks.
+        if exc.resets_at is not None:
+            return http_429(f"Quota exhausted, resets at {exc.resets_at:%H:%M} UTC")
         return http_403("Your Bedrock access is blocked")
 ```
 
 `client_for` returns an ordinary boto3 client. The factory keeps one lease
 per identity, vends lazily on the first Bedrock call, renews before the
-lease ends, and forgets idle identities. The broker request is SigV4-signed
-with the backend's own role, which must be in `invoker_principal_arns`.
+lease ends, and forgets idle identities. Pass it only tokens your
+application has already verified: the cache key is read from the JWT
+client-side, and the broker's own verification happens later, at vend time.
+The broker request is SigV4-signed with the backend's own role, which must
+be in `invoker_principal_arns`.
 
 **Per workload:** change one string.
 
@@ -205,7 +211,7 @@ detail.
   quota again: at the next vend, on the workload enforcer's pass, or in the
   nightly sweep. Admin blocks never lift automatically.
 
-Details, including why weekly and monthly totals read at most 37 daily rows:
+Details, including why weekly and monthly totals read at most 31 daily rows:
 [docs/quotas.md](docs/quotas.md).
 
 ## Operate
@@ -216,7 +222,10 @@ thresholds, rate limits, block and unblock, detail drawer with usage history,
 audit, and per-model budgets), **Workloads** (the deployed roster with its
 enforcement state), **Operations** (enforcement configuration, the runtime
 lease dial, emergency stop, live leases, auto-block sweep, reconciliation,
-alarm chips), and **Audit** (global admin audit).
+alarm chips), and **Audit** (routine admin audit; lease-dial and emergency
+changes are shown on the Operations tab). Emergency actions are confirmed
+with the break-glass key, which the operator types into the dialog for each
+action; the console sends it in the request header and never stores it.
 
 The screenshots below come from the console's local preview harness
 (`admin-ui/preview/`), which runs against fictitious users and data.
@@ -230,16 +239,19 @@ The screenshots below come from the console's local preview harness
 The same API is reachable from the SigV4 admin CLI:
 
 ```bash
+# ADMIN_KEY holds the routine admin key (see DEPLOYMENT.md step 4); the CLI
+# reads it from the environment so it never lands in your shell history.
 python examples/sigv4_gateway.py --gateway-url "$BROKER_API_URL" \
-  --profile "$AWS_PROFILE" --region "$AWS_REGION" --admin-key "$ADMIN_KEY" \
+  --profile "$AWS_PROFILE" --region "$AWS_REGION" \
   create-user alice --daily-usd 5 --daily-input-tokens 1000000 --daily-output-tokens 200000 \
   --daily-thresholds "50:warn,80:warn,100:block" --rpm 60 --tpm 100000
 ```
 
-Every deployment creates eight CloudWatch alarms (ten with workloads and
-reconciliation configured), all notifying the `QuotaAlerts` SNS topic and
-each with a runbook under [docs/runbooks/](docs/runbooks/README.md), as does
-every Lambda component. Warnings and blocks go to the same topic.
+Every deployment creates 15 CloudWatch alarms (17 with workloads, 18 with
+reconciliation, 20 with both), named `<stack>-<key>`, all notifying the
+`QuotaAlerts` SNS topic and each with a runbook under
+[docs/runbooks/](docs/runbooks/README.md), as does every Lambda component.
+Warnings and blocks go to the same topic.
 
 Console tabs, the lease dial, the emergency-stop state machine, CLI
 commands, safe-write rules: [docs/operations.md](docs/operations.md).
@@ -251,12 +263,12 @@ Per-user CloudWatch metrics dominate the solution's own running cost: every
 active user adds about eleven metric streams, and CloudWatch bills each
 stream only for the hours in which it receives data. The estimate is about
 $63/month for the demo scenario (100 users, active about an hour a day) and
-about $765/month at 1,000 users active about four hours a day, of which
-everything other than custom metrics is under $25. The per-user metrics of a
+about $766/month at 1,000 users active about four hours a day, of which
+everything other than custom metrics is about $25. The per-user metrics of a
 subject that calls Bedrock around the clock are billed for the full month,
-about $3.30. Dropping
-the `UserId` dimension from the EMF metrics is the largest single reduction
-(about $77/month at 1,000 users). Assumptions, line items, and
+about $3.30. Dropping the `UserId` dimension from the EMF metrics is the
+largest single reduction: it saves about $688/month at 1,000 users, leaving
+about $78/month. Assumptions, line items, and
 reduction options: [docs/cost-estimate.md](docs/cost-estimate.md). Bedrock
 inference spend itself is what the solution meters and is not included.
 
@@ -266,13 +278,26 @@ inference spend itself is what the solution meters and is not included.
   call it, and the broker role cannot invoke a model.
 - The vended role receives only Runtime actions on `allowed_model_arns`,
   capped by a managed permissions boundary. Lease session policies can only
-  narrow it further.
+  narrow it further. Both the role policy and the boundary carry an explicit
+  deny on application inference profiles and provisioned models and on the
+  unmetered `StartAsyncInvoke` / `InvokeModelWithBidirectionalStream` paths,
+  so a vended session cannot reach a workload's profile or spend unmetered
+  even with `allowed_model_arns: ["*"]`.
+- The vended role's trust policy requires `sts:SourceIdentity`: the broker
+  is the only principal that may assume it, and only while stamping the
+  identity that metering and revocation key on.
 - The revocation and emergency processors can version only their designated
   pre-attached policies; they cannot edit the role, its trust policy, or the
   boundary.
 - No Bedrock bearer keys are vended: `bedrock:CallWithBearerToken` requires
   `Resource: "*"` and would defeat the model allowlist.
-- The console never receives the shared admin key or the emergency key.
+- The console never receives the shared admin key and never stores the
+  emergency key: the operator types the break-glass key into the dialog for
+  each emergency action. Console sign-in gets AWS credentials only through
+  an Identity Pool rules mapping on `admin_jwt_claim` / `admin_jwt_value`;
+  anyone else who can sign in to the client receives no role and cannot
+  reach the Function URL. A console login token is accepted on `/admin/*`
+  only and can never vend Bedrock credentials.
 
 **Quotas only hold if no other principal can call Bedrock directly.**
 Production applies an SCP (example in [DEPLOYMENT.md](DEPLOYMENT.md#5-prevent-bypass)),
@@ -301,11 +326,16 @@ cd cdk
 npx cdk destroy -c deployment_config=config/demo.json
 ```
 
-With `retain_tables_on_delete: true` (the production default) the DynamoDB
-tables survive deletion. Stack-managed invocation logging (the
-configuration, writer role, and log group) is always retained because the
-previous account-wide setting cannot be reconstructed. Remove retained
-resources only through an explicit data-retention decision.
+With `retain_tables_on_delete: true` (set in `config/production.json`; the
+code default is `false`) the DynamoDB tables survive deletion and carry
+deletion protection while the stack exists. Point-in-time recovery is on
+for every table in every configuration. Stack-managed invocation logging
+(the configuration, writer role, and log group
+`/bedrock/spend-controls/model-invocations`) is always retained because the
+previous account-wide setting cannot be reconstructed; redeploying in the
+same Region afterwards requires deleting or renaming that log group, or
+passing it back via `invocation_log_group_name`. Remove retained resources
+only through an explicit data-retention decision.
 
 ## Repository layout
 
@@ -332,7 +362,8 @@ resources only through an explicit data-retention decision.
 ## Running the tests
 
 ```bash
-python -m pytest tests/ -q
+python3 -m venv .venv && .venv/bin/pip install -r requirements-dev.txt
+.venv/bin/python -m pytest tests/ -q
 (cd admin-ui && npm ci && npm test && npm run build)
 (cd cdk && for c in demo production; do
   npx cdk synth --app "python app.py" -c deployment_config=config/$c.json --quiet
@@ -358,7 +389,8 @@ by the tools you run:
 | `gateway/requirements.txt` | Broker Lambda (bundled into the deployment asset on your deploy host) | MIT, BSD-2/3-Clause, Apache-2.0, MIT-0, PSF-2.0 (`typing_extensions`) |
 | `cdk/requirements.txt`, `cdk/package.json` | CDK app and CLI | Apache-2.0, MIT |
 | `admin-ui/package.json` | Admin console build (runtime: React, AWS SDK for JavaScript, aws4fetch, lucide-react) | Runtime: MIT, Apache-2.0, ISC, 0BSD. Build/test only: also MIT-0 and CC-BY-4.0 (`caniuse-lite` browser data) |
-| `examples/refreshable_bedrock.py` (`boto3`, `httpx`) | Your application | Apache-2.0, BSD-3-Clause, MIT; `httpx` pulls in `certifi` (MPL-2.0) |
+| `examples/requirements.txt` (`boto3`, `httpx`, used by `examples/refreshable_bedrock.py`) | Your application and the smoke tests | Apache-2.0, BSD-3-Clause, MIT; `httpx` pulls in `certifi` (MPL-2.0) |
+| `requirements-dev.txt` | Running the test suite | Test and tooling dependencies only; nothing from it ships |
 
 The broker also attaches the public
 [AWS Lambda Web Adapter](https://github.com/awslabs/aws-lambda-web-adapter)

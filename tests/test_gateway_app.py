@@ -269,6 +269,121 @@ def test_manual_and_usage_blocks_prevent_vending(client):
     assert broker.users == []
 
 
+def test_automatic_block_refusal_carries_the_reset_headers(client):
+    """Only the vend that flips the block got the 429 with X-Quota-Resets-At;
+    every later vend was a bare 403, leaving the client unable to tell when
+    the window reopens. Automatic blocks now carry the same headers."""
+    api, store, broker = client
+    _seed_user(store, "spent", "Spent", 1, 100, 50)
+    store._usage.put_item(  # noqa: SLF001
+        Item={
+            "user_id": "spent",
+            "window": current_window(),
+            "cost_micro": MICRO,
+            "requests": 1,
+        }
+    )
+    first = _vend(api, make_jwt("spent"))
+    assert first.status_code == 429
+    second = _vend(api, make_jwt("spent"))
+    assert second.status_code == 403
+    assert second.json()["error"]["type"] == "quota_blocked"
+    assert second.headers["X-Quota-Breached-Period"] == "daily"
+    assert second.headers["X-Quota-Breached-Dimension"] == "usd"
+    assert second.headers["X-Quota-Resets-At"] == first.headers["X-Quota-Resets-At"]
+    assert second.headers["X-Quota-Enabled-Periods"] == "daily"
+    assert broker.users == []
+
+    # An admin block has no window to report: no breach/reset headers.
+    _seed_user(store, "manual", "Manual", 1, 100, 50)
+    store.set_user_status("manual", "blocked", "admin API", origin="admin")
+    manual = _vend(api, make_jwt("manual"))
+    assert manual.status_code == 403
+    assert manual.json()["error"]["type"] == "quota_blocked"
+    assert "X-Quota-Resets-At" not in manual.headers
+    assert "X-Quota-Breached-Period" not in manual.headers
+    assert manual.headers["X-Quota-Enabled-Periods"] == "daily"
+
+
+def test_hash_in_a_subject_cannot_alias_a_model_ledger(client):
+    """``bob#model#<model>`` is bob's per-model ledger key; a JWT or admin
+    create with that identity must be refused before it touches storage."""
+    api, store, broker = client
+    _seed_user(store, "bob", "Bob", 100, 0, 0)
+    response = _vend(api, make_jwt("bob#model#anthropic.claude-haiku"))
+    assert response.status_code == 401
+    assert "'#'" in response.json()["error"]["message"]
+    assert broker.users == []
+    # Nothing was provisioned: the store refuses the identity as well.
+    assert not any(
+        "#" in str(key[0]) for key in store._users.items  # noqa: SLF001
+    )
+    with pytest.raises(ValueError, match="'#'"):
+        store.get_user("bob#model#anthropic.claude-haiku")
+
+    created = api.post(
+        "/admin/users",
+        json={"user_id": "bob#model#anthropic.claude-haiku", "name": "x"},
+        headers=ADMIN,
+    )
+    assert created.status_code == 400
+    assert "'#'" in created.json()["error"]["message"]
+    # Path-, email- and tenant-style identities still provision normally.
+    assert _vend(api, make_jwt("tenant/alice@example.com:dev")).status_code == 200
+
+
+def test_openapi_schema_is_not_exposed(client):
+    api, _, _ = client
+    assert api.get("/openapi.json").status_code == 404
+    assert api.get("/docs").status_code == 404
+    assert api.get("/redoc").status_code == 404
+
+
+def test_non_ascii_shared_key_headers_are_forbidden_not_500(client):
+    """``secrets.compare_digest`` rejects non-ASCII ``str`` with TypeError;
+    a header carrying one used to turn into a 500 on both key checks."""
+    api, _, _ = client
+    odd = "admin-sécret".encode("utf-8")
+    assert api.get(
+        "/admin/users", headers={b"x-quota-admin-key": odd}
+    ).status_code == 403
+    assert api.get(
+        "/admin/users", headers={b"authorization": b"Bearer " + odd}
+    ).status_code == 403
+    emergency = api.post(
+        "/admin/emergency-stop",
+        json={
+            "action": "activate",
+            "confirmation": "STOP_ALL_BEDROCK_SESSIONS",
+            "reason": "exercise",
+        },
+        headers={b"x-quota-emergency-key": "emergency-sécret".encode("utf-8")},
+    )
+    assert emergency.status_code == 403
+    assert emergency.json()["error"]["type"] == "forbidden"
+
+
+def test_non_finite_threshold_literals_are_a_400(client):
+    """Python's JSON parser accepts the ``Infinity``/``NaN`` extensions; the
+    basis-point conversion then overflowed into a 500."""
+    api, store, _ = client
+    _seed_user(store, "alice", "Alice", 1, 100, 50)
+    for literal in ("Infinity", "-Infinity", "NaN"):
+        body = (
+            '{"limits": {"daily": {"usd": 1, "input_tokens": 1, "output_tokens": 1,'
+            ' "thresholds": [{"at": ' + literal + ', "action": "warn"},'
+            ' {"at": 1.0, "action": "block"}]}}}'
+        )
+        response = api.put(
+            "/admin/user/limits",
+            params={"user_id": "alice"},
+            content=body,
+            headers={**ADMIN, "Content-Type": "application/json"},
+        )
+        assert response.status_code == 400, (literal, response.text)
+        assert "finite" in response.json()["error"]["message"]
+
+
 def test_existing_credentials_are_not_revoked_by_current_status_block(client):
     """Blocking denies the next vend/refresh; already-issued keys keep
     their fixed deadline (the revocation layer cuts them out-of-band)."""
@@ -551,8 +666,8 @@ def test_operations_is_read_only_safe_and_reports_revocation_health(
         "emergency_dlq": "emergency-dlq-alarm",
         "revocation_failure": "revocation-failure-alarm",
         "revocation_overflow": "revocation-overflow-alarm",
-        "revocation_dlq": "revocation-dlq-alarm",
-        "revocation_iterator_age": "revocation-age-alarm",
+        "enforcement_dispatch_dlq": "enforcement-dispatch-dlq-alarm",
+        "enforcement_dispatch_iterator_age": "enforcement-dispatch-age-alarm",
     }
     monkeypatch.setattr(
         gateway,
@@ -635,12 +750,12 @@ def test_operations_is_read_only_safe_and_reports_revocation_health(
                 "StateUpdatedTimestamp": now - timedelta(minutes=1),
             },
             {
-                "AlarmName": "revocation-dlq-alarm",
+                "AlarmName": "enforcement-dispatch-dlq-alarm",
                 "StateValue": "OK",
                 "StateUpdatedTimestamp": now - timedelta(minutes=1),
             },
             {
-                "AlarmName": "revocation-age-alarm",
+                "AlarmName": "enforcement-dispatch-age-alarm",
                 "StateValue": "OK",
                 "StateUpdatedTimestamp": now - timedelta(minutes=1),
             },
@@ -694,8 +809,8 @@ def test_operations_marks_partial_cloudwatch_evidence_unknown(
     alarm_names = {
         "revocation_failure": "revocation-failure-alarm",
         "revocation_overflow": "revocation-overflow-alarm",
-        "revocation_dlq": "revocation-dlq-alarm",
-        "revocation_iterator_age": "revocation-age-alarm",
+        "enforcement_dispatch_dlq": "enforcement-dispatch-dlq-alarm",
+        "enforcement_dispatch_iterator_age": "enforcement-dispatch-age-alarm",
     }
     monkeypatch.setattr(
         gateway,
@@ -941,6 +1056,62 @@ def test_usage_metrics_aggregates_models_and_top_users(client, monkeypatch):
     assert dimension_filters == ["Model", "UserId"]
 
 
+def test_top_users_rank_every_metered_identity_not_an_alphabetical_prefix(
+    client, monkeypatch
+):
+    """ListMetrics used to stop after the first 100 identities (sorted), so
+    a heavy spender late in the alphabet never appeared. Every identity is
+    now queried, in GetMetricData batches of 500."""
+    api, _, _ = client
+    today = datetime.combine(
+        datetime.now(timezone.utc).date(), datetime.min.time(), tzinfo=timezone.utc
+    )
+    identities = [f"user-{index:03d}" for index in range(599)] + ["zz-whale"]
+    whale_index = sorted(identities).index("zz-whale")
+    assert whale_index == 599
+    results = [
+        {"Id": f"u{whale_index}_cost", "StatusCode": "Complete",
+         "Timestamps": [today], "Values": [42.0]},
+        {"Id": f"u{whale_index}_requests", "StatusCode": "Complete",
+         "Timestamps": [today], "Values": [7.0]},
+        {"Id": "u0_cost", "StatusCode": "Complete",
+         "Timestamps": [today], "Values": [0.01]},
+        {"Id": "u0_requests", "StatusCode": "Complete",
+         "Timestamps": [today], "Values": [1.0]},
+    ]
+    cloudwatch = FakeCloudWatch(
+        results=results,
+        metrics=[_usage_metric("UserId", user_id) for user_id in identities],
+    )
+    monkeypatch.setattr(gateway, "_cloudwatch", cloudwatch)
+
+    body = api.get("/admin/usage/metrics?days=7", headers=ADMIN).json()
+
+    assert body["status"] == "available"
+    assert [entry["user_id"] for entry in body["top_users"]] == ["zz-whale", "user-000"]
+    assert body["top_users"][0]["cost_usd"] == 42.0
+    # 4 totals + 600 x 2 user queries = 1,204 -> three GetMetricData calls.
+    sizes = [len(call["MetricDataQueries"]) for call in cloudwatch.metric_calls]
+    assert sizes == [500, 500, 204]
+    assert all(call["StartTime"] for call in cloudwatch.metric_calls)
+
+
+def test_top_users_beyond_the_identity_cap_mark_the_response_partial(
+    client, monkeypatch
+):
+    api, _, _ = client
+    monkeypatch.setattr(gateway, "USAGE_METRICS_MAX_USERS", 2)
+    cloudwatch = FakeCloudWatch(
+        results=[],
+        metrics=[_usage_metric("UserId", f"user-{index}") for index in range(3)],
+    )
+    monkeypatch.setattr(gateway, "_cloudwatch", cloudwatch)
+    body = api.get("/admin/usage/metrics?days=7", headers=ADMIN).json()
+    assert body["status"] == "partial"
+    # Only the capped identities were queried: 4 totals + 2 x 2.
+    assert len(cloudwatch.metric_calls[0]["MetricDataQueries"]) == 8
+
+
 def test_usage_metrics_marks_partial_and_unavailable(client, monkeypatch):
     api, _, _ = client
     incomplete = FakeCloudWatch(
@@ -1087,6 +1258,141 @@ def test_emergency_stop_requires_break_glass_confirmation_and_gates_recovery(
     store.mark_emergency_applied(active=False)
     assert _vend(api, make_jwt("alice")).status_code == 200
     assert broker.users == ["alice"]
+
+
+def test_emergency_stop_concurrent_request_is_a_409(client, monkeypatch):
+    """A second operator whose read raced the first must not overwrite the
+    first request; they get the winner's state back and decide again."""
+    api, store, _ = client
+    activate = {
+        "action": "activate",
+        "confirmation": "STOP_ALL_BEDROCK_SESSIONS",
+        "reason": "incident",
+    }
+    assert api.post("/admin/emergency-stop", json=activate, headers=EMERGENCY).status_code == 202
+    store.mark_emergency_applied(active=True)
+    real_read = store.get_emergency_state
+    # Operator B's snapshot: active, generation 1 ...
+    snapshot = dict(real_read())
+    assert snapshot["generation"] == 1 and snapshot["state"] == "active"
+    # ... while operator A's recover lands first (generation 2).
+    store.set_emergency_desired(active=False, actor="operator-a", reason="all clear")
+    # The route reads once (idempotency check) and the store once more
+    # (observed generation): B sees its stale snapshot both times.
+    reads = iter([snapshot, snapshot])
+    monkeypatch.setattr(
+        store, "get_emergency_state", lambda: next(reads, None) or real_read()
+    )
+
+    recover = api.post(
+        "/admin/emergency-stop",
+        json={
+            "action": "recover",
+            "confirmation": "RESTORE_ALL_BEDROCK_SESSIONS",
+            "reason": "false alarm",
+        },
+        headers=EMERGENCY,
+    )
+    assert recover.status_code == 409, recover.text
+    error = recover.json()["error"]
+    assert error["type"] == "version_conflict"
+    assert error["details"]["current_emergency"]["generation"] == 2
+    assert error["details"]["current_emergency"]["state"] == "recovering"
+    # A's request is untouched: B did not overwrite it with a generation-2
+    # row of its own.
+    latest = real_read()
+    assert latest["generation"] == 2
+    assert latest["actor"] == "operator-a"
+    assert store.emergency_stop_active()
+
+
+def test_emergency_actor_names_the_signed_in_admin_when_a_jwt_accompanies_the_key(
+    client, monkeypatch
+):
+    """The shared key authorizes; it does not say who held it. When the
+    console also sends the operator's admin login, the audit trail names
+    them. The key remains mandatory."""
+    api, store, _ = client
+    _enable_admin_jwt(monkeypatch)
+    admin_token = make_jwt("ops-lead", groups=["quota-admins"])
+    activate = {
+        "action": "activate",
+        "confirmation": "STOP_ALL_BEDROCK_SESSIONS",
+        "reason": "incident",
+    }
+    recover = {
+        "action": "recover",
+        "confirmation": "RESTORE_ALL_BEDROCK_SESSIONS",
+        "reason": "done",
+    }
+
+    # JWT alone, however privileged, is not break-glass authorization.
+    assert api.post(
+        "/admin/emergency-stop", json=activate,
+        headers={"X-Quota-User-Token": admin_token},
+    ).status_code == 403
+
+    activated = api.post(
+        "/admin/emergency-stop", json=activate,
+        headers={**EMERGENCY, "X-Quota-User-Token": admin_token},
+    )
+    assert activated.status_code == 202
+    assert activated.json()["actor"] == "ops-lead (emergency-shared-key)"
+    assert store.get_emergency_state()["actor"] == "ops-lead (emergency-shared-key)"
+    audit_rows = [
+        item for item in store._users.items.values()  # noqa: SLF001
+        if str(item["user_id"]).startswith("EMERGENCY_AUDIT#")
+    ]
+    assert [row["actor"] for row in audit_rows] == ["ops-lead (emergency-shared-key)"]
+
+    # A non-admin or garbage token does not get named; the key still works.
+    store.mark_emergency_applied(active=True)
+    recovered = api.post(
+        "/admin/emergency-stop", json=recover,
+        headers={**EMERGENCY, "X-Quota-User-Token": make_jwt("dev", groups=["developers"])},
+    )
+    assert recovered.status_code == 202
+    assert recovered.json()["actor"] == "emergency-shared-key"
+    store.mark_emergency_applied(active=False)
+    again = api.post(
+        "/admin/emergency-stop", json=activate,
+        headers={**EMERGENCY, "X-Quota-User-Token": "not-a-jwt"},
+    )
+    assert again.status_code == 202
+    assert again.json()["actor"] == "emergency-shared-key"
+
+
+def test_console_audience_cannot_vend_credentials(client, monkeypatch):
+    """JWT_AUDIENCE = "<data-plane>,<console>": a console login authorizes
+    /admin/* but never /v1/credentials, even with auto-provisioning on."""
+    import app.auth as auth_module
+    from app.config import Settings
+
+    api, store, broker = client
+    monkeypatch.setenv("ADMIN_JWT_CLAIM", "groups")
+    monkeypatch.setenv("ADMIN_JWT_VALUE", "quota-admins")
+    monkeypatch.setenv("JWT_AUDIENCE", "data-plane-client,console-client")
+    fresh = Settings()
+    monkeypatch.setattr(gateway, "settings", fresh)
+    monkeypatch.setattr(auth_module, "settings", fresh)
+
+    console_admin = make_jwt("console-admin", aud="console-client", groups=["quota-admins"])
+    console_user = make_jwt("console-user", aud="console-client")
+    data_plane = make_jwt("app-user", aud="data-plane-client")
+
+    assert api.get(
+        "/admin/summary", headers={"X-Quota-User-Token": console_admin}
+    ).status_code == 200
+    for token in (console_admin, console_user):
+        refused = _vend(api, token)
+        assert refused.status_code == 401
+        assert "audience" in refused.json()["error"]["message"]
+    assert store.get_user("console-admin") is None
+    assert store.get_user("console-user") is None
+    assert broker.users == []
+
+    assert _vend(api, data_plane).status_code == 200
+    assert broker.users == ["app-user"]
 
 
 def test_admin_requires_authorization_and_valid_payloads(client):
@@ -1877,9 +2183,11 @@ def test_admin_principal_is_derived_from_one_verified_jwt(client, monkeypatch):
         def __init__(self):
             self.calls = 0
 
-        def verify(self, token):
+        def verify(self, token, scope="data-plane"):
             self.calls += 1
             assert token == "verified-admin-token"  # nosec B105  # placeholder
+            # Admin routes verify in admin scope (console audience allowed).
+            assert scope == "admin"
             return gateway.Identity(
                 user_id="verified-admin",
                 claims={"groups": ["quota-admins"]},

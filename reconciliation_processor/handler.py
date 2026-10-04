@@ -50,9 +50,14 @@ RECONCILE_PREFIX = "RECONCILE#"
 # as returned by GetDimensionValues(SearchString="Bedrock"): on-demand model
 # usage appears under BOTH names depending on the SKU, and Marketplace-billed
 # third-party models (Anthropic) land under the same two services rather
-# than a separate "Claude" value. Override with CE_SERVICE_NAMES_JSON if
-# your bill differs.
+# than a separate "Claude" value. Override with RECONCILE_SERVICE_NAMES_JSON
+# (alias: CE_SERVICE_NAMES_JSON) if your bill differs.
 DEFAULT_SERVICE_NAMES = ("Amazon Bedrock", "Amazon Bedrock Service")
+# Only metered usage: credits, refunds and fees would otherwise shrink (or
+# inflate) the billed figure and read as a pricing gap.
+_USAGE_RECORD_TYPE_FILTER = {
+    "Dimensions": {"Key": "RECORD_TYPE", "Values": ["Usage"], "MatchOptions": ["EQUALS"]}
+}
 WORKLOAD_TAG_KEY = os.environ.get("WORKLOAD_TAG_KEY", "bedrock-spend-controls-workload")
 # Usage-table partition-key prefixes that are not subject ledgers.
 _NON_SUBJECT_PREFIXES = ("REQUEST#", "RATE#", RECONCILE_PREFIX)
@@ -154,6 +159,7 @@ def billed_usd_for_day(ce, day: str, region: str, service_names: tuple[str, ...]
             "And": [
                 {"Dimensions": {"Key": "SERVICE", "Values": list(service_names), "MatchOptions": ["EQUALS"]}},
                 {"Dimensions": {"Key": "REGION", "Values": [region], "MatchOptions": ["EQUALS"]}},
+                _USAGE_RECORD_TYPE_FILTER,
             ]
         },
     )
@@ -172,10 +178,23 @@ def billed_usd_for_workload(ce, day: str, region: str, service_names: tuple[str,
                 {"Dimensions": {"Key": "SERVICE", "Values": list(service_names), "MatchOptions": ["EQUALS"]}},
                 {"Dimensions": {"Key": "REGION", "Values": [region], "MatchOptions": ["EQUALS"]}},
                 {"Tags": {"Key": WORKLOAD_TAG_KEY, "Values": [workload_name], "MatchOptions": ["EQUALS"]}},
+                _USAGE_RECORD_TYPE_FILTER,
             ]
         },
     )
     return _ce_amount(response)
+
+
+def _service_names() -> tuple[str, ...]:
+    configured = os.environ.get("RECONCILE_SERVICE_NAMES_JSON") or os.environ.get(
+        "CE_SERVICE_NAMES_JSON"
+    )
+    if not configured:
+        return DEFAULT_SERVICE_NAMES
+    names = tuple(str(name) for name in json.loads(configured))
+    if not names:
+        raise ValueError("RECONCILE_SERVICE_NAMES_JSON must list at least one service")
+    return names
 
 
 def _delta(estimated: float, billed: float) -> tuple[float, float | None]:
@@ -268,26 +287,35 @@ def handler(event, context, *, dynamodb=None, ce=None, sns=None) -> dict:
         dynamodb = dynamodb or default_dynamodb
         ce = ce or default_ce
         sns = sns or default_sns
-    usage_table = dynamodb.Table(os.environ["USAGE_TABLE"])
-    region = os.environ["RECONCILE_REGION"]
-    lag_days = int(os.environ.get("RECONCILE_LAG_DAYS", "2"))
-    retention_days = int(os.environ.get("USAGE_RETENTION_DAYS", "35"))
-    service_names = tuple(json.loads(os.environ.get("CE_SERVICE_NAMES_JSON", json.dumps(list(DEFAULT_SERVICE_NAMES)))))
-    workloads = json.loads(os.environ.get("WORKLOADS_JSON", "{}"))
     now = datetime.now(timezone.utc)
-    day = str((event or {}).get("day") or (now.date() - timedelta(days=lag_days)).isoformat())
-
+    day = str((event or {}).get("day") or "")
+    # Heartbeat before any work. A Lambda timeout cannot be caught, so the
+    # only way to alarm on it is ReconciliationStarted without a matching
+    # ReconciliationRuns (or ReconciliationFailure) in the same period.
+    _emit(
+        {"ReconciliationStarted": ("Count", 1)},
+        {"Day": day or "pending", "Scope": "heartbeat"},
+    )
     try:
+        usage_table = dynamodb.Table(os.environ["USAGE_TABLE"])
+        region = os.environ["RECONCILE_REGION"]
+        lag_days = int(os.environ.get("RECONCILE_LAG_DAYS", "2"))
+        retention_days = int(os.environ.get("USAGE_RETENTION_DAYS", "35"))
+        service_names = _service_names()
+        workloads = json.loads(os.environ.get("WORKLOADS_JSON", "{}"))
+        day = day or (now.date() - timedelta(days=lag_days)).isoformat()
         result = reconcile_day(
             usage_table=usage_table, ce=ce, day=day, region=region,
             workloads=workloads, service_names=service_names,
         )
-    except ClientError as exc:
-        payload = {"day": day, "error": str(exc)}
+        store_result(usage_table, result, retention_days=retention_days, now=now)
+    except Exception as exc:  # noqa: BLE001 - every failure must raise the alarm
+        # Broad on purpose: this metric is the only failure signal for the
+        # daily run (configuration errors included); the exception re-raises.
+        payload = {"day": day, "error": str(exc), "error_type": type(exc).__name__}
         _emit({"ReconciliationFailure": ("Count", 1)}, payload)
         _notify(sns, "[bedrock-spend-controls] RECONCILIATION FAILED", payload)
         raise
-    store_result(usage_table, result, retention_days=retention_days, now=now)
 
     aggregate = result["aggregate"]
     _emit(

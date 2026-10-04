@@ -166,13 +166,32 @@ def _lift(client, users_table_name: str, item: dict, now: datetime) -> bool:
             ]
         )
     except ClientError as exc:
-        if exc.response.get("Error", {}).get("Code") in {
-            "ConditionalCheckFailedException",
-            "TransactionCanceledException",
-        }:
+        if _is_conditional_race(exc):
             return False
         raise
     return True
+
+
+def _is_conditional_race(exc: ClientError) -> bool:
+    """True only when the transaction lost a genuine conditional check.
+
+    ``TransactionCanceledException`` also covers throttling, validation and
+    transaction conflicts; those are failures to alert on, not races. The
+    per-item ``CancellationReasons`` tell them apart (``None`` marks items
+    that did not fail). Older responses without the list fall back to the
+    message, which names the reasons in the same words.
+    """
+    error = exc.response.get("Error", {})
+    code = error.get("Code")
+    if code == "ConditionalCheckFailedException":
+        return True
+    if code != "TransactionCanceledException":
+        return False
+    reasons = exc.response.get("CancellationReasons") or []
+    codes = {str(reason.get("Code", "None")) for reason in reasons} - {"None"}
+    if codes:
+        return codes == {"ConditionalCheckFailed"}
+    return "ConditionalCheckFailed" in str(error.get("Message", ""))
 
 
 def _record_state(users_table, summary: dict) -> None:
@@ -255,12 +274,22 @@ def handler(
         "failures": [],
     }
     failures: list[dict] = []
-    for item in _blocked_users(users_table):
+    try:
+        candidates = _blocked_users(users_table)
+    except ClientError as exc:
+        # The scan is the one step with nothing to isolate per row; report
+        # it the same way so the alarm fires instead of a silent Lambda error.
+        candidates = []
+        failures.append({"user_id": "<scan>", "error": str(exc)})
+    for item in candidates:
         user_id = str(item["user_id"])
         result["evaluated"] += 1
         if not automatic_owned(item):
             result["admin_blocked"] += 1
             continue
+        # Broad on purpose: a malformed row (bad limits, non-numeric usage)
+        # raises ValueError/TypeError/KeyError out of over_budget and must not
+        # stop the sweep for every row after it.
         try:
             if over_budget(usage_table, item, now, warn_threshold=warn_threshold):
                 result["still_blocked"] += 1
@@ -274,7 +303,7 @@ def handler(
                 result["lifted_users"].append(user_id)
             else:
                 result["raced"] += 1
-        except ClientError as exc:
+        except Exception as exc:  # noqa: BLE001 - isolate rows, re-raised below
             failures.append({"user_id": user_id, "error": str(exc)})
 
     result["failures"] = failures

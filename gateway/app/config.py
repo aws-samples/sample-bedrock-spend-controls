@@ -33,8 +33,10 @@ class Settings:
     # --- JWT auth (bring your own IdP) ---
     # Expected token issuer, e.g. https://cognito-idp.us-east-1.amazonaws.com/<pool-id>
     jwt_issuer: str = field(default_factory=lambda: _env("JWT_ISSUER", ""))
-    # Expected audience(s), comma-separated (e.g. app client ids). A token
-    # matching any listed audience is accepted. Empty = not enforced.
+    # Expected audience(s), comma-separated (e.g. app client ids). The first
+    # entry is the data-plane audience and the only one /v1/credentials
+    # accepts; later entries (the admin console's public client id) are
+    # accepted on /admin/* only. Empty = not enforced.
     jwt_audience: str = field(default_factory=lambda: _env("JWT_AUDIENCE", ""))
     # JWKS URL; resolved from the issuer's OIDC discovery document if empty.
     jwt_jwks_url: str = field(default_factory=lambda: _env("JWT_JWKS_URL", ""))

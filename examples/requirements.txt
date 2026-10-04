@@ -1,0 +1,6 @@
+# Runtime dependencies of examples/refreshable_bedrock.py and
+# examples/sigv4_gateway.py (the client library and the admin CLI).
+# Pinned to the versions the gateway and the test suite use.
+boto3==1.43.47
+botocore==1.43.47
+httpx==0.28.1

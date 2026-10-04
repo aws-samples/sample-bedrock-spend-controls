@@ -5,9 +5,12 @@ import pytest
 
 from app.quota import (
     MICRO,
+    EmergencyVersionConflict,
     LeaseRateLimited,
     QuotaStore,
     current_window,
+    model_ledger_subject,
+    validate_user_id,
 )
 
 
@@ -50,6 +53,27 @@ def _admin_set_limits(
         idempotency_key=f"{user_id}-limits-{version}",
         request_hash="h",
     )
+
+
+@pytest.mark.parametrize(
+    "user_id",
+    ["bob#model#anthropic.claude-haiku", "#bob", "bob#", "a#b"],
+)
+def test_user_ids_containing_hash_are_rejected(user_id):
+    """'#' is the ledger key separator: ``bob#model#<m>`` is exactly where
+    bob's per-model ledger lives, so a subject with that identity would
+    read and write another subject's rows."""
+    assert "#" in model_ledger_subject("bob", "m")
+    with pytest.raises(ValueError, match="'#'"):
+        validate_user_id(user_id)
+
+
+@pytest.mark.parametrize(
+    "user_id",
+    ["tenant/alice", "alice@example.com", "tenant:alice", "arn:aws:sts::1:assumed-role/r/s"],
+)
+def test_path_email_and_tenant_style_user_ids_stay_valid(user_id):
+    assert validate_user_id(user_id) == user_id
 
 
 def test_get_or_provision_creates_defaults_without_resetting_existing(
@@ -316,6 +340,63 @@ def test_emergency_stop_state_keeps_vending_closed_through_recovery(
     store.mark_emergency_applied(active=False, now=now + timedelta(seconds=3))
     assert not store.emergency_stop_active()
     assert store.list_users() == []
+
+
+def test_emergency_desired_write_is_conditional_on_the_observed_generation(
+    fake_dynamodb, monkeypatch
+):
+    """Activate racing recover: the second writer's read is stale, so its
+    unconditional put used to overwrite the first. Now it fails closed with
+    the state the winner wrote."""
+    now = datetime(2030, 1, 1, tzinfo=timezone.utc)
+    store = QuotaStore(dynamodb=fake_dynamodb)
+    store.set_emergency_desired(
+        active=True, actor="operator-a", reason="incident", now=now
+    )
+    real_read = store.get_emergency_state
+    stale = {
+        "state": "inactive",
+        "desired_active": False,
+        "generation": 0,
+        "actor": "",
+        "reason": "",
+    }
+    reads = iter([stale])
+    monkeypatch.setattr(
+        store, "get_emergency_state", lambda: next(reads, None) or real_read()
+    )
+
+    with pytest.raises(EmergencyVersionConflict) as conflict:
+        store.set_emergency_desired(
+            active=False,
+            actor="operator-b",
+            reason="false alarm",
+            now=now + timedelta(seconds=1),
+        )
+    assert conflict.value.current["generation"] == 1
+    assert conflict.value.current["state"] == "activating"
+    # The winner's request is intact and vending stays closed.
+    state = real_read()
+    assert state["actor"] == "operator-a"
+    assert state["desired_active"] is True
+    assert store.emergency_stop_active()
+
+    # Non-zero generations are guarded the same way (generation = :expected):
+    # a reader that observed generation 1 after generation 2 was written.
+    store.mark_emergency_applied(active=True, generation=1, now=now)
+    store.set_emergency_desired(
+        active=False, actor="operator-b", reason="done", now=now + timedelta(seconds=2)
+    )
+    assert real_read()["generation"] == 2
+    reads = iter(
+        [{**stale, "generation": 1, "state": "active", "desired_active": True}]
+    )
+    with pytest.raises(EmergencyVersionConflict) as late:
+        store.set_emergency_desired(
+            active=True, actor="operator-c", reason="again", now=now + timedelta(seconds=3)
+        )
+    assert late.value.current["generation"] == 2
+    assert real_read()["actor"] == "operator-b"
 
 
 def test_emergency_state_normalizes_dynamodb_decimals(fake_dynamodb):

@@ -5,7 +5,8 @@
 DynamoDB stream (`LATEST`, `batch_size=100`, 5 s batching window, bisect on
 error, 10 retries, DLQ `EnforcementDispatchDeadLetterQueue`), filtered to
 keys with prefix `REVOCATION#` or `workload:`. 128 MB, 30 s timeout,
-reserved concurrency 1.
+reserved concurrency 1 (unless `reserve_enforcement_concurrency` is
+`false`).
 
 ## What it does
 
@@ -33,6 +34,7 @@ and no per-record content — downstream processors re-scan DynamoDB.
 
 | Symptom | Alarm | Notes |
 |---|---|---|
+| `Invoke` raises | [enforcement-dispatcher-errors](../alarms/enforcement-dispatcher-errors.md) | Invoke denied or downstream unavailable; the batch is retried, then dead-lettered. |
 | Batch exhausted retries | [enforcement-dispatch-dlq](../alarms/enforcement-dispatch-dlq.md) | Invoke denied or downstream unavailable. Enforcement converges via schedules. |
 | Falling behind | [enforcement-dispatch-iterator-age](../alarms/enforcement-dispatch-iterator-age.md) | Slow `Invoke`, disabled mapping, or write burst. |
 

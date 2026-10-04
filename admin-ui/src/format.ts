@@ -16,9 +16,13 @@ const TWO_DECIMALS = new Intl.NumberFormat(GROUPING_LOCALE, { maximumFractionDig
 
 /** `$1,234.56`: USD with exactly two decimals. Sub-cent amounts round to
  *  `$0.00`; the ledger keeps micro-dollar precision, the console does not
- *  show it. */
+ *  show it. Negative amounts (reconciliation deltas) read `-$1.23`, with the
+ *  sign ahead of the currency symbol. */
 export function formatUsd(value: number): string {
-  return `$${MONEY.format(value)}`;
+  const formatted = MONEY.format(Math.abs(value));
+  // A value that rounds to zero carries no sign: "-$0.00" is noise.
+  const negative = value < 0 && formatted !== MONEY.format(0);
+  return `${negative ? "-" : ""}$${formatted}`;
 }
 
 /** `1,234`: integer with thousands grouping. Non-integers are rounded. */
@@ -32,15 +36,30 @@ export function formatDecimal(value: number): string {
   return TWO_DECIMALS.format(value);
 }
 
-/** `21.6M`: abbreviated token counts. Below 1,000 the plain integer. */
+/** `21.6M`: abbreviated token counts. Below 1,000 the plain integer. A value
+ *  that would round up to a thousand of its unit rolls over to the next one
+ *  (999,950 reads `1M`, never `1,000K`). */
 export function formatCompact(value: number): string {
   const magnitude = Math.abs(value);
   if (magnitude < 1_000) return INTEGER.format(value);
   const units: Array<[number, string]> = [[1e12, "T"], [1e9, "B"], [1e6, "M"], [1e3, "K"]];
-  for (const [size, suffix] of units) {
-    if (magnitude >= size) return `${ONE_DECIMAL.format(value / size)}${suffix}`;
-  }
-  return INTEGER.format(value);
+  let index = units.findIndex(([size]) => magnitude >= size);
+  // Decide on the figure that would be printed (one decimal), not the raw
+  // magnitude: 999,950 is "1,000.0K" at one decimal, so it moves up to "1M".
+  if (index > 0 && Math.round((magnitude / units[index][0]) * 10) / 10 >= 1_000) index -= 1;
+  const [size, suffix] = units[index];
+  return `${ONE_DECIMAL.format(value / size)}${suffix}`;
+}
+
+/** `2026-09-03 00:00 UTC`: calendar-window boundaries and ledger times. The
+ *  broker's windows are UTC calendar periods, so these are shown in UTC with
+ *  an explicit suffix rather than silently converted to the browser zone. */
+export function formatUtcTimestamp(value: string | null | undefined): string {
+  if (!value) return "Not available";
+  const timestamp = new Date(value);
+  if (Number.isNaN(timestamp.getTime())) return "Invalid timestamp";
+  const iso = timestamp.toISOString();
+  return `${iso.slice(0, 10)} ${iso.slice(11, 16)} UTC`;
 }
 
 /** `+1.90%` / `-12.00%`, always within +/-100 %; `null` means neither the

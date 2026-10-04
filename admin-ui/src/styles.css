@@ -2757,6 +2757,19 @@ tbody tr:hover {
 .highest-warning { color: #9a6700; }
 .highest-critical { color: var(--red); }
 
+/* Spend-undercount warning: a usage row with requests the pricing catalog
+   could not fully price. Sits under the identity in tables, inline elsewhere. */
+.unpriced-badge {
+  margin-top: 4px;
+  font-size: 10.5px;
+}
+
+.unpriced-count {
+  color: #9a6700;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+}
+
 .quota-limit-matrix,
 .detail-periods {
   display: grid;

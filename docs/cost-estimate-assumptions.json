@@ -40,7 +40,7 @@
       "emf_bytes": 900,
       "distinct_models": 5,
       "operational_metrics": 40,
-      "alarms": 8,
+      "alarms": 15,
       "dashboards_free_tier": true,
       "admin_ui_page_loads_per_month": 300,
       "gmd_metrics_per_page_load": 60,
@@ -70,11 +70,11 @@
       "emf_bytes": 900,
       "distinct_models": 12,
       "operational_metrics": 40,
-      "alarms": 10,
+      "alarms": 20,
       "dashboards_free_tier": true,
       "admin_ui_page_loads_per_month": 3000,
       "gmd_metrics_per_page_load": 60,
-      "admin_ui": true,
+      "admin_ui": false,
       "workloads": 3,
       "reconciliation_enabled": true
     }

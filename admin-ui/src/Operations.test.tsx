@@ -1,7 +1,7 @@
 import { render, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { AutoBlockSweepCard, EmergencyStopCard, EnforcementDialCard, OperationsView, SpendReconciliationCard, leaseWindowLabel, reconciliationTone } from "./Operations";
+import { AutoBlockSweepCard, EmergencyStopCard, EnforcementDialCard, OperationsView, SpendReconciliationCard, emergencySettled, humanizeAlarmKey, leaseWindowLabel, reconciliationTone } from "./Operations";
 import { ApiError, api, type AutoBlockSweep, type EnforcementConfig, type Operations, type ReconciliationResponse } from "./api";
 import type { Session } from "./auth";
 import type { AdminConfig } from "./config";
@@ -200,6 +200,121 @@ describe("enforcement dial", () => {
 });
 
 describe("emergency stop", () => {
+  // The card polls GET /admin/emergency-stop after a request and reads it as
+  // a fallback when the operations payload is missing; keep that deterministic.
+  beforeEach(() => {
+    vi.spyOn(api, "getEmergencyStop").mockResolvedValue({ state: "inactive", desired_active: false, generation: 0 });
+  });
+
+  it("classifies in-flight and settled states", () => {
+    expect(emergencySettled("active")).toBe(true);
+    expect(emergencySettled("inactive")).toBe(true);
+    expect(emergencySettled("activating")).toBe(false);
+    expect(emergencySettled("recovering")).toBe(false);
+  });
+
+  it("polls the raw state after a request until it settles and updates the card", async () => {
+    const actor = userEvent.setup();
+    vi.spyOn(api, "setEmergencyStop").mockResolvedValue({ state: "activating", desired_active: true, generation: 1, requested_at: "2026-09-09T10:06:00Z" });
+    const get = vi.spyOn(api, "getEmergencyStop")
+      .mockResolvedValueOnce({ state: "activating", desired_active: true, generation: 1 })
+      .mockResolvedValueOnce({ state: "active", desired_active: true, generation: 1 });
+    const onApplied = vi.fn();
+    render(<EmergencyStopCard cfg={cfg} emergency={operations.emergency} onApplied={onApplied} pollIntervalMs={10} session={session} />);
+
+    await actor.click(screen.getByRole("button", { name: "Activate emergency stop" }));
+    const dialog = screen.getByRole("dialog", { name: "Activate emergency stop" });
+    await actor.type(within(dialog).getByLabelText("Emergency key"), "break-glass-secret");
+    await actor.type(within(dialog).getByLabelText("Confirmation phrase"), "STOP_ALL_BEDROCK_SESSIONS");
+    await actor.type(within(dialog).getByLabelText("Emergency reason"), "incident 4711");
+    await actor.click(within(dialog).getByRole("button", { name: "Stop all sessions" }));
+
+    // The acknowledgement is shown at once, then the poll takes over.
+    expect(await screen.findByText(/re-checks the state every 0 seconds/)).toBeInTheDocument();
+    expect(screen.getByRole("status", { name: "Emergency stop state" })).toHaveTextContent(/activating · checking every few seconds/);
+    expect(screen.getByRole("button", { name: "Recover from emergency stop" })).toBeInTheDocument();
+
+    expect(await screen.findByText(/Emergency stop is active/)).toBeInTheDocument();
+    expect(screen.getByRole("status", { name: "Emergency stop state" })).toHaveTextContent(/^active$/);
+    expect(screen.getByRole("status", { name: "Emergency stop state" })).toHaveClass("ops-status-red");
+    expect(get).toHaveBeenCalledTimes(2);
+    // Once on request, once on convergence so the operations panel refreshes.
+    expect(onApplied).toHaveBeenCalledTimes(2);
+  });
+
+  it("stops polling at the cap and says the state has not settled", async () => {
+    const actor = userEvent.setup();
+    vi.spyOn(api, "setEmergencyStop").mockResolvedValue({ state: "recovering", desired_active: false, generation: 2 });
+    vi.spyOn(api, "getEmergencyStop").mockResolvedValue({ state: "recovering", desired_active: false, generation: 2 });
+    render(
+      <EmergencyStopCard
+        cfg={cfg}
+        emergency={{ ...operations.emergency, state: "active", desired_active: true, generation: 1, applied_generation: 1 }}
+        onApplied={vi.fn()}
+        pollIntervalMs={5}
+        pollMaxMs={20}
+        session={session}
+      />,
+    );
+
+    await actor.click(screen.getByRole("button", { name: "Recover from emergency stop" }));
+    const dialog = screen.getByRole("dialog", { name: "Recover from emergency stop" });
+    await actor.type(within(dialog).getByLabelText("Emergency key"), "break-glass-secret");
+    await actor.type(within(dialog).getByLabelText("Confirmation phrase"), "RESTORE_ALL_BEDROCK_SESSIONS");
+    await actor.type(within(dialog).getByLabelText("Emergency reason"), "all clear");
+    await actor.click(within(dialog).getByRole("button", { name: "Restore sessions" }));
+
+    expect(await screen.findByRole("alert")).toHaveTextContent(/has not settled after 0 minutes/);
+    expect(screen.getByRole("status", { name: "Emergency stop state" })).toHaveTextContent(/^recovering$/);
+    expect(screen.getByRole("status", { name: "Emergency stop state" })).toHaveClass("ops-status-amber");
+  });
+
+  it("falls back to the raw state so the buttons work without the operations payload", async () => {
+    const actor = userEvent.setup();
+    vi.spyOn(api, "getEmergencyStop").mockResolvedValue({ state: "active", desired_active: true, generation: 3, requested_at: "2026-09-09T10:00:00Z" });
+    render(<EmergencyStopCard cfg={cfg} emergency={null} onApplied={vi.fn()} session={session} />);
+
+    const recover = await screen.findByRole("button", { name: "Recover from emergency stop" });
+    expect(recover).toBeEnabled();
+    expect(screen.getByRole("status", { name: "Emergency stop state" })).toHaveTextContent("active");
+    expect(screen.getByText("Direct read; operational telemetry is unavailable")).toBeInTheDocument();
+    await actor.click(recover);
+    expect(screen.getByRole("dialog", { name: "Recover from emergency stop" })).toBeInTheDocument();
+  });
+
+  it("disables the buttons only when neither source can be read", async () => {
+    vi.spyOn(api, "getEmergencyStop").mockRejectedValue(new ApiError("Unavailable", 503, "service_unavailable"));
+    render(<EmergencyStopCard cfg={cfg} emergency={null} onApplied={vi.fn()} session={session} />);
+
+    expect(await screen.findByRole("alert")).toHaveTextContent(/Emergency state unavailable/);
+    expect(screen.getByRole("button", { name: "Activate emergency stop" })).toBeDisabled();
+    expect(screen.getByRole("status", { name: "Emergency stop state" })).toHaveTextContent("unknown");
+  });
+
+  it("keeps the key out of autofill and clears it from the form on submit", async () => {
+    const actor = userEvent.setup();
+    vi.spyOn(api, "setEmergencyStop").mockRejectedValue(new ApiError("Break-glass emergency authorization required.", 403, "forbidden"));
+    render(<EmergencyStopCard cfg={cfg} emergency={operations.emergency} onApplied={vi.fn()} session={session} />);
+
+    await actor.click(screen.getByRole("button", { name: "Activate emergency stop" }));
+    const dialog = screen.getByRole("dialog", { name: "Activate emergency stop" });
+    const key = within(dialog).getByLabelText("Emergency key");
+    expect(key).toHaveAttribute("autocomplete", "new-password");
+    expect(key).toHaveAttribute("type", "password");
+    expect(within(dialog).getByText(/Used for this action only/)).toHaveTextContent(/never stored/);
+
+    await actor.type(key, "wrong-key");
+    await actor.type(within(dialog).getByLabelText("Confirmation phrase"), "STOP_ALL_BEDROCK_SESSIONS");
+    await actor.type(within(dialog).getByLabelText("Emergency reason"), "incident");
+    await actor.click(within(dialog).getByRole("button", { name: "Stop all sessions" }));
+
+    expect(await within(dialog).findByText(/not authorized/)).toBeInTheDocument();
+    // The rejected key is gone; the operator re-enters it, the phrase and reason stay.
+    expect(key).toHaveValue("");
+    expect(within(dialog).getByLabelText("Confirmation phrase")).toHaveValue("STOP_ALL_BEDROCK_SESSIONS");
+    expect(key).toHaveFocus();
+  });
+
   it("requires the key, the exact phrase, and a reason before stopping all sessions", async () => {
     const actor = userEvent.setup();
     const post = vi.spyOn(api, "setEmergencyStop").mockResolvedValue({
@@ -285,6 +400,41 @@ describe("operations view", () => {
   beforeEach(() => {
     vi.spyOn(api, "leaseSnapshot").mockResolvedValue({ users: [], next_cursor: null });
     vi.spyOn(api, "reconciliation").mockResolvedValue({ enabled: false, runs: [], message: "off" });
+    vi.spyOn(api, "getEmergencyStop").mockResolvedValue({ state: "inactive", desired_active: false, generation: 0 });
+  });
+
+  it("renders every alarm key in the payload with a readable label, including ones it has never seen", async () => {
+    vi.spyOn(api, "getEnforcement").mockResolvedValue(enforcement);
+    expect(humanizeAlarmKey("usage_processor_dlq")).toBe("usage processor DLQ");
+    expect(humanizeAlarmKey("usage_processor_errors")).toBe("usage processor errors");
+    expect(humanizeAlarmKey("gateway_errors")).toBe("gateway errors");
+    expect(humanizeAlarmKey("revocation_iterator_age")).toBe("revocation iterator age");
+
+    render(
+      <OperationsView
+        cfg={cfg}
+        error=""
+        loading={false}
+        onChanged={vi.fn()}
+        operations={{
+          ...operations,
+          alarms: [
+            ...operations.alarms,
+            { key: "usage_processor_dlq", state: "ALARM", updated_at: "2026-09-09T09:30:00Z" },
+            { key: "usage_processor_errors", state: "OK", updated_at: null },
+            { key: "some_future_component_errors", state: "INSUFFICIENT_DATA", updated_at: null },
+          ],
+        }}
+        session={session}
+        stale={false}
+      />,
+    );
+
+    const strip = await screen.findByLabelText("Operational alarms");
+    expect(within(strip).getByText("usage processor DLQ: ALARM")).toHaveClass("ops-status-red");
+    expect(within(strip).getByText("usage processor errors: OK")).toHaveClass("ops-status-green");
+    expect(within(strip).getByText("some future component errors: INSUFFICIENT DATA")).toHaveClass("ops-status-gray");
+    expect(within(strip).getByText("enforcement dispatch DLQ: OK")).toBeInTheDocument();
   });
 
   it("renders controls, health cards, and alarms together", async () => {
@@ -306,7 +456,7 @@ describe("operations view", () => {
     expect(screen.getByText("Emergency stop", { selector: "#emergency-title" })).toBeInTheDocument();
     expect(screen.getByText("Always on · 19 shards")).toBeInTheDocument();
     expect(screen.getByText("5 min · runtime dial")).toBeInTheDocument();
-    expect(within(screen.getByLabelText("Operational alarms")).getByText(/enforcement dispatch dlq/)).toBeInTheDocument();
+    expect(within(screen.getByLabelText("Operational alarms")).getByText(/enforcement dispatch DLQ/)).toBeInTheDocument();
   });
 
   it("shows live leases on the operations panel", async () => {
@@ -357,7 +507,7 @@ describe("operations view", () => {
     expect(await within(leases).findByText(/Lease Holder · granted/)).toBeInTheDocument();
   });
 
-  it("keeps the controls reachable when operational telemetry is unavailable", async () => {
+  it("keeps the controls usable when operational telemetry is unavailable", async () => {
     vi.spyOn(api, "getEnforcement").mockResolvedValue(enforcement);
     render(
       <OperationsView
@@ -373,7 +523,10 @@ describe("operations view", () => {
 
     expect(screen.getByText("Operations unavailable")).toBeInTheDocument();
     expect(await screen.findByRole("radiogroup", { name: "Permission lease window" })).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Activate emergency stop" })).toBeDisabled();
+    // The emergency card reads GET /admin/emergency-stop directly instead of
+    // going dark with the CloudWatch-backed operations payload.
+    expect(await screen.findByText("Direct read; operational telemetry is unavailable")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Activate emergency stop" })).toBeEnabled();
   });
 });
 

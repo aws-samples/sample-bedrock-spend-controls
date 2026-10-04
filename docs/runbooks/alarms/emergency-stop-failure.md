@@ -1,6 +1,6 @@
 # EmergencyStopFailureAlarm
 
-**Operations key:** `emergency_failure` · **Metric:** `EmergencyStopFailure` (Sum ≥ 1 over 5 min, 1 period) · **Emitted by:** `emergency_processor/handler.py` `_emit("EmergencyStopFailure", ...)` in the `except` at the bottom of `handler()`.
+**Operations key:** `emergency_failure` · **Alarm name:** `<stack>-emergency-failure` · **Metric:** `EmergencyStopFailure` (Sum ≥ 1 over 5 min, 1 period) · **Emitted by:** `emergency_processor/handler.py` `_emit("EmergencyStopFailure", ...)` in the `except` at the bottom of `handler()`.
 
 ## What it means
 
@@ -37,10 +37,9 @@ so a single alarm evaluation may self-heal — check the state before acting.
    ```
    The payload's `error` field carries the boto3 message (`AccessDenied`,
    `LimitExceeded`, `Throttling`).
-2. **Five policy versions with no removable one** (`RuntimeError: emergency
-   policy has no removable version`). Should not happen — the processor
-   deletes the oldest non-default version first — but a manually set default
-   version can leave four non-default versions that are all newer. Inspect:
+2. **Policy-version housekeeping fails.** The processor deletes the oldest
+   non-default version before writing when five exist; `DeleteConflict` or
+   `AccessDenied` on `DeletePolicyVersion` lands here. Inspect:
    ```bash
    aws iam list-policy-versions --policy-arn "$(aws cloudformation describe-stacks --stack-name BedrockSpendControls --query "Stacks[0].Outputs[?OutputKey=='EmergencyDenyPolicyArn'].OutputValue | [0]" --output text)"
    ```
@@ -97,4 +96,5 @@ so a single alarm evaluation may self-heal — check the state before acting.
 
 - [emergency-stop-dlq.md](emergency-stop-dlq.md)
 - Component: [components/emergency-processor.md](../components/emergency-processor.md)
-- Metrics: `EmergencyStopActivated`, `EmergencyStopRecovered`, `EmergencyStopFailure`
+- [emergency-stop-processor-errors.md](emergency-stop-processor-errors.md)
+- Metrics (no dimensions): `EmergencyStopActivated`, `EmergencyStopRecovered`, `EmergencyStopFailure`
