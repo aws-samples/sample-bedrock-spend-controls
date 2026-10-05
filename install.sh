@@ -607,7 +607,11 @@ end_phase OK
 
 # 5. diff
 begin_phase diff
+# A stack left in ROLLBACK_COMPLETE by a failed create goes first: diffing
+# against it would only describe resources that are about to be deleted.
+if [ "$DRY_RUN" != 1 ]; then recover_failed_stack; fi
 if [ "$DRY_RUN" = 1 ]; then
+  say "(dry run) would delete a stack left in ROLLBACK_COMPLETE by a failed create, after asking"
   show aws cloudformation describe-stacks --stack-name "$STACK_NAME"
   say "(dry run) when the stack already exists:"
   run_in "$ROOT/cdk" npx cdk diff "${CDK_CONTEXT[@]}"
@@ -625,10 +629,8 @@ fi
 # 6. deploy
 begin_phase deploy
 if [ "$DRY_RUN" = 1 ]; then
-  say "(dry run) would delete a stack left in ROLLBACK_COMPLETE by a failed create, and an orphaned"
-  say "(dry run) /bedrock/spend-controls/model-invocations log group, after asking"
+  say "(dry run) would delete an orphaned /bedrock/spend-controls/model-invocations log group, after asking"
 else
-  recover_failed_stack
   remove_orphaned_log_group
 fi
 run_in "$ROOT/cdk" npx cdk deploy --require-approval never "${CDK_CONTEXT[@]}"

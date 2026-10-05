@@ -87,14 +87,80 @@ the seven trust boundaries used by the threat model, rendered as
 
 - An AWS account with Amazon Bedrock model access in the target Region.
 - AWS CLI with an authorized profile; permission to bootstrap and deploy CDK.
-- Node.js and npm (CDK CLI and the admin console build).
+- Node.js 20 or later and npm (CDK CLI and the admin console build).
 - Python 3.12 or later on the deploy host with `pip3` available. The broker
   is bundled on the host with pinned manylinux wheels; Docker or Finch is
   used only as an automatic fallback (`CDK_DOCKER=finch` for Finch).
 - For the integration library in your application: Python 3.10 or later
   with the pinned `boto3` and `httpx` from `examples/requirements.txt`.
 
-## Quick deploy (demo)
+## Choose your path
+
+| Route | Time | For | Start with |
+|---|---|---|---|
+| **Try it** | about 25 minutes | A demo or sandbox account you own: stack-created Cognito, hosted console, `$1/day` default quota | The **Launch Stack** link or the `install.sh` one-liner below |
+| **Production** | 1 to 3 days | A shared account with your OIDC IdP, centrally managed invocation logging, exact model ARNs, and an SCP | `python setup.py --profile-template production`, then `install.sh --config` or your own pipeline |
+| **Manual** | the same install, step by step | Reviewing every command before it runs, or adapting the steps to your tooling | The command block below and [DEPLOYMENT.md](DEPLOYMENT.md) |
+
+### Try it (about 25 minutes, demo account)
+
+**[Launch Stack](https://console.aws.amazon.com/cloudformation/home?region=us-east-1#/stacks/create/review?templateURL=https://raw.githubusercontent.com/aws-samples/sample-bedrock-spend-controls/main/deploy/installer.yaml&stackName=bedrock-spend-controls-installer)**
+opens the CloudFormation console in `us-east-1` with
+[`deploy/installer.yaml`](deploy/installer.yaml): enter the alert address,
+select `yes` for the logging acknowledgement, and create the stack. It
+starts a CodeBuild job that clones this repository and runs `install.sh`;
+the stack completes within a minute and the install takes 15 to 25 more
+(watch it with the stack's `WatchCommand` output). Change `region=` in the
+URL for another Region.
+
+Or, from CloudShell or a terminal with Node.js 20 or later, Python 3.12 or
+later, and the AWS CLI:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/aws-samples/sample-bedrock-spend-controls/main/install.sh \
+  | bash -s -- --alert-email you@example.com --acknowledge-logging-overwrite
+```
+
+Both do the same thing to the account: they run preflight checks that stop
+on anything that would fail the deploy, then deploy the
+`BedrockSpendControls` stack with `cdk/config/demo.json`. That configuration
+**overwrites the Region's Bedrock model invocation logging configuration**
+(metadata only, no payloads; the previous destination is not restored on
+destroy), creates a Cognito user pool with the administrator `quota-admin`,
+whose temporary password Cognito emails to the address you give
+(`--admin-email`; default: the alert address), hosts the admin console on
+CloudFront, auto-provisions quota users with a `$1/day` default, and ends
+with a smoke test that makes one small Bedrock call. Use a personal or
+sandbox account. Reference for both tools: [docs/installer.md](docs/installer.md).
+
+### Production (1 to 3 days, shared account, your IdP)
+
+```bash
+python3 -m venv .venv && .venv/bin/pip install -r requirements-dev.txt
+.venv/bin/python setup.py --profile-template production --profile your-profile --region us-east-1
+```
+
+The wizard asks for every deployment key, validates each answer exactly as
+`cdk synth` would, checks it against the account (issuer discovery, model
+access, the existing logging configuration, Lambda concurrency), writes
+`cdk/config/production.local.json`, and prints the tasks other teams must do
+(the console redirect URI, the token claims, the bypass-prevention SCP
+filled in). Deploy with `./install.sh --config cdk/config/production.local.json`
+or `setup.py --deploy`, or hand the file to your pipeline; `--save-answers`
+and `--answers FILE --yes` repeat the install in another account. Bring:
+
+- your OIDC issuer URL and audience, the claim that identifies the quota
+  subject, and, for the console, a public (no-secret) SPA client;
+- the central log group that already receives Bedrock invocation logs in
+  the Region (the stack adds a subscription filter instead of taking over
+  the Region's logging configuration);
+- the exact foundation-model and inference-profile ARNs users may invoke;
+- an SCP (or the stack's `DenyDirectBedrockPolicyArn`) so that no other
+  principal can call Bedrock directly.
+
+Steps and decisions: [DEPLOYMENT.md](DEPLOYMENT.md#production--shared-account).
+
+### Manual
 
 The demo configuration creates its own Cognito user pool, manages invocation
 logging for the Region, hosts the admin console, and auto-provisions users
@@ -121,9 +187,10 @@ npx cdk deploy -c deployment_config=config/demo.json -c alert_email=you@example.
 ```
 
 Then follow [DEPLOYMENT.md](DEPLOYMENT.md) to read the outputs, create the
-demo administrator, and run the smoke tests. The same guide covers the
-production path: your IdP, centrally managed logging, exact model ARNs, and
-the SCP that prevents bypass.
+demo administrator (or add `-c admin_email=you@example.com` to the two
+commands and let the stack create it), and run the smoke tests. The same
+guide covers the production path: your IdP, centrally managed logging,
+exact model ARNs, and the SCP that prevents bypass.
 
 ## Integrate your application
 
@@ -313,7 +380,7 @@ strict accounting matters. The `bedrock-mantle` endpoint is a separate IAM
 prefix that vended sessions cannot reach, but any other principal with
 `bedrock-mantle:*` spends unmetered; the SCP example denies both prefixes.
 
-The STRIDE review of the seven trust boundaries, with 31 threats, mitigations,
+The STRIDE review of the seven trust boundaries, with 33 threats, mitigations,
 and code references, is [docs/threat-model.md](docs/threat-model.md)
 ([Threat Composer export](docs/threat-model.tc.json)). Account and
 organization administrators can still change IAM and SCPs; the sample cannot
@@ -322,10 +389,14 @@ constrain the management plane.
 ## Clean up
 
 ```bash
-cd cdk
-npx cdk destroy -c deployment_config=config/demo.json
+./install.sh --destroy --region us-east-1      # or, by hand:
+(cd cdk && npx cdk destroy -c deployment_config=config/demo.json)
 ```
 
+`install.sh --destroy` is the supported teardown: it runs `cdk destroy`
+after a confirmation, removes `.install-outputs.env`, and lists what is
+retained with the commands that remove each item
+([docs/installer.md](docs/installer.md#--destroy)).
 With `retain_tables_on_delete: true` (set in `config/production.json`; the
 code default is `false`) the DynamoDB tables survive deletion and carry
 deletion protection while the stack exists. Point-in-time recovery is on
@@ -341,6 +412,9 @@ only through an explicit data-retention decision.
 
 | Path | Purpose |
 |---|---|
+| `install.sh` | One-command installer: preflight, build, `cdk bootstrap`, synth, diff, deploy, outputs, smoke test; `--destroy` to tear down ([docs/installer.md](docs/installer.md)) |
+| `setup.py` | Configuration wizard: validated questions with live account checks, writes `cdk/config/<name>.local.json`; `--deploy` hands over to `install.sh` |
+| `deploy/` | `installer.yaml`, the one-click CloudFormation installer (a CodeBuild project runs `install.sh`), and its README |
 | `cdk/` | CDK app, validated deployment configuration, price catalog, and the deploy-time price resolver |
 | `gateway/` | Broker and admin API (FastAPI on Lambda Web Adapter) |
 | `usage_processor/` | Invocation-log subscription consumer: pricing, ledger, warnings, blocks |
@@ -354,10 +428,13 @@ only through an explicit data-retention decision.
 | `admin-ui/` | Static React admin console |
 | `examples/` | `refreshable_bedrock.py` (the `BedrockSpendControls` client factory and credential provider) and `sigv4_gateway.py` (admin CLI) |
 | `qualification/` | Guarded probes to measure enforcement latency in your own account, and the evidence template |
+| `tools/preflight/` | Read-only pre-deployment checks (toolchain, credentials, bootstrap, model access, logging ownership, concurrency, IdP, Region support) shared by `install.sh`, the one-click installer, and the wizard |
+| `tools/wizard/` | Implementation of `setup.py` |
+| `tools/smoke_test.py` | Non-interactive end-to-end smoke test of a deployed stack (vend, one Bedrock call, ledger) |
 | `tools/` | Price-catalog export, unpriced-usage report, cost estimate, threat-model export, diagram rendering |
 | `assets/` | Architecture and data-flow diagrams (draw.io source and PNG renders), admin console screenshots |
-| `docs/` | Quotas, pricing, configuration, operations, admin API, integration guide, runbooks, threat model, cost estimate |
-| `tests/` | Unit, API, infrastructure, probe, pricing, and threat-model consistency tests |
+| `docs/` | Quotas, pricing, configuration, installer reference, operations, admin API, integration guide, runbooks, threat model, cost estimate |
+| `tests/` | Unit, API, infrastructure, probe, pricing, installer (preflight, wizard, `install.sh`, template), and threat-model consistency tests |
 
 ## Running the tests
 
@@ -369,6 +446,10 @@ python3 -m venv .venv && .venv/bin/pip install -r requirements-dev.txt
   npx cdk synth --app "python app.py" -c deployment_config=config/$c.json --quiet
 done)
 ```
+
+`tests/test_installer_template.py` also lints `deploy/installer.yaml` with
+`cfn-lint` (pinned in `requirements-dev.txt`; the test is skipped when it is
+not installed).
 
 Static analysis (`semgrep` with `p/security-audit`, `p/secrets`, `p/jwt` and
 the language rulesets, `bandit`, `gitleaks`) reports no security findings.

@@ -1,6 +1,6 @@
 {
   "title": "Bedrock Spend Controls threat model",
-  "reviewed": "2026-10-04",
+  "reviewed": "2026-10-05",
   "method": "STRIDE per trust boundary",
   "asset": "The Bedrock bill, bounded per identity, tenant, or workload; correct usage attribution; enforcement within the documented bound (metering lag + min(lease remainder, deny propagation)); authorized and audited administration. Prompt confidentiality is out of scope: the broker never sees inference traffic and payload delivery is disabled.",
   "status_legend": {
@@ -73,7 +73,8 @@
       "crosses": "Console/CLI with account privileges",
       "implemented_by": [
         "DenyDirectBedrockPolicy (helper)",
-        "DEPLOYMENT.md SCP guidance"
+        "DEPLOYMENT.md SCP guidance",
+        "deploy/installer.yaml BuildRole (single use)"
       ]
     }
   ],
@@ -265,6 +266,14 @@
       "content": "A SESSION# map row cannot be needed after the STS credential it describes has expired (at most 3 600 s), so a usage_retention_days TTL with a 31-day floor only loses attribution for records delivered days late.",
       "linked_threats": [
         "T-15"
+      ]
+    },
+    {
+      "id": "AS-13",
+      "content": "The installer tooling (install.sh, deploy/installer.yaml, setup.py) is fetched from the repository over HTTPS at a reviewed tag or commit and runs with the operator's deploy credentials; the operator extends it the same trust as the CDK app and the pinned npm and pip dependencies the deploy installs.",
+      "linked_threats": [
+        "T-32",
+        "T-33"
       ]
     }
   ],
@@ -484,6 +493,18 @@
       "channel": "SNS subscription (alert_email)",
       "carries": "warnings, blocks, component failures",
       "assets": []
+    },
+    {
+      "id": "DF-20",
+      "source": "Operator",
+      "destination": "Installer stack (deploy/installer.yaml) -> CodeBuild -> cdk bootstrap / cdk deploy",
+      "boundary": "B7",
+      "channel": "CloudFormation create-stack with CAPABILITY_IAM; CodeBuild service role (BuildRole or ExistingBuildRoleArn); git clone of the repository at GitRef",
+      "carries": "the build role's permissions, the install.sh run, stack outputs, and the admin key the smoke test reads",
+      "assets": [
+        "A-6",
+        "A-5"
+      ]
     }
   ],
   "threats": [
@@ -1555,6 +1576,75 @@
       ],
       "residual_risk": "A console label can mislead an admin in an account that is already compromised at the ssm:PutParameter level.",
       "status": "Mitigated"
+    },
+    {
+      "id": "T-32",
+      "boundary": "B7",
+      "stride": [
+        "Elevation of privilege"
+      ],
+      "priority": "Medium",
+      "grammar": {
+        "threat_source": "compromised installer build",
+        "prerequisites": "running in CodeBuild with the installer stack's BuildRole (a malicious GitRef, a tampered repository, or a poisoned npm or pip dependency pulled during the build)",
+        "threat_action": "use the role's bootstrap-scoped CloudFormation, IAM, S3, and SSM permissions and the CDK bootstrap roles it may assume, and read the admin key the smoke test fetches",
+        "threat_impact": "arbitrary resources created in the account through the CDK deploy roles and disclosure of the routine admin key",
+        "impacted_goal": [
+          "integrity",
+          "confidentiality"
+        ],
+        "impacted_assets": [
+          "A-6",
+          "A-5"
+        ]
+      },
+      "title": "Installer CodeBuild role is broad",
+      "description": "deploy/installer.yaml creates a CodeBuild service role that can run cdk bootstrap (cloudformation:* on CDKToolkit, iam:*, s3:*, ecr:* and SSM on the cdk-hnb659fds-* bootstrap names), assume the CDK bootstrap roles that cdk deploy uses, and read BedrockSpendControls* secrets for the smoke test. Whatever runs in the build runs with it.",
+      "mitigation": "Accepted as a single-use role: the deploy itself is performed by the CDK bootstrap roles (the CloudFormation execution role creates the stack); the role's write permissions are scoped to the bootstrap names and its smoke-test grants to BedrockSpendControls-* resources; it trusts codebuild.amazonaws.com only from this account's projects (aws:SourceAccount / aws:SourceArn); the project runs one build at a time; and the role is deleted with the installer stack once the build has succeeded. ExistingBuildRoleArn lets an account supply its own, tighter role, and GitRef pins a reviewed tag.",
+      "code_references": [
+        "deploy/installer.yaml (BuildRole, InstallerProject)",
+        "deploy/README.md (Resources and IAM footprint)"
+      ],
+      "tests": [
+        "tests/test_installer_template.py"
+      ],
+      "residual_risk": "While the installer stack exists, any build started from it runs with these permissions; delete the stack after the install and review the GitRef it clones.",
+      "status": "Accepted"
+    },
+    {
+      "id": "T-33",
+      "boundary": "B7",
+      "stride": [
+        "Tampering",
+        "Elevation of privilege"
+      ],
+      "priority": "Medium",
+      "grammar": {
+        "threat_source": "external actor",
+        "prerequisites": "able to alter the install.sh an operator fetches (a compromised repository branch, a look-alike URL, or an intercepted download) while the operator pipes it into bash with deploy credentials",
+        "threat_action": "execute arbitrary commands on the operator's machine and in the target account with the operator's AWS credentials",
+        "threat_impact": "a tampered deployment, resources created or changed outside the reviewed stack, and exposure of the credentials and admin key the install handles",
+        "impacted_goal": [
+          "integrity",
+          "confidentiality"
+        ],
+        "impacted_assets": [
+          "A-6",
+          "A-5"
+        ]
+      },
+      "title": "curl | bash installation",
+      "description": "The documented one-line install pipes install.sh from raw.githubusercontent.com into bash. The script clones the repository and re-executes itself from the checkout, so what runs is whatever the fetched branch contains at that moment.",
+      "mitigation": "Accepted with the usual precautions, which the documentation states next to the one-liner: pin a release tag (GIT_REF=<tag>, or GitRef in the one-click installer) instead of main, or clone the repository and read install.sh before running it. The script is fetched over HTTPS, prints the commands it runs (+ lines), and asks its questions on the terminal rather than stdin, so a piped script cannot answer its own confirmations; the one-click installer clones from GitHub inside CodeBuild instead of piping. The same trust is already placed in the CDK app and the npm and pip dependencies the deploy installs.",
+      "code_references": [
+        "install.sh (clone and re-exec outside a checkout; confirm reads /dev/tty)",
+        "deploy/installer.yaml (BuildSpec: git clone --branch GitRef)"
+      ],
+      "tests": [
+        "tests/test_install_sh.py"
+      ],
+      "residual_risk": "An unpinned main can change between review and execution; a pinned tag or a read checkout removes that window.",
+      "status": "Accepted"
     }
   ],
   "summary": {
@@ -1591,7 +1681,9 @@
       "T-22",
       "T-24",
       "T-26",
-      "T-27"
+      "T-27",
+      "T-32",
+      "T-33"
     ],
     "Open": []
   },
