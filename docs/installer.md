@@ -240,15 +240,15 @@ demo configuration from the console. The full description of its resources
 and IAM policy is in [deploy/README.md](../deploy/README.md); this is the
 operator's view.
 
-Open it with a Launch Stack URL (replace `<region>`; `<ref>` is a branch or
-tag):
-
-```text
-https://console.aws.amazon.com/cloudformation/home?region=<region>#/stacks/create/review?templateURL=https://raw.githubusercontent.com/aws-samples/sample-bedrock-spend-controls/<ref>/deploy/installer.yaml&stackName=bedrock-spend-controls-installer
-```
-
-or create it with the CLI (`--capabilities CAPABILITY_IAM`). The sample is
-deployed in the Region the installer stack is created in.
+Download the template and upload it in the console: open *Create stack* at
+`https://console.aws.amazon.com/cloudformation/home?region=<region>#/stacks/create/template`,
+choose *Upload a template file*, select `deploy/installer.yaml`, and name the
+stack (for example `bedrock-spend-controls-installer`). CloudFormation reads
+templates only from Amazon S3 or from an uploaded file, so a quick-create
+link cannot point at this repository; the file is 20 KB and has no assets.
+Or create it with the CLI (`--template-body file://deploy/installer.yaml
+--capabilities CAPABILITY_IAM`). The sample is deployed in the Region the
+installer stack is created in.
 
 ### Parameters
 

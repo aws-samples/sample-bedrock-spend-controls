@@ -27,7 +27,7 @@ shared or production account. Reference material lives in `docs/`:
 | Admin console | Hosted, Cognito group `quota-admins` | `admin_ui: true` with `admin_ui_client_id` against your IdP, or not hosted |
 | Direct Bedrock access | Demo deny policy optional | SCP, permissions boundary, or `DenyDirectBedrockPolicyArn` required |
 | Price fallback | Shipped default | Reviewed against the most expensive allowed model |
-| Installation | `install.sh` or the Launch Stack button ([installer reference](docs/installer.md)) | `setup.py` wizard, then `install.sh --config` or your own pipeline |
+| Installation | `install.sh` or the console-uploaded installer template ([installer reference](docs/installer.md)) | `setup.py` wizard, then `install.sh --config` or your own pipeline |
 
 The architectural decision to accept is the enforcement guarantee: the
 sample does not inspect inference requests. Every credential carries an
@@ -72,7 +72,7 @@ deny propagation)`; measure it in your account before relying on a number
 >
 > or, from a checkout, `./install.sh --alert-email you@example.com
 > --acknowledge-logging-overwrite`. Without a terminal at all, the
-> **Launch Stack** link in the [README](README.md#try-it-about-25-minutes-demo-account)
+> installer template described in the [README](README.md#try-it-about-25-minutes-demo-account)
 > runs the same script from CodeBuild. Flags, phases, and troubleshooting:
 > [docs/installer.md](docs/installer.md).
 

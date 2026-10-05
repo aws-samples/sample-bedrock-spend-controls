@@ -759,8 +759,9 @@ def test_template_and_readme_hygiene(text: str):
         assert "AKIA" not in content, name
     # The README documents the contract the template relies on.
     for needle in (
-        "templateURL=https://raw.githubusercontent.com/aws-samples/sample-bedrock-spend-controls/<ref>/deploy/installer.yaml",
-        "stackName=bedrock-spend-controls-installer",
+        "#/stacks/create/template",
+        "Upload a template file",
+        "bedrock-spend-controls-installer",
         "15 minutes",
         "ExistingBuildRoleArn",
         "aws cloudformation delete-stack",

@@ -43,14 +43,12 @@ in its summary table.
 
 ## Launching it
 
-Open the template in the CloudFormation console with a "Launch Stack" URL
-(replace `<region>` and `<ref>`, a branch or tag of the repository):
-
-```text
-https://console.aws.amazon.com/cloudformation/home?region=<region>#/stacks/create/review?templateURL=https://raw.githubusercontent.com/aws-samples/sample-bedrock-spend-controls/<ref>/deploy/installer.yaml&stackName=bedrock-spend-controls-installer
-```
-
-Or download the file and upload it in the console, or use the CLI:
+Download this file and upload it in the CloudFormation console: *Create
+stack* (`https://console.aws.amazon.com/cloudformation/home?region=<region>#/stacks/create/template`),
+*Upload a template file*, then a stack name such as
+`bedrock-spend-controls-installer` and the parameters below. CloudFormation
+accepts templates only from Amazon S3 or as an uploaded file, so no
+quick-create link can point at the repository itself. Or use the CLI:
 
 ```bash
 aws cloudformation create-stack --region us-east-1 \

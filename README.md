@@ -98,20 +98,24 @@ the seven trust boundaries used by the threat model, rendered as
 
 | Route | Time | For | Start with |
 |---|---|---|---|
-| **Try it** | about 25 minutes | A demo or sandbox account you own: stack-created Cognito, hosted console, `$1/day` default quota | The **Launch Stack** link or the `install.sh` one-liner below |
+| **Try it** | about 25 minutes | A demo or sandbox account you own: stack-created Cognito, hosted console, `$1/day` default quota | The console upload or the `install.sh` one-liner below |
 | **Production** | 1 to 3 days | A shared account with your OIDC IdP, centrally managed invocation logging, exact model ARNs, and an SCP | `python setup.py --profile-template production`, then `install.sh --config` or your own pipeline |
 | **Manual** | the same install, step by step | Reviewing every command before it runs, or adapting the steps to your tooling | The command block below and [DEPLOYMENT.md](DEPLOYMENT.md) |
 
 ### Try it (about 25 minutes, demo account)
 
-**[Launch Stack](https://console.aws.amazon.com/cloudformation/home?region=us-east-1#/stacks/create/review?templateURL=https://raw.githubusercontent.com/aws-samples/sample-bedrock-spend-controls/main/deploy/installer.yaml&stackName=bedrock-spend-controls-installer)**
-opens the CloudFormation console in `us-east-1` with
-[`deploy/installer.yaml`](deploy/installer.yaml): enter the alert address,
-select `yes` for the logging acknowledgement, and create the stack. It
-starts a CodeBuild job that clones this repository and runs `install.sh`;
-the stack completes within a minute and the install takes 15 to 25 more
-(watch it with the stack's `WatchCommand` output). Change `region=` in the
-URL for another Region.
+**From the console, without a terminal.** Download
+[`deploy/installer.yaml`](https://raw.githubusercontent.com/aws-samples/sample-bedrock-spend-controls/main/deploy/installer.yaml),
+open **[Create stack](https://console.aws.amazon.com/cloudformation/home?region=us-east-1#/stacks/create/template)**
+in the CloudFormation console (change `region=` in that URL for another
+Region), choose *Upload a template file*, select the downloaded file, and
+enter the alert address, `yes` for the logging acknowledgement, and a stack
+name such as `bedrock-spend-controls-installer`. CloudFormation accepts
+templates only from Amazon S3 or as an uploaded file, so there is no
+one-click link that points at this repository. The stack starts a CodeBuild
+job that clones this repository and runs `install.sh`; the stack completes
+within a minute and the install takes 15 to 25 more (watch it with the
+stack's `WatchCommand` output).
 
 Or, from CloudShell or a terminal with Node.js 20 or later, Python 3.12 or
 later, and the AWS CLI:
