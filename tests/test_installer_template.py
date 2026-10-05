@@ -527,6 +527,12 @@ def test_build_role_is_scoped_to_the_cdk_bootstrap_and_read_only_elsewhere(templ
     assert _as_list(broker["Action"]) == ["lambda:InvokeFunctionUrl"]
     assert _sub_text(broker["Resource"]).endswith(f":function:{STACK_NAME}-*")
     assert broker["Condition"] == {"StringEquals": {"lambda:FunctionUrlAuthType": "AWS_IAM"}}
+    # IAM-authenticated Function URLs also evaluate lambda:InvokeFunction for
+    # the call (the first live smoke test under CodeBuild got 403 without it).
+    via_url = by_sid["SmokeTestBrokerFunction"]
+    assert _as_list(via_url["Action"]) == ["lambda:InvokeFunction"]
+    assert _sub_text(via_url["Resource"]).endswith(f":function:{STACK_NAME}-*")
+    assert via_url["Condition"] == {"Bool": {"lambda:InvokedViaFunctionUrl": "true"}}
 
 
 def test_start_build_role_can_only_start_and_read_the_project(template: dict):

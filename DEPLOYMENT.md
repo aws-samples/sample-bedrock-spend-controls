@@ -20,7 +20,7 @@ shared or production account. Reference material lives in `docs/`:
 | Runtime models | `*` for exploration | Exact model and inference-profile ARNs; exclude models used through unmetered APIs |
 | Invocation logging | Stack managed (`manage_invocation_logging: true`) | Reuse the centrally managed log group (`false` + `invocation_log_group_name`) |
 | Auto-provisioning | Enabled | Disabled |
-| Function URL callers | Account default | Explicit backend and admin role ARNs in `invoker_principal_arns` |
+| Function URL callers | Account default: any principal in the account whose own IAM policy allows `lambda:InvokeFunctionUrl` and `lambda:InvokeFunction` (via Function URL) on the broker | Explicit backend and admin role ARNs in `invoker_principal_arns` (granted by the Function URL's resource policy; nothing to add to their own policies) |
 | Usage retention | 35 days | 90 days (policy-defined, at least 31) |
 | DynamoDB on delete | `DESTROY` | `RETAIN` |
 | Alerts | Personal email | Operations topic or distribution list |

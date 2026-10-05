@@ -111,7 +111,8 @@ resources. Its policy is scoped to those names where AWS allows it:
 - for the smoke test that `install.sh` runs after the deploy:
   `secretsmanager:GetSecretValue` on the admin key secret (`AdminApiKey*`),
   `cognito-idp:AdminCreateUser/AdminSetUserPassword/AdminDeleteUser` on the
-  account's user pools, and `lambda:InvokeFunctionUrl` (IAM auth) on
+  account's user pools, and `lambda:InvokeFunctionUrl` (IAM auth) plus
+  `lambda:InvokeFunction` (only when invoked via the Function URL) on
   functions named `BedrockSpendControls-*`;
 - `logs:CreateLogStream` / `PutLogEvents` on the installer log group;
 - to retry after a failed first create: `cloudformation:DeleteStack` on

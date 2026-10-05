@@ -243,6 +243,17 @@ Resources:
                 Condition:
                   StringEquals:
                     lambda:FunctionUrlAuthType: AWS_IAM
+              # Function URLs with IAM auth check two actions: the URL
+              # invoke above and InvokeFunction "via Function URL" (the
+              # stack's resource policy carries the same pair). Scoped the
+              # same way; the condition keeps this below a plain Invoke.
+              - Sid: SmokeTestBrokerFunction
+                Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource: !Sub arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:BedrockSpendControls-*
+                Condition:
+                  Bool:
+                    lambda:InvokedViaFunctionUrl: "true"
 
   InstallerProject:
     Type: AWS::CodeBuild::Project

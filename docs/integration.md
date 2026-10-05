@@ -379,7 +379,11 @@ under a minute, with no in-flight deadline as a backstop.
 
 **Per-user**
 
-- [ ] Backend role ARN is in `invoker_principal_arns`.
+- [ ] Backend role ARN is in `invoker_principal_arns`. (A demo deployment
+      with the account default instead needs the backend role's own policy to
+      allow `lambda:InvokeFunctionUrl` and `lambda:InvokeFunction` with
+      `lambda:InvokedViaFunctionUrl: true` on the broker function: IAM-authenticated
+      Function URLs evaluate both actions.)
 - [ ] `identity_claim` equals the deployment's `jwt_user_claim`.
 - [ ] One `BedrockSpendControls` per process; `client_for(jwt)` per request,
       called only with tokens your middleware has already verified
