@@ -107,6 +107,10 @@ class Context:
     # ``service`` -> client, or ``"service@region"`` for another Region.
     # Tests pre-populate this with botocore Stubber-wrapped or fake clients.
     client_cache: dict[str, Any] = field(default_factory=dict)
+    # Set by the credentials check when the target Region is an opt-in
+    # Region the account has not enabled; checks that call Regional AWS
+    # endpoints are then skipped instead of failing one by one.
+    region_disabled: bool = False
     _identity: dict[str, str] | None = field(default=None, repr=False)
 
     def clients(self, service: str, *, region: str | None = None) -> Any:

@@ -1,0 +1,440 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  One-click installer for the Bedrock Spend Controls sample. Creates a
+  CodeBuild project that clones the repository and runs install.sh with the
+  demo configuration (preflight, build, cdk bootstrap, cdk deploy, smoke test),
+  then starts one build. Delete this stack once the build has succeeded: the
+  deployed BedrockSpendControls stack is not affected.
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label: { default: Deployment }
+        Parameters: [AlertEmail, AdminEmail, AcknowledgeLoggingOverwrite]
+      - Label: { default: Source }
+        Parameters: [GitRef, RerunToken]
+      - Label: { default: Build environment }
+        Parameters: [ComputeType, ExistingBuildRoleArn]
+    ParameterLabels:
+      AlertEmail: { default: Alert email address }
+      AdminEmail: { default: Console administrator email address }
+      AcknowledgeLoggingOverwrite: { default: Bedrock invocation logging acknowledgement }
+      GitRef: { default: Git branch or tag }
+      RerunToken: { default: Re-run token }
+      ComputeType: { default: CodeBuild compute type }
+      ExistingBuildRoleArn: { default: Existing CodeBuild service role ARN }
+
+Parameters:
+  AlertEmail:
+    Type: String
+    Description: >-
+      Address that receives the SNS quota alerts. AWS Notifications sends a
+      subscription confirmation to it after the deploy.
+    AllowedPattern: '^[^\s@]+@[^\s@]+\.[^\s@]+$'
+    ConstraintDescription: must be one email address (name@domain).
+    MaxLength: 254
+  AdminEmail:
+    Type: String
+    Default: ""
+    Description: >-
+      Address of the console administrator (Cognito user quota-admin); the
+      temporary password is emailed there. Leave empty to use the alert email.
+    AllowedPattern: '^$|^[^\s@]+@[^\s@]+\.[^\s@]+$'
+    ConstraintDescription: must be empty or one email address (name@domain).
+    MaxLength: 254
+  AcknowledgeLoggingOverwrite:
+    Type: String
+    AllowedValues: ["yes"]
+    Description: >-
+      The demo configuration turns on Bedrock model-invocation logging for the
+      whole Region and OVERWRITES any logging configuration that already
+      exists there (the previous destination is not restored on destroy).
+      Select "yes" to accept this; the preflight check refuses to continue
+      otherwise.
+  GitRef:
+    Type: String
+    Default: main
+    Description: >-
+      Branch or tag of https://github.com/aws-samples/sample-bedrock-spend-controls
+      to install (git clone --branch).
+    AllowedPattern: '^[A-Za-z0-9][A-Za-z0-9._/-]*$'
+    ConstraintDescription: must be a git branch or tag name.
+    MaxLength: 200
+  RerunToken:
+    Type: String
+    Default: ""
+    Description: >-
+      Optional. Change this value (any text) when updating the stack to run
+      the installer again, for example after fixing the cause of a failed
+      build.
+    MaxLength: 64
+  ComputeType:
+    Type: String
+    Default: BUILD_GENERAL1_SMALL
+    AllowedValues: [BUILD_GENERAL1_SMALL, BUILD_GENERAL1_MEDIUM, BUILD_GENERAL1_LARGE]
+    Description: >-
+      CodeBuild compute type. SMALL (3 GB) is enough; MEDIUM shortens the
+      console and CDK builds by a few minutes.
+  ExistingBuildRoleArn:
+    Type: String
+    Default: ""
+    Description: >-
+      Optional. ARN of an IAM role CodeBuild should use instead of the role
+      this template creates. It must trust codebuild.amazonaws.com and hold
+      the permissions listed in deploy/README.md.
+    AllowedPattern: '^$|^arn:aws[A-Za-z-]*:iam::[0-9]{12}:role/.+$'
+    ConstraintDescription: must be empty or an IAM role ARN.
+
+Conditions:
+  CreateBuildRole: !Equals [!Ref ExistingBuildRoleArn, ""]
+  UseAlertEmailAsAdmin: !Equals [!Ref AdminEmail, ""]
+
+Mappings:
+  # Console host names per partition, for the URLs in the outputs.
+  ConsoleDomain:
+    aws: { Host: console.aws.amazon.com }
+    aws-cn: { Host: console.amazonaws.cn }
+    aws-us-gov: { Host: console.amazonaws-us-gov.com }
+
+Resources:
+  InstallerLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/codebuild/${AWS::StackName}
+      RetentionInDays: 30
+
+  # The build runs cdk bootstrap and cdk deploy, so this role is broad by
+  # nature: it may create the CDK bootstrap resources (CDKToolkit stack,
+  # cdk-hnb659fds-* roles, assets bucket, ECR repository, SSM parameter)
+  # and assume the bootstrap roles that deploy the stack. Delete it with the
+  # installer stack once the build has succeeded.
+  BuildRole:
+    Type: AWS::IAM::Role
+    Condition: CreateBuildRole
+    Properties:
+      Description: !Sub Service role of the ${AWS::StackName} CodeBuild project (Bedrock Spend Controls installer)
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: codebuild.amazonaws.com }
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+              ArnLike:
+                aws:SourceArn: !Sub arn:${AWS::Partition}:codebuild:${AWS::Region}:${AWS::AccountId}:project/*
+      Policies:
+        - PolicyName: installer
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: WriteBuildLogs
+                Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !GetAtt InstallerLogGroup.Arn
+              # cdk deploy / diff / asset publishing work through the CDK
+              # bootstrap roles (deploy, file-publishing, image-publishing,
+              # lookup); the CloudFormation execution role creates the stack.
+              - Sid: AssumeCdkBootstrapRoles
+                Effect: Allow
+                Action: sts:AssumeRole
+                Resource: !Sub arn:${AWS::Partition}:iam::${AWS::AccountId}:role/cdk-hnb659fds-*
+              # cdk bootstrap, when the account/Region is not bootstrapped yet
+              # (or carries an old bootstrap): the CDKToolkit stack and the
+              # resources it contains. Scoped to the default qualifier.
+              - Sid: BootstrapStack
+                Effect: Allow
+                Action: cloudformation:*
+                Resource: !Sub arn:${AWS::Partition}:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/CDKToolkit/*
+              - Sid: BootstrapRoles
+                Effect: Allow
+                Action: iam:*
+                Resource:
+                  - !Sub arn:${AWS::Partition}:iam::${AWS::AccountId}:role/cdk-hnb659fds-*
+                  - !Sub arn:${AWS::Partition}:iam::${AWS::AccountId}:policy/cdk-hnb659fds-*
+              - Sid: BootstrapBucket
+                Effect: Allow
+                Action: s3:*
+                Resource:
+                  - !Sub arn:${AWS::Partition}:s3:::cdk-hnb659fds-assets-${AWS::AccountId}-${AWS::Region}
+                  - !Sub arn:${AWS::Partition}:s3:::cdk-hnb659fds-assets-${AWS::AccountId}-${AWS::Region}/*
+              - Sid: BootstrapRepository
+                Effect: Allow
+                Action: ecr:*
+                Resource: !Sub arn:${AWS::Partition}:ecr:${AWS::Region}:${AWS::AccountId}:repository/cdk-hnb659fds-container-assets-*
+              - Sid: BootstrapVersionParameter
+                Effect: Allow
+                Action:
+                  - ssm:GetParameter
+                  - ssm:GetParameters
+                  - ssm:PutParameter
+                  - ssm:DeleteParameter
+                  - ssm:AddTagsToResource
+                  - ssm:ListTagsForResource
+                  - ssm:RemoveTagsFromResource
+                Resource: !Sub arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/cdk-bootstrap/hnb659fds/*
+              # install.sh, the preflight and the smoke test read stack state.
+              - Sid: ReadStacks
+                Effect: Allow
+                Action:
+                  - cloudformation:DescribeStacks
+                  - cloudformation:DescribeStackEvents
+                  - cloudformation:GetTemplate
+                  - cloudformation:ListStacks
+                Resource: "*"
+              # Read-only actions of tools/preflight (REQUIRED_ACTIONS in
+              # tools/preflight/checks.py). ssm:GetParameter and
+              # cloudformation:DescribeStacks are granted above.
+              - Sid: PreflightReadOnly
+                Effect: Allow
+                Action:
+                  - sts:GetCallerIdentity
+                  - bedrock:GetFoundationModelAvailability
+                  - bedrock:GetInferenceProfile
+                  - bedrock:GetModelInvocationLoggingConfiguration
+                  - logs:DescribeLogGroups
+                  - logs:FilterLogEvents
+                  - lambda:GetAccountSettings
+                  - lambda:GetLayerVersion
+                  - iam:GetRole
+                  - iam:GetUser
+                  - iam:SimulatePrincipalPolicy
+                Resource: "*"
+              # tools/smoke_test.py, run by install.sh after the deploy:
+              # reads the admin key, creates and deletes a temporary Cognito
+              # user, and calls the broker's IAM-authenticated Function URL
+              # (the Bedrock call itself uses the credentials the broker
+              # vends, not this role). Scoped to the BedrockSpendControls
+              # stack's resources by name prefix.
+              - Sid: SmokeTestAdminKey
+                Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: !Sub arn:${AWS::Partition}:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:BedrockSpendControls*
+              - Sid: SmokeTestCognitoUser
+                Effect: Allow
+                Action:
+                  - cognito-idp:AdminCreateUser
+                  - cognito-idp:AdminSetUserPassword
+                  - cognito-idp:AdminDeleteUser
+                Resource: !Sub arn:${AWS::Partition}:cognito-idp:${AWS::Region}:${AWS::AccountId}:userpool/*
+              - Sid: SmokeTestBrokerUrl
+                Effect: Allow
+                Action: lambda:InvokeFunctionUrl
+                Resource: !Sub arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:BedrockSpendControls-*
+                Condition:
+                  StringEquals:
+                    lambda:FunctionUrlAuthType: AWS_IAM
+
+  InstallerProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Ref AWS::StackName
+      Description: Clones sample-bedrock-spend-controls and runs install.sh (demo configuration)
+      ServiceRole: !If [CreateBuildRole, !GetAtt BuildRole.Arn, !Ref ExistingBuildRoleArn]
+      ConcurrentBuildLimit: 1
+      TimeoutInMinutes: 60
+      Artifacts: { Type: NO_ARTIFACTS }
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: !Ref ComputeType
+        Image: aws/codebuild/amazonlinux-x86_64-standard:5.0
+        PrivilegedMode: false
+        EnvironmentVariables:
+          - { Name: ALERT_EMAIL, Value: !Ref AlertEmail }
+          - { Name: ADMIN_EMAIL, Value: !If [UseAlertEmailAsAdmin, !Ref AlertEmail, !Ref AdminEmail] }
+          - { Name: GIT_REF, Value: !Ref GitRef }
+          - { Name: ACKNOWLEDGE_LOGGING_OVERWRITE, Value: !Ref AcknowledgeLoggingOverwrite }
+          - { Name: AWS_REGION, Value: !Ref AWS::Region }
+          - { Name: INSTALL_DIR, Value: /tmp/sample-bedrock-spend-controls }
+          - { Name: JSII_SILENCE_WARNING_UNTESTED_NODE_VERSION, Value: "1" }
+          - { Name: CI, Value: "1" }
+      LogsConfig:
+        CloudWatchLogs:
+          Status: ENABLED
+          GroupName: !Ref InstallerLogGroup
+        S3Logs: { Status: DISABLED }
+      Source:
+        Type: NO_SOURCE
+        # The repository is cloned from GitHub at GIT_REF and install.sh runs
+        # from the checkout (no "curl | bash"). No --profile: CodeBuild
+        # supplies the service role's credentials; the Region comes from
+        # AWS_REGION. --yes answers the prompts, which CodeBuild cannot show.
+        # --acknowledge-logging-overwrite is passed only while the
+        # AcknowledgeLoggingOverwrite parameter is set ("yes" is its only
+        # allowed value); without it the preflight stops the install when
+        # the Region already has invocation logging configured.
+        BuildSpec: |
+          version: 0.2
+          phases:
+            install:
+              runtime-versions:
+                nodejs: 20
+                python: 3.12
+            build:
+              commands:
+                - git clone --depth 1 --branch "$GIT_REF" https://github.com/aws-samples/sample-bedrock-spend-controls.git "$INSTALL_DIR"
+                - cd "$INSTALL_DIR" && ./install.sh --yes --config demo --region "$AWS_REGION" --alert-email "$ALERT_EMAIL" --admin-email "$ADMIN_EMAIL" ${ACKNOWLEDGE_LOGGING_OVERWRITE:+--acknowledge-logging-overwrite}
+            post_build:
+              commands:
+                - if [ "$CODEBUILD_BUILD_SUCCEEDING" = 1 ]; then echo "Install finished. Open the AdminUiUrl output of stack BedrockSpendControls in $AWS_REGION; the administrator password was emailed to $ADMIN_EMAIL."; else echo "Install failed. The failing phase is named in the summary above."; fi
+
+  StartBuildLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${AWS::StackName}-start-build
+      RetentionInDays: 30
+
+  StartBuildRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Description: !Sub Lets the ${AWS::StackName} custom resource start the installer build
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: start-build
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !GetAtt StartBuildLogGroup.Arn
+              - Effect: Allow
+                Action:
+                  - codebuild:StartBuild
+                  - codebuild:BatchGetBuilds
+                Resource: !GetAtt InstallerProject.Arn
+
+  # Starts the build and returns at once. A Lambda function can run for 15
+  # minutes at most while the install takes 15-25, so the custom resource
+  # does not wait: the stack reaches CREATE_COMPLETE within a minute and the
+  # install's result is read from CodeBuild (see the outputs).
+  StartBuildFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Description: !Sub Starts the ${AWS::StackName} CodeBuild installer build (CloudFormation custom resource)
+      Runtime: python3.12
+      Handler: index.handler
+      Timeout: 120
+      MemorySize: 128
+      Role: !GetAtt StartBuildRole.Arn
+      LoggingConfig:
+        LogGroup: !Ref StartBuildLogGroup
+      Code:
+        ZipFile: |
+          import json
+          import urllib.parse
+          import urllib.request
+
+          import boto3
+
+          # Custom resource: Create/Update start one CodeBuild build and return
+          # at once (the install outlasts a Lambda invocation); Delete never
+          # touches the deployed BedrockSpendControls stack.
+
+
+          def respond(event, context, status, data, reason, physical_id):
+              body = json.dumps({
+                  "Status": status,
+                  "Reason": reason[:1000],
+                  "PhysicalResourceId": physical_id,
+                  "StackId": event["StackId"],
+                  "RequestId": event["RequestId"],
+                  "LogicalResourceId": event["LogicalResourceId"],
+                  "Data": data,
+              }).encode()
+              request = urllib.request.Request(
+                  event["ResponseURL"], data=body, method="PUT",
+                  headers={"Content-Type": "", "Content-Length": str(len(body))},
+              )
+              with urllib.request.urlopen(request, timeout=30) as response:
+                  response.read()
+
+
+          def handler(event, context):
+              print(json.dumps({"RequestType": event.get("RequestType"), "RequestId": event.get("RequestId")}))
+              physical_id = event.get("PhysicalResourceId") or context.log_stream_name
+              props = event.get("ResourceProperties") or {}
+              try:
+                  if event["RequestType"] == "Delete":
+                      respond(event, context, "SUCCESS", {},
+                              "installer removed; the deployed stack is kept", physical_id)
+                      return
+                  project = props["ProjectName"]
+                  region = props["Region"]
+                  build = boto3.client("codebuild").start_build(projectName=project)["build"]
+                  build_id = build["id"]
+                  account = build["arn"].split(":")[4]
+                  console = f"https://{region}.{props['ConsoleDomain']}"
+                  data = {
+                      "BuildId": build_id,
+                      "BuildArn": build["arn"],
+                      "BuildUrl": (f"{console}/codesuite/codebuild/{account}/projects/{project}"
+                                   f"/build/{urllib.parse.quote(build_id, safe='')}/?region={region}"),
+                      "LogsUrl": (f"{console}/cloudwatch/home?region={region}#logEvent:"
+                                  f"group={props['LogGroupName']};stream={build_id.split(':', 1)[-1]}"),
+                  }
+                  respond(event, context, "SUCCESS", data, f"started build {build_id}", build_id)
+              except Exception as exc:  # the stack must hear about every failure
+                  reason = f"could not start the installer build: {type(exc).__name__}: {exc}"
+                  print(reason)
+                  try:
+                      respond(event, context, "FAILED", {}, reason, physical_id)
+                  except Exception as send_error:  # no retry: it could start a second build
+                      print(f"could not send the response: {send_error}")
+
+  RunInstaller:
+    Type: Custom::RunInstaller
+    Properties:
+      ServiceToken: !GetAtt StartBuildFunction.Arn
+      ProjectName: !Ref InstallerProject
+      Region: !Ref AWS::Region
+      ConsoleDomain: !FindInMap [ConsoleDomain, !Ref AWS::Partition, Host]
+      LogGroupName: !Ref InstallerLogGroup
+      # A changed value re-runs the build on a stack update.
+      Trigger:
+        GitRef: !Ref GitRef
+        AlertEmail: !Ref AlertEmail
+        AdminEmail: !If [UseAlertEmailAsAdmin, !Ref AlertEmail, !Ref AdminEmail]
+        RerunToken: !Ref RerunToken
+
+Outputs:
+  BuildProjectUrl:
+    Description: CodeBuild project (build history) in the console
+    Value: !Sub
+      - https://${AWS::Region}.${Host}/codesuite/codebuild/${AWS::AccountId}/projects/${InstallerProject}/history?region=${AWS::Region}
+      - Host: !FindInMap [ConsoleDomain, !Ref AWS::Partition, Host]
+  BuildId:
+    Description: CodeBuild build started by this stack (project:uuid)
+    Value: !GetAtt RunInstaller.BuildId
+  BuildUrl:
+    Description: Console page of the build (phases, status, log tail)
+    Value: !GetAtt RunInstaller.BuildUrl
+  BuildLogsUrl:
+    Description: CloudWatch Logs stream with the full install.sh output
+    Value: !GetAtt RunInstaller.LogsUrl
+  WatchCommand:
+    Description: Prints the build status (IN_PROGRESS, SUCCEEDED, FAILED, ...)
+    Value: !Sub >-
+      aws codebuild batch-get-builds --region ${AWS::Region} --ids ${RunInstaller.BuildId}
+      --query 'builds[0].buildStatus' --output text
+  NextSteps:
+    Description: What to do once the build has SUCCEEDED
+    Value: !Sub >-
+      The install runs in CodeBuild for 15-25 minutes after this stack completes.
+      When WatchCommand prints SUCCEEDED, open the AdminUiUrl output of stack
+      BedrockSpendControls in ${AWS::Region}; sign in as quota-admin with the
+      temporary password Cognito emailed to the administrator address, and
+      confirm the SNS subscription sent to the alert address. If it prints
+      FAILED, read BuildLogsUrl (the failing phase is named in the summary
+      table). This installer stack can then be deleted; it does not remove
+      the deployed stack.

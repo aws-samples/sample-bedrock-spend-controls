@@ -901,9 +901,56 @@ def test_install_verdict_ignores_what_the_installer_resolves(tmp_path, capsys):
     # Anything else failing still blocks.
     assert install_verdict(report(bootstrap="pass", invocation_logging="fail")) == ("fail", "clean", "pass")
     assert install_verdict(report(toolchain="pass")) == ("ok", "clean", "missing")
+    # The demo's deliberate "*" advisory does not prompt; any other model warning does.
+    from tools.preflight.verdict import render
+    unrestricted = {"ok": True, "results": [
+        {"name": "bedrock_model_access", "status": "warn", "title": "Bedrock model access",
+         "detail": "allowed_model_arns contains '*': vended sessions may call any model", "fix": "pin"},
+        {"name": "bootstrap", "status": "fail", "title": "CDK bootstrap", "detail": "missing", "fix": "bootstrap"}]}
+    assert install_verdict(unrestricted) == ("ok", "clean", "fail")
+    unrestricted["results"][0]["detail"] = "model X is not enabled"
+    assert install_verdict(unrestricted) == ("ok", "warn", "fail")
+    text = render(unrestricted)
+    assert "Installer verdict: OK (bootstrap: handled by the next phases); warnings need a look" in text
+    assert "Summary:" not in text and "FAIL  bootstrap" in text
 
     path = tmp_path / "preflight.json"
     path.write_text(json.dumps(fresh), encoding="utf-8")
     assert verdict_main([str(path)]) == 0
     assert capsys.readouterr().out.strip() == "ok warn fail"
     assert verdict_main([]) == 2
+
+
+# --- opt-in Region not enabled -----------------------------------------------------------
+
+
+def test_disabled_region_is_named_and_regional_checks_are_skipped():
+    ctx = make_context(account=None, region="eu-south-2")
+    stub(ctx, "sts").add_client_error(
+        "get_caller_identity", "InvalidClientTokenId",
+        "The security token included in the request is invalid")
+    stub(ctx, "sts", region="us-east-1").add_response("get_caller_identity", {
+        "UserId": "deployer", "Account": ACCOUNT,
+        "Arn": f"arn:aws:sts::{ACCOUNT}:assumed-role/Deployer/deployer",
+    })
+    result = checks.check_credentials(ctx)
+    assert result.status == "fail"
+    assert "has not enabled Region eu-south-2" in result.detail
+    assert "enable-region --region-name eu-south-2" in result.fix
+    assert ctx.region_disabled is True and ctx.account == ACCOUNT
+
+    report = checks.run(ctx, ["bootstrap", "quotas_cost", "region_support"])
+    statuses = {r.name: r.status for r in report.results}
+    assert statuses["bootstrap"] == "skip" and statuses["region_support"] == "skip"
+    assert "not enabled" in report.results[0].detail
+    assert statuses["quotas_cost"] == "pass"  # local checks still run
+
+
+def test_truly_invalid_credentials_still_fail_as_credentials():
+    ctx = make_context(account=None, region="eu-south-2")
+    stub(ctx, "sts").add_client_error("get_caller_identity", "InvalidClientTokenId", "bad token")
+    stub(ctx, "sts", region="us-east-1").add_client_error(
+        "get_caller_identity", "InvalidClientTokenId", "bad token")
+    result = checks.execute("credentials", ctx)
+    assert result.status == "fail" and "InvalidClientTokenId" in result.detail
+    assert ctx.region_disabled is False

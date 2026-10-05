@@ -55,6 +55,20 @@ class _FakePricing:
         return [{"PriceList": self.products}]
 
 
+class _FilteringPricing(_FakePricing):
+    """Honours the ``model`` TERM_MATCH filter, so a catalog model with no
+    rows in the fixture behaves like one the Region does not offer."""
+
+    def paginate(self, **kwargs):
+        self.calls.append(kwargs)
+        wanted = [f["Value"] for f in kwargs.get("Filters", []) if f.get("Field") == "model"]
+        rows = [
+            row for row in self.products
+            if not wanted or json.loads(row)["product"]["attributes"].get("model") in wanted
+        ]
+        return [{"PriceList": rows}]
+
+
 def test_snapshot_uses_standard_prices_and_maps_all_model_ids():
     pricing = _FakePricing([
         _product("native-in", "Input tokens", "0.0000700000",
@@ -304,10 +318,21 @@ def test_conservative_fallback_covers_every_known_dimension_at_the_max_rate():
 
 
 class _FakeSsm:
-    def __init__(self, *, missing_on_delete: bool = False):
+    def __init__(self, *, missing_on_delete: bool = False, live_models: dict | None = None):
         self.puts = []
         self.deletes = []
         self.missing_on_delete = missing_on_delete
+        self.live_models = live_models
+
+    def get_parameter(self, **kwargs):
+        if self.live_models is None:
+            from botocore.exceptions import ClientError
+
+            raise ClientError(
+                {"Error": {"Code": "ParameterNotFound", "Message": "absent"}}, "GetParameter",
+            )
+        document = json.dumps({"models": self.live_models, "fallback": {}, "resolved_at": "x"})
+        return {"Parameter": {"Name": kwargs["Name"], "Value": resolver.encode_parameter_value(document)}}
 
     def put_parameter(self, **kwargs):
         self.puts.append(kwargs)
@@ -373,8 +398,9 @@ def test_create_writes_the_parameter_and_returns_only_a_digest():
     data = result["Data"]
     assert set(data) == {
         "ParameterName", "SnapshotDigest", "ModelCount", "ResolvedAt",
-        "FallbackPriceJson",
+        "FallbackPriceJson", "UnresolvedCount", "UnresolvedModels",
     }
+    assert data["UnresolvedCount"] == "0" and data["UnresolvedModels"] == ""
     assert data["ParameterName"] == _PROPERTIES["ParameterName"]
     assert len(data["SnapshotDigest"]) == 16
     assert data["ModelCount"] == "2"
@@ -454,7 +480,7 @@ def test_shipped_catalog_response_stays_far_under_the_cloudformation_limit():
         for model_id, price in config["price_overrides"].items()
     }
     pricing = _shipped_catalog_pricing(config["catalog_models"])
-    snapshot, fallback = resolver._resolve(
+    snapshot, fallback, _unresolved = resolver._resolve(
         pricing,
         {
             "RegionCode": "us-east-1",
@@ -650,15 +676,17 @@ def test_scheduled_refresh_writes_the_price_parameter(monkeypatch):
 
 def test_scheduled_refresh_failure_leaves_parameter_unwritten(monkeypatch):
     monkeypatch.setenv("PRICES_PARAMETER_NAME", "/quota/model-prices")
-    # Ambiguous catalog data must fail the refresh, not write bad prices.
+    # Ambiguous catalog data for a model the live table already prices must
+    # fail the refresh (keeping the previous value), not demote it to the
+    # fallback or write bad prices.
     pricing = _FakePricing([
         _product("in-a", "Input tokens", "0.0000700000"),
         _product("in-b", "Input tokens", "0.0000900000"),
         _product("out", "Output tokens", "0.0003000000"),
     ])
-    ssm = _FakeSsm()
+    ssm = _FakeSsm(live_models={"openai.gpt-oss-20b": {"input_per_mtok": 0.07, "output_per_mtok": 0.3}})
 
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="no longer prices openai.gpt-oss-20b"):
         resolver.scheduled_handler(
             {
                 "RegionCode": "us-east-1",
@@ -669,3 +697,48 @@ def test_scheduled_refresh_failure_leaves_parameter_unwritten(monkeypatch):
             ssm_client=ssm,
         )
     assert ssm.puts == []
+
+
+def test_deploy_skips_a_catalog_model_the_region_does_not_offer():
+    """Nova Canvas is not sold in us-east-2: the Price List returns no rows,
+    which must not fail the whole stack (seen live). The model is skipped,
+    reported, and priced with the fallback at runtime."""
+    pricing = _FilteringPricing([
+        _product("in", "Input tokens", "0.0000700000"),
+        _product("out", "Output tokens", "0.0003000000"),
+    ])
+    ssm = _FakeSsm()
+    properties = {
+        **_PROPERTIES,
+        "RegionCode": "us-east-2",
+        "CatalogModels": {
+            "gpt-oss-20b": ["openai.gpt-oss-20b"],
+            "Nova Canvas": ["amazon.nova-canvas-v1:0"],
+        },
+    }
+    result = resolver.handler(
+        {"RequestType": "Create", "ResourceProperties": properties}, None,
+        pricing_client=pricing, ssm_client=ssm,
+    )
+    data = result["Data"]
+    assert data["ModelCount"] == "2"  # gpt-oss + the pinned Opus
+    assert data["UnresolvedCount"] == "1" and data["UnresolvedModels"] == "Nova Canvas"
+    document = resolver.decode_parameter_value(ssm.puts[0]["Value"])
+    assert "amazon.nova-canvas-v1:0" not in document["models"]
+    assert document["unresolved"] == ["Nova Canvas"]
+
+
+def test_scheduled_refresh_skips_a_model_that_was_never_priced(monkeypatch):
+    monkeypatch.setenv("PRICES_PARAMETER_NAME", "/quota/model-prices")
+    pricing = _FilteringPricing([
+        _product("in", "Input tokens", "0.0000700000"),
+        _product("out", "Output tokens", "0.0003000000"),
+    ])
+    ssm = _FakeSsm(live_models={"openai.gpt-oss-20b": {"input_per_mtok": 0.07, "output_per_mtok": 0.3}})
+    resolver.scheduled_handler(
+        {"RegionCode": "us-east-2",
+         "CatalogModels": {"gpt-oss-20b": ["openai.gpt-oss-20b"], "Nova Canvas": ["amazon.nova-canvas-v1:0"]}},
+        None, pricing_client=pricing, ssm_client=ssm,
+    )
+    assert len(ssm.puts) == 1
+    assert resolver.decode_parameter_value(ssm.puts[0]["Value"])["unresolved"] == ["Nova Canvas"]
