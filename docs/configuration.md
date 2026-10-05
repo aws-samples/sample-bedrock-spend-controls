@@ -18,6 +18,19 @@ account, stack-created Cognito) and `production.json` (shared account, your
 IdP). Private copies named `config/*.local.json` and `config/workloads.json`
 are ignored by Git.
 
+The recommended way to produce a deployment file is the wizard,
+`python setup.py --profile-template demo|production`, run from the
+repository root with the CDK Python environment. It asks for every key
+below in sections with a one-line help per key, validates each answer with
+the same validator `cdk synth` uses (so it rejects exactly what synthesis
+would, with the same message), checks answers against the target account
+when credentials are available (issuer discovery, model access, the
+Region's existing invocation logging configuration, Lambda concurrency,
+invoker principals), refuses to keep the templates' example values, and
+writes `cdk/config/<template>.local.json`. `--answers FILE --yes` replays a
+saved run without questions
+([installer.md](installer.md#setuppy-configuration-wizard)).
+
 ## Keys
 
 | Key | Default | Validation and meaning |
@@ -50,7 +63,7 @@ are ignored by Git.
 | `admin_ui` | `false` | Hosts the console on CloudFront; requires both admin JWT keys; works with demo Cognito or your issuer |
 | `admin_ui_client_id` | empty | Your issuer only (`admin_ui: true` with `jwt_issuer`): the SPA's public OAuth client ID (defaults to `jwt_audience`) |
 | `admin_ui_connect_origins` | `[]` | Your issuer only: extra `https://` origins without a trailing slash for the console's Content-Security-Policy (token endpoint on another origin) |
-| `admin_email` | empty | Demo Cognito only (`admin_ui: true`, empty `jwt_issuer`, `admin_jwt_claim: cognito:groups`): one email address (`name@domain`, no spaces). The stack creates the Cognito user `quota-admin` with this address, adds it to the `admin_jwt_value` group, and Cognito emails the temporary password; the user is kept on stack deletion. Setting it with your own issuer or another admin claim fails synthesis |
+| `admin_email` | empty | Demo Cognito only (`admin_ui: true`, empty `jwt_issuer`, `admin_jwt_claim: cognito:groups`): one email address (`name@domain`, no spaces). The stack creates the Cognito user `quota-admin` with this address, adds it to the `admin_jwt_value` group, and Cognito emails the temporary password; the user is kept on stack deletion, and an existing `quota-admin` is left alone on redeploy. Setting it with your own issuer or another admin claim fails synthesis. `install.sh --admin-email` and the one-click installer's `AdminEmail` set it ([DEPLOYMENT.md](../DEPLOYMENT.md#5-configure-the-demo-administrator)) |
 | `alert_email` | empty | Creates an SNS email subscription on the alerts topic |
 | `snapstart` | `false` | Enable Lambda SnapStart for the broker |
 | `adapter_layer_arn` | regional default (`LambdaAdapterLayerX86:30`) | Override the Lambda Web Adapter layer |

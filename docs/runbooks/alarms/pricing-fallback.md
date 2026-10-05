@@ -17,7 +17,10 @@ the metric:
    priced at the fallback (`fallback_price` in `cdk/config/model-pricing.json`,
    raised at deploy to at least the highest known rate). This
    **over-estimates** and can block a
-   subject earlier than the bill would justify.
+   subject earlier than the bill would justify. A `catalog_models` entry the
+   Region does not price lands here too: the resolver skips it at deploy
+   instead of failing the stack (`ModelPriceSnapshot` ends with
+   `unresolved=<n>`; the parameter document lists it under `unresolved`).
 2. **Geographic profile derived from its base model while a sibling pin
    disagrees** (`PriceSource: base-model-mismatch`, `UnpricedDimensionRequests:
    0`). The `modelId` is, say, `apac.<model>`; the catalog has no `apac.` pin
@@ -66,7 +69,16 @@ only the USD figure is imprecise.
 5. **Price refresh failing**, so the SSM parameter is stale, or unreadable
    at a cold start, in which case every model is priced at the fallback.
    Check the `PriceRefreshFn` `Errors` metric — it is not alarmed
-   separately.
+   separately. A refresh also fails on purpose when the Price List stops
+   pricing a model the live table carries (`Refusing to refresh the price
+   parameter`): the parameter is left unchanged, so this cause never
+   produces fallback pricing by itself.
+6. **A catalog model the Region does not sell.** The deploy skipped it
+   (`ModelPriceSnapshot` ends with `unresolved=<n>`; `unresolved` in the
+   parameter document names it) and every invocation of it is
+   fallback-priced until it is pinned in `price_overrides` or removed from
+   `allowed_model_arns`
+   ([pricing.md](../../pricing.md#models-the-region-does-not-price)).
 
 Find which models and dimensions:
 ```bash
@@ -86,7 +98,11 @@ involved.
    otherwise unlisted model, add a `price_overrides` entry with `input_per_mtok`,
    `output_per_mtok`, and — if the alarm named them — `cache_read_per_mtok`,
    `cache_write_per_mtok`, `per_image`, plus a `reason`. Redeploy; the daily
-   refresh also picks up catalog-driven changes without a redeploy.
+   refresh also picks up catalog-driven changes without a redeploy. A model
+   listed under `unresolved` is not sold in this Region through the Price
+   List: pin it in `price_overrides` with its published rate, or remove it
+   from `allowed_model_arns`; adding it to `catalog_models` again changes
+   nothing.
 2. **Verify the resolver can price it** before deploying:
    `python3 tools/bedrock_price_catalog.py --region <region>
    --metering-compatible` lists the rows the Price List publishes.
