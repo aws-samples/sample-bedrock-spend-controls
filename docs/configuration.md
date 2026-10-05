@@ -50,6 +50,7 @@ are ignored by Git.
 | `admin_ui` | `false` | Hosts the console on CloudFront; requires both admin JWT keys; works with demo Cognito or your issuer |
 | `admin_ui_client_id` | empty | Your issuer only (`admin_ui: true` with `jwt_issuer`): the SPA's public OAuth client ID (defaults to `jwt_audience`) |
 | `admin_ui_connect_origins` | `[]` | Your issuer only: extra `https://` origins without a trailing slash for the console's Content-Security-Policy (token endpoint on another origin) |
+| `admin_email` | empty | Demo Cognito only (`admin_ui: true`, empty `jwt_issuer`, `admin_jwt_claim: cognito:groups`): one email address (`name@domain`, no spaces). The stack creates the Cognito user `quota-admin` with this address, adds it to the `admin_jwt_value` group, and Cognito emails the temporary password; the user is kept on stack deletion. Setting it with your own issuer or another admin claim fails synthesis |
 | `alert_email` | empty | Creates an SNS email subscription on the alerts topic |
 | `snapstart` | `false` | Enable Lambda SnapStart for the broker |
 | `adapter_layer_arn` | regional default (`LambdaAdapterLayerX86:30`) | Override the Lambda Web Adapter layer |

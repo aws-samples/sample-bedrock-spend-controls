@@ -2788,3 +2788,176 @@ def test_web_adapter_layer_is_partition_aware_and_current():
         "AWS::CloudWatch::Dashboard",
         {"DashboardName": "bedrock-spend-controls"},
     )
+
+
+# --- admin_email: the stack creates the demo administrator -------------------
+
+_DEMO_CONSOLE = {
+    "manage_invocation_logging": True,
+    "admin_ui": True,
+    "admin_jwt_claim": "cognito:groups",
+    "admin_jwt_value": "quota-admins",
+}
+
+
+def _sdk_calls(template: Template, action: str) -> list[dict]:
+    """``Custom::AWS`` resources whose Create call uses ``action``."""
+    return [
+        resource
+        for resource in template.find_resources("Custom::AWS").values()
+        if f'\\"action\\":\\"{action}\\"' in json.dumps(resource["Properties"].get("Create"))
+    ]
+
+
+def _policy_actions_on_pool(template: Template) -> dict[str, dict]:
+    """``{action: statement}`` for every IAM statement naming a cognito-idp action."""
+    statements: dict[str, dict] = {}
+    for policy in template.find_resources("AWS::IAM::Policy").values():
+        for statement in policy["Properties"]["PolicyDocument"]["Statement"]:
+            actions = statement["Action"]
+            for action in [actions] if isinstance(actions, str) else actions:
+                if action.startswith("cognito-idp:"):
+                    statements[action] = statement
+    return statements
+
+
+def test_admin_email_creates_the_demo_administrator_by_invitation():
+    template = _template({**_DEMO_CONSOLE, "admin_email": "Admin@Example.com"})
+
+    (create_user,) = _sdk_calls(template, "adminCreateUser")
+    properties = create_user["Properties"]
+    rendered_create = json.dumps(properties["Create"])
+    # Same call on create and update; nothing on delete (the user is kept).
+    assert json.dumps(properties["Update"]) == rendered_create
+    assert "Delete" not in properties
+    assert properties["InstallLatestAwsSdk"] is False
+    assert '\\"Username\\":\\"quota-admin\\"' in rendered_create
+    assert '{\\"Name\\":\\"email\\",\\"Value\\":\\"Admin@Example.com\\"}' in rendered_create
+    assert '{\\"Name\\":\\"email_verified\\",\\"Value\\":\\"true\\"}' in rendered_create
+    # Cognito mails the temporary password: EMAIL delivery, never SUPPRESS.
+    assert '\\"DesiredDeliveryMediums\\":[\\"EMAIL\\"]' in rendered_create
+    assert "SUPPRESS" not in rendered_create and "TemporaryPassword" not in rendered_create
+    assert '\\"ignoreErrorCodesMatching\\":\\"UsernameExistsException\\"' in rendered_create
+    assert '"Ref": "DemoUserPool1AB98549"' in rendered_create
+    assert "DemoUserPool1AB98549" in create_user["DependsOn"]
+
+    (membership,) = _sdk_calls(template, "adminAddUserToGroup")
+    rendered_membership = json.dumps(membership["Properties"]["Create"])
+    assert json.dumps(membership["Properties"]["Update"]) == rendered_membership
+    assert "Delete" not in membership["Properties"]
+    assert '\\"Username\\":\\"quota-admin\\"' in rendered_membership
+    assert '\\"GroupName\\":\\"quota-admins\\"' in rendered_membership
+    # Membership waits for both the user and the group.
+    depends_on = membership["DependsOn"]
+    assert any(name.startswith("DemoAdminUser") for name in depends_on)
+    assert any(name.startswith("EnsureDemoAdminGroup") for name in depends_on)
+
+    template.has_output("AdminUsername", {"Value": "quota-admin"})
+
+
+def test_admin_email_physical_id_follows_the_address():
+    first = _template({**_DEMO_CONSOLE, "admin_email": "one@example.com"})
+    second = _template({**_DEMO_CONSOLE, "admin_email": "two@example.com"})
+    same_as_first = _template({**_DEMO_CONSOLE, "admin_email": "ONE@example.com"})
+
+    def physical_id(template: Template) -> str:
+        (create_user,) = _sdk_calls(template, "adminCreateUser")
+        rendered = json.dumps(create_user["Properties"]["Create"])
+        start = rendered.index("demo-admin-user-")
+        return rendered[start : start + len("demo-admin-user-") + 12]
+
+    assert physical_id(first) != physical_id(second)
+    # Case differences in the address do not re-run the invitation.
+    assert physical_id(first) == physical_id(same_as_first)
+
+
+def test_admin_email_permissions_are_scoped_to_the_demo_pool():
+    template = _template({**_DEMO_CONSOLE, "admin_email": "admin@example.com"})
+    statements = _policy_actions_on_pool(template)
+    assert set(statements) == {
+        "cognito-idp:CreateGroup",
+        "cognito-idp:AdminCreateUser",
+        "cognito-idp:AdminAddUserToGroup",
+    }
+    pool_arn = {"Fn::GetAtt": ["DemoUserPool1AB98549", "Arn"]}
+    for action in ("cognito-idp:AdminCreateUser", "cognito-idp:AdminAddUserToGroup"):
+        assert statements[action]["Effect"] == "Allow"
+        assert statements[action]["Resource"] == pool_arn
+        assert statements[action]["Action"] == action
+    # No wider Cognito permission sneaks in (no delete, no password set).
+    rendered = json.dumps(template.to_json()["Resources"])
+    assert "cognito-idp:AdminDeleteUser" not in rendered
+    assert "cognito-idp:AdminSetUserPassword" not in rendered
+
+
+@pytest.mark.parametrize(
+    "context",
+    [
+        _DEMO_CONSOLE,
+        {**_DEMO_CONSOLE, "admin_email": ""},
+        {**_DEMO_CONSOLE, "admin_email": "   "},
+        {"manage_invocation_logging": True},
+    ],
+)
+def test_without_admin_email_no_administrator_is_created(context):
+    template = _template(context)
+    assert _sdk_calls(template, "adminCreateUser") == []
+    assert _sdk_calls(template, "adminAddUserToGroup") == []
+    assert "AdminUsername" not in template.to_json().get("Outputs", {})
+    assert "cognito-idp:AdminCreateUser" not in json.dumps(template.to_json())
+
+
+@pytest.mark.parametrize(
+    ("context", "message"),
+    [
+        # Console disabled: nobody to administer.
+        (
+            {"manage_invocation_logging": True, "admin_email": "a@example.com"},
+            "admin_email applies only when admin_ui=true",
+        ),
+        # Bring-your-own issuer: the stack has no user pool to invite into.
+        (
+            {
+                "manage_invocation_logging": True,
+                "admin_ui": True,
+                "jwt_issuer": "https://idp.example.com",
+                "jwt_audience": "spa-client",
+                "admin_jwt_claim": "groups",
+                "admin_jwt_value": "quota-admins",
+                "admin_email": "a@example.com",
+            },
+            "stack manages the demo Cognito user pool",
+        ),
+        # Demo pool but the admin claim is not the Cognito group claim.
+        (
+            {
+                **_DEMO_CONSOLE,
+                "admin_jwt_claim": "email",
+                "admin_jwt_value": "a@example.com",
+                "admin_email": "a@example.com",
+            },
+            "admin_jwt_claim=cognito:groups",
+        ),
+        ({**_DEMO_CONSOLE, "admin_email": "not-an-address"}, "single email address"),
+        ({**_DEMO_CONSOLE, "admin_email": "two words@example.com"}, "single email address"),
+        ({**_DEMO_CONSOLE, "admin_email": "a@b@example.com"}, "single email address"),
+        ({**_DEMO_CONSOLE, "admin_email": "a@localhost"}, "single email address"),
+        ({**_DEMO_CONSOLE, "admin_email": ["a@example.com"]}, "must be a string"),
+    ],
+)
+def test_admin_email_validation(context, message):
+    with pytest.raises(ValueError, match=message):
+        _template(context)
+
+
+def test_demo_profile_accepts_admin_email_context():
+    template = _template(
+        {
+            "deployment_config": "config/demo.json",
+            "alert_email": "alerts@example.com",
+            "admin_email": "admin@example.com",
+        }
+    )
+    assert len(_sdk_calls(template, "adminCreateUser")) == 1
+    template.has_output("AdminUsername", {"Value": "quota-admin"})
+    assert "Admin@Example.com" not in json.dumps(template.to_json())
