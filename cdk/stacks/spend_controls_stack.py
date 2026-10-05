@@ -352,6 +352,7 @@ class SpendControlsStack(Stack):
         )
         price_snapshot_digest = price_snapshot.get_att_string("SnapshotDigest")
         price_snapshot_models = price_snapshot.get_att_string("ModelCount")
+        price_snapshot_unresolved = price_snapshot.get_att_string("UnresolvedCount")
         fallback_price_json = price_snapshot.get_att_string("FallbackPriceJson")
 
         price_refresh_fn = lambda_.Function(
@@ -375,7 +376,9 @@ class SpendControlsStack(Stack):
         )
         price_refresh_fn.add_to_role_policy(
             iam.PolicyStatement(
-                actions=["ssm:PutParameter"],
+                # GetParameter: a refresh refuses to drop a model the live
+                # table prices (see _refuse_regression in the resolver).
+                actions=["ssm:PutParameter", "ssm:GetParameter"],
                 resources=[model_prices_parameter_arn],
             )
         )
@@ -2851,6 +2854,7 @@ class SpendControlsStack(Stack):
                     "ssm:", model_prices_parameter_name,
                     " sha256:", price_snapshot_digest,
                     " models=", price_snapshot_models,
+                    " unresolved=", price_snapshot_unresolved,
                 ],
             ),
             description=(

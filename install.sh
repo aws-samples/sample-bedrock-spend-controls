@@ -457,6 +457,43 @@ stack_exists() {
   aws cloudformation describe-stacks --stack-name "$STACK_NAME" >/dev/null 2>&1
 }
 
+stack_status() {
+  aws cloudformation describe-stacks --stack-name "$STACK_NAME" \
+    --query 'Stacks[0].StackStatus' --output text 2>/dev/null || true
+}
+
+# A stack whose first create failed sits in ROLLBACK_COMPLETE and cannot be
+# updated: CloudFormation requires deleting it before creating it again.
+recover_failed_stack() {
+  local status
+  status="$(stack_status)"
+  case "$status" in
+    ROLLBACK_COMPLETE|ROLLBACK_FAILED|CREATE_FAILED|DELETE_FAILED)
+      say "stack $STACK_NAME is in $status: a previous create failed and CloudFormation cannot update it"
+      say "(cdk deploy printed the failing resource; the log groups it kept may hold the reason)"
+      confirm "Delete the failed stack and create it again?"
+      run aws cloudformation delete-stack --stack-name "$STACK_NAME"
+      run aws cloudformation wait stack-delete-complete --stack-name "$STACK_NAME"
+      ;;
+  esac
+}
+
+# The stack RETAINs its invocation log group on delete and on rollback, so
+# a second create in the same Region fails with "already exists" unless
+# that orphan goes first. Only for a fresh create with stack-managed logging.
+remove_orphaned_log_group() {
+  local group="/bedrock/spend-controls/model-invocations" found=""
+  if stack_exists; then return 0; fi
+  if [ "$(config_flag manage_invocation_logging)" != true ]; then return 0; fi
+  found="$(aws logs describe-log-groups --log-group-name-prefix "$group" \
+    --query "logGroups[?logGroupName=='$group'].logGroupName" --output text 2>/dev/null || true)"
+  if [ "$found" != "$group" ]; then return 0; fi
+  say "log group $group exists without the stack (kept by an earlier install's rollback or destroy);"
+  say "CloudFormation cannot create it again while it is there"
+  confirm "Delete $group (its old invocation logs are lost) so the new stack can own it?"
+  run aws logs delete-log-group --log-group-name "$group"
+}
+
 # --- destroy ----------------------------------------------------------------------
 
 if [ "$DESTROY" = 1 ]; then
@@ -587,6 +624,13 @@ fi
 
 # 6. deploy
 begin_phase deploy
+if [ "$DRY_RUN" = 1 ]; then
+  say "(dry run) would delete a stack left in ROLLBACK_COMPLETE by a failed create, and an orphaned"
+  say "(dry run) /bedrock/spend-controls/model-invocations log group, after asking"
+else
+  recover_failed_stack
+  remove_orphaned_log_group
+fi
 run_in "$ROOT/cdk" npx cdk deploy --require-approval never "${CDK_CONTEXT[@]}"
 end_phase OK
 
