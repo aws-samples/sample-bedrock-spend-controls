@@ -355,9 +355,53 @@ def check_toolchain(ctx: Context) -> CheckResult:
     return CheckResult("pass", "toolchain", TITLES["toolchain"], detail)
 
 
+# STS rejects every token sent to a Regional endpoint of an opt-in Region
+# the account has not enabled, with the same codes an invalid key gets.
+_DISABLED_REGION_CODES = frozenset({"InvalidClientTokenId", "UnrecognizedClientException"})
+# Where to retry GetCallerIdentity to tell "bad credentials" from "Region
+# not enabled": a Region every account in the partition can reach.
+_HOME_REGION = {"aws": "us-east-1", "aws-cn": "cn-north-1", "aws-us-gov": "us-gov-west-1"}
+
+# Checks that call Regional AWS endpoints and are therefore pointless (and
+# noisy) once the credentials check has found the Region disabled.
+REGIONAL_CHECKS = frozenset(
+    {
+        "bootstrap",
+        "bedrock_model_access",
+        "invocation_logging",
+        "lambda_concurrency",
+        "invoker_principals",
+        "scp_bypass",
+        "region_support",
+    }
+)
+
+
 def check_credentials(ctx: Context) -> CheckResult:
     """``sts:GetCallerIdentity``: who deploys, into which account/Region."""
-    identity = ctx.identity()
+    try:
+        identity = ctx.identity()
+    except ClientError as exc:
+        if _error_code(exc) not in _DISABLED_REGION_CODES:
+            raise
+        home = _HOME_REGION.get(ctx.partition, "us-east-1")
+        if home == ctx.region:
+            raise
+        try:
+            probe = ctx.clients("sts", region=home).get_caller_identity()
+        except ClientError:
+            raise exc from None  # the credentials really are bad
+        account = probe["Account"]
+        if not ctx.account:
+            ctx.account = account
+        ctx.region_disabled = True
+        return CheckResult(
+            "fail", "credentials", TITLES["credentials"],
+            f"{probe['Arn']}\naccount {account} has not enabled Region {ctx.region} "
+            "(an opt-in Region): its endpoints reject every request",
+            f"enable the Region (aws account enable-region --region-name {ctx.region}, "
+            "then wait a few minutes) or deploy in a Region the account already has",
+        )
     arn = identity["Arn"]
     account = identity["Account"]
     detail = f"{arn}\naccount {account}, region {ctx.region}, partition {ctx.partition}"
@@ -1117,5 +1161,13 @@ def run(ctx: Context, names: Iterable[str] | None = None) -> Report:
             raise ValueError(
                 f"unknown check(s): {', '.join(unknown)}; available: {', '.join(CHECKS)}"
             )
-    results = [execute(name, ctx) for name in selected]
+    results = []
+    for name in selected:
+        if ctx.region_disabled and name in REGIONAL_CHECKS:
+            results.append(CheckResult(
+                "skip", name, TITLES[name],
+                f"not checked: Region {ctx.region} is not enabled for this account (see credentials)",
+            ))
+            continue
+        results.append(execute(name, ctx))
     return Report(results=results, account=ctx.account, region=ctx.region, profile=ctx.profile)

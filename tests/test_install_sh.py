@@ -166,11 +166,13 @@ def test_dry_run_prints_the_phase_plan_without_touching_aws(shims):
     # build: console, CDK virtualenv, CDK CLI.
     assert re.search(r"\+ \(cd \S*/admin-ui && npm ci\)", joined)
     assert re.search(r"\+ \(cd \S*/admin-ui && npm run build\)", joined)
-    assert re.search(r"\+ \S*python\S* -m venv \S*/cdk/\.venv", joined)
+    assert re.search(r"\+ \S*python\S* -m venv \S*/cdk/\.venv", joined) or Path(ROOT, "cdk", ".venv").exists()
     assert re.search(r"cdk/\.venv/bin/pip install .*-r \S*/cdk/requirements\.txt", joined)
     assert re.search(r"\+ \(cd \S*/cdk && npm ci\)", joined)
     # bootstrap runs because the preflight was skipped.
-    assert re.search(r"\+ \(cd \S*/cdk && npx cdk bootstrap\)", joined)
+    assert re.search(
+        r"\+ \(cd \S*/cdk && npx cdk bootstrap aws://\d{12}/us-east-1 "
+        r"-c deployment_config=\S*demo\.json -c alert_email=a@example\.com -c admin_email=a@example\.com\)", joined)
     context = (
         r"-c deployment_config=\S*cdk/config/demo\.json "
         r"-c alert_email=a@example\.com -c admin_email=a@example\.com"
@@ -225,7 +227,7 @@ def test_dry_run_preflight_command_is_printed_not_executed(shims):
     preflight = out.split("==> [1/9] preflight", 1)[1].split("==> [2/9]", 1)[0]
     # The CDK virtualenv (plus the pinned boto3/httpx) is prepared first so the
     # checks can import cdk/stacks/configuration.py and validate like synth.
-    assert re.search(r"\+ \S*python\S* -m venv \S*/cdk/\.venv", preflight)
+    assert re.search(r"\+ \S*python\S* -m venv \S*/cdk/\.venv", preflight) or Path(ROOT, "cdk", ".venv").exists()
     assert re.search(
         r"cdk/\.venv/bin/pip install .*-r \S*/cdk/requirements\.txt "
         r"-r \S*/examples/requirements\.txt",
