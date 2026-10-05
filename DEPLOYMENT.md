@@ -234,7 +234,7 @@ export USER_POOL_ID=$(aws cloudformation describe-stacks --stack-name "$STACK_NA
 ```
 
 **With `admin_email`** (`-c admin_email=you@example.com` on `cdk synth` and
-`cdk deploy`, `--admin-email` in `install.sh`, `AdminEmail` in the one-click
+`cdk deploy`, `--admin-email` in `install.sh`, `AdminEmail` in the console installer
 installer, or the key in the deployment file) the stack creates the
 administrator itself: the Cognito user `quota-admin` with that address,
 added to the `admin_jwt_value` group. Cognito emails the temporary password

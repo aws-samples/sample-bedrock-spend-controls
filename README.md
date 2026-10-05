@@ -418,7 +418,7 @@ only through an explicit data-retention decision.
 |---|---|
 | `install.sh` | One-command installer: preflight, build, `cdk bootstrap`, synth, diff, deploy, outputs, smoke test; `--destroy` to tear down ([docs/installer.md](docs/installer.md)) |
 | `setup.py` | Configuration wizard: validated questions with live account checks, writes `cdk/config/<name>.local.json`; `--deploy` hands over to `install.sh` |
-| `deploy/` | `installer.yaml`, the one-click CloudFormation installer (a CodeBuild project runs `install.sh`), and its README |
+| `deploy/` | `installer.yaml`, the console CloudFormation installer (a CodeBuild project runs `install.sh`), and its README |
 | `cdk/` | CDK app, validated deployment configuration, price catalog, and the deploy-time price resolver |
 | `gateway/` | Broker and admin API (FastAPI on Lambda Web Adapter) |
 | `usage_processor/` | Invocation-log subscription consumer: pricing, ledger, warnings, blocks |

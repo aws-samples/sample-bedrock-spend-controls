@@ -8,7 +8,7 @@ Three entry points install Bedrock Spend Controls. They share one engine:
 | Entry point | For | How it runs |
 |---|---|---|
 | [`install.sh`](#installsh) | The demo in a personal account, or any deployment file, from a terminal or CloudShell | One command: preflight, build, `cdk bootstrap`, `cdk synth`, `cdk diff`, `cdk deploy`, outputs, smoke test |
-| [`deploy/installer.yaml`](#deployinstalleryaml-one-click) | The demo from the CloudFormation console, no terminal | A CodeBuild project clones the repository and runs `install.sh --yes --config demo` |
+| [`deploy/installer.yaml`](#deployinstalleryaml-console-installer) | The demo from the CloudFormation console, no terminal | A CodeBuild project clones the repository and runs `install.sh --yes --config demo` |
 | [`setup.py`](#setuppy-configuration-wizard) | A production deployment file for a shared account and your IdP | Interactive questions validated live; writes `cdk/config/<name>.local.json`; `--deploy` hands over to `install.sh` |
 
 [`tools/preflight`](#toolspreflight) and [`tools/smoke_test.py`](#smoke-test)
@@ -68,7 +68,7 @@ clone first and read the script (see
 | 9 | `done` | Prints the console URL, the broker URL, where the administrator password went, the SNS subscription reminder, the outputs path, and the `--destroy` command | never |
 
 The confirmations in phases 1, 5, and 6 are answered by `--yes`, which the
-one-click installer passes because CodeBuild has no terminal.
+console installer passes because CodeBuild has no terminal.
 
 ### Flags
 
@@ -233,7 +233,7 @@ until then. The invocation itself is a few tokens of Nova Micro. A
 or `ValidationException` means the account has no access to that model in
 the Region: enable it, or pass `--model` (`SMOKE_MODEL` for `install.sh`).
 
-## `deploy/installer.yaml` (one-click)
+## `deploy/installer.yaml` (console installer)
 
 A static CloudFormation template, no assets to upload, that installs the
 demo configuration from the console. The full description of its resources
@@ -455,7 +455,7 @@ Failures seen while testing the installers, and what to do about each.
    <region>`, then wait a few minutes) or deploy in a Region the account
    already has.
 2. **Missing or old CDK bootstrap.** `bootstrap` fails with `stack CDKToolkit
-   not found` (or a version below 21). `install.sh` and the one-click
+   not found` (or a version below 21). `install.sh` and the console
    installer handle this: the verdict stays `OK (bootstrap: handled by the
    next phases)` and phase 3 runs `cdk bootstrap`. By hand: `npx cdk
    bootstrap aws://<account>/<region>` from `cdk/`.
