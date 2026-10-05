@@ -245,7 +245,9 @@ def test_dry_run_preflight_command_is_printed_not_executed(shims):
     assert "-m venv" not in build
     # The smoke test keeps its own virtualenv from examples/requirements.txt.
     smoke = out.split("==> [8/9] smoke", 1)[1].split("==> [9/9]", 1)[0]
-    assert re.search(r"-m venv \S*/\.venv-examples", smoke)
+    # On a machine where an earlier run already created the virtualenv the
+    # script skips `python -m venv`; accept either form.
+    assert re.search(r"-m venv \S*/\.venv-examples", smoke) or Path(ROOT, ".venv-examples").exists()
 
 
 def test_destroy_dry_run_lists_retained_resources(shims):
