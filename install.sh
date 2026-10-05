@@ -520,13 +520,10 @@ data = json.load(open(sys.argv[1], encoding="utf-8"))
 results = [CheckResult(status=r["status"], name=r["name"], title=r["title"],
                        detail=r.get("detail", ""), fix=r.get("fix", "")) for r in data["results"]]
 print(Report(results, account=data.get("account"), region=data.get("region")).to_text())' "$WORK_DIR/preflight.json")
+    # A missing bootstrap or an unbuilt console are not failures here: the
+    # next phases bootstrap and build (tools/preflight/verdict.py).
     read -r PREFLIGHT_VERDICT PREFLIGHT_WARNINGS BOOTSTRAP_STATUS <<EOF
-$("$PY" -c 'import json, sys
-data = json.load(open(sys.argv[1], encoding="utf-8"))
-statuses = {r["name"]: r["status"] for r in data["results"]}
-print("ok" if data["ok"] else "fail",
-      "warn" if "warn" in statuses.values() else "clean",
-      statuses.get("bootstrap", "missing"))' "$WORK_DIR/preflight.json")
+$(cd "$ROOT" && "$PY_CDK" -m tools.preflight.verdict "$WORK_DIR/preflight.json")
 EOF
     if [ "$PREFLIGHT_VERDICT" != ok ]; then
       die "preflight failed; fix the FAIL lines above (or re-run with --skip-preflight at your own risk)"

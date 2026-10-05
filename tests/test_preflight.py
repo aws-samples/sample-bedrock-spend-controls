@@ -881,3 +881,29 @@ def test_module_runs_as_directory_and_as_module():
         )
         assert completed.returncode == 0, completed.stderr
         assert "--acknowledge-logging-overwrite" in completed.stdout
+
+
+# --- install verdict ----------------------------------------------------------------
+
+
+def test_install_verdict_ignores_what_the_installer_resolves(tmp_path, capsys):
+    from tools.preflight.verdict import install_verdict, main as verdict_main
+
+    def report(**statuses):
+        return {"ok": all(s != "fail" for s in statuses.values()),
+                "results": [{"name": n, "status": s} for n, s in statuses.items()]}
+
+    # A fresh account: no bootstrap, no console build -> the installer proceeds.
+    fresh = report(toolchain="pass", bootstrap="fail", admin_ui_build="warn", bedrock_model_access="warn")
+    assert install_verdict(fresh) == ("ok", "warn", "fail")
+    # Only installer-resolvable findings -> no warning prompt either.
+    assert install_verdict(report(bootstrap="fail", admin_ui_build="warn")) == ("ok", "clean", "fail")
+    # Anything else failing still blocks.
+    assert install_verdict(report(bootstrap="pass", invocation_logging="fail")) == ("fail", "clean", "pass")
+    assert install_verdict(report(toolchain="pass")) == ("ok", "clean", "missing")
+
+    path = tmp_path / "preflight.json"
+    path.write_text(json.dumps(fresh), encoding="utf-8")
+    assert verdict_main([str(path)]) == 0
+    assert capsys.readouterr().out.strip() == "ok warn fail"
+    assert verdict_main([]) == 2
