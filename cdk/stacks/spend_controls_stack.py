@@ -2681,7 +2681,7 @@ class SpendControlsStack(Stack):
         dashboard = cw.Dashboard(
             self,
             "Dashboard",
-            dashboard_name="bedrock-spend-controls",
+            dashboard_name=f"bedrock-spend-controls-{self.region}",
         )
 
         def search_widget(title: str, metric: str, stat: str = "Sum") -> cw.GraphWidget:

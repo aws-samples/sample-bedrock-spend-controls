@@ -791,6 +791,7 @@ replaces some resources; plan for the following.
 | Resource | What happens | Action |
 |---|---|---|
 | `deny-direct-bedrock-invocation-<region>` managed policy | Replaced (new name, new ARN) | Re-attach the new `DenyDirectBedrockPolicyArn` wherever the old policy was attached |
+| CloudWatch dashboard | Replaced as `bedrock-spend-controls-<region>`: dashboard names are account-wide, so the suffix lets one account run a stack per Region | Update bookmarks; the dashboard holds no data of its own |
 | All CloudWatch alarms | Replaced with fixed names `<stack>-<key>`; alarm history resets | Update any external alarm subscriptions or dashboards that reference alarm names |
 | SSM price parameter | CloudFormation deletes the old one; the resolver writes the new compressed parameter (`ModelPricesParameterName`) | None; metering falls back to the conservative price (alarmed) only if the parameter is unreadable at a cold start |
 | Identity Pool authenticated role | Replaced by `AdminConsoleRole` with a rules mapping on `admin_jwt_claim` | Console users sign in again; non-admin logins no longer receive credentials |
@@ -799,8 +800,8 @@ replaces some resources; plan for the following.
 | Usage-processor DLQ and 10 new alarms | Added | Subscribe the new alarms' runbooks ([docs/runbooks/README.md](docs/runbooks/README.md)) |
 | `ModelPriceSnapshot` output | Now ends with `unresolved=<n>`: a catalog model the Region does not price is skipped at deploy instead of failing it ([pricing.md](docs/pricing.md#models-the-region-does-not-price)) | Expect `unresolved=0` where every catalog model is sold; otherwise pin the listed models in `price_overrides` or keep them out of `allowed_model_arns` |
 
-Not replaced: the DynamoDB tables, `BedrockUserRole`, the invocation log
-group, and the dashboard. The `EnableBedrockInvocationLogging` custom
+Not replaced: the DynamoDB tables, `BedrockUserRole`, and the invocation
+log group. The `EnableBedrockInvocationLogging` custom
 resource now also runs on update, so a redeploy repairs the account-wide
 logging setting if something changed it. The workload enforcer renames the
 inline deny on workload roles automatically on its next run (the legacy

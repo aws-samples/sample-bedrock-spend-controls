@@ -2786,7 +2786,7 @@ def test_web_adapter_layer_is_partition_aware_and_current():
     assert ":layer:LambdaAdapterLayerX86:30" in layer
     template.has_resource_properties(
         "AWS::CloudWatch::Dashboard",
-        {"DashboardName": "bedrock-spend-controls"},
+        {"DashboardName": "bedrock-spend-controls-us-east-1"},
     )
 
 
