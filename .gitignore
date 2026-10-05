@@ -12,4 +12,8 @@ __pycache__/
 *.pyc
 .pytest_cache/
 .venv/
+.venv-examples/
 .DS_Store
+
+# Written by install.sh after a deploy (stack outputs for the smoke test).
+.install-outputs.env

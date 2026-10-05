@@ -83,6 +83,10 @@ PROJECT_DIR = os.path.abspath(
 # Tag key stamped on workload inference profiles (cost allocation + audit).
 WORKLOAD_TAG_KEY = "bedrock-spend-controls-workload"
 
+# Cognito username of the demo console administrator created from the
+# ``admin_email`` deployment key (DEPLOYMENT.md uses the same name).
+DEMO_ADMIN_USERNAME = "quota-admin"
+
 # Cross-region inference-profile ID prefixes; must stay in sync with
 # usage_processor/handler.py _PROFILE_PREFIXES.
 _CR_PROFILE_PREFIXES = {
@@ -640,6 +644,104 @@ class SpendControlsStack(Stack):
                     log_group=self._shared_custom_resource_log_group(),
                 )
                 ensure_admin_group.node.add_dependency(user_pool)
+
+                if config.admin_email:
+                    # Demo administrator (replaces DEPLOYMENT.md step 5):
+                    # Cognito emails the temporary password to admin_email,
+                    # so it never passes through the CLI, the template, or
+                    # the logs. The same call runs on create and update
+                    # (an existing quota-admin is left alone); nothing runs
+                    # on delete, matching "retain data". The physical ID
+                    # follows the address so a changed admin_email is an
+                    # update, not a no-op; note that while quota-admin
+                    # exists the call is ignored and the stored address is
+                    # not changed (delete the user and redeploy, or use
+                    # admin-update-user-attributes, to re-invite).
+                    admin_user_parameters = {
+                        "UserPoolId": user_pool.user_pool_id,
+                        "Username": DEMO_ADMIN_USERNAME,
+                        "UserAttributes": [
+                            {"Name": "email", "Value": config.admin_email},
+                            {"Name": "email_verified", "Value": "true"},
+                        ],
+                        "DesiredDeliveryMediums": ["EMAIL"],
+                    }
+                    admin_user_id = cr.PhysicalResourceId.of(
+                        "demo-admin-user-"
+                        + hashlib.sha256(
+                            config.admin_email.lower().encode("utf-8")
+                        ).hexdigest()[:12]
+                    )
+                    create_admin_user = cr.AwsSdkCall(
+                        service="CognitoIdentityServiceProvider",
+                        action="adminCreateUser",
+                        parameters=admin_user_parameters,
+                        physical_resource_id=admin_user_id,
+                        ignore_error_codes_matching="UsernameExistsException",
+                    )
+                    demo_admin_user = cr.AwsCustomResource(
+                        self,
+                        "DemoAdminUser",
+                        on_create=create_admin_user,
+                        on_update=create_admin_user,
+                        policy=cr.AwsCustomResourcePolicy.from_statements(
+                            [
+                                iam.PolicyStatement(
+                                    actions=["cognito-idp:AdminCreateUser"],
+                                    resources=[user_pool.user_pool_arn],
+                                )
+                            ]
+                        ),
+                        install_latest_aws_sdk=False,
+                        log_group=self._shared_custom_resource_log_group(),
+                    )
+                    demo_admin_user.node.add_dependency(user_pool)
+                    # Membership is idempotent in Cognito (adding an existing
+                    # member is a no-op), so create and update share the call.
+                    add_admin_to_group = cr.AwsSdkCall(
+                        service="CognitoIdentityServiceProvider",
+                        action="adminAddUserToGroup",
+                        parameters={
+                            "UserPoolId": user_pool.user_pool_id,
+                            "Username": DEMO_ADMIN_USERNAME,
+                            "GroupName": config.admin_jwt_value,
+                        },
+                        physical_resource_id=cr.PhysicalResourceId.of(
+                            "demo-admin-membership-"
+                            + hashlib.sha256(
+                                f"{config.admin_email.lower()}/"
+                                f"{config.admin_jwt_value}".encode("utf-8")
+                            ).hexdigest()[:12]
+                        ),
+                    )
+                    demo_admin_membership = cr.AwsCustomResource(
+                        self,
+                        "DemoAdminGroupMembership",
+                        on_create=add_admin_to_group,
+                        on_update=add_admin_to_group,
+                        policy=cr.AwsCustomResourcePolicy.from_statements(
+                            [
+                                iam.PolicyStatement(
+                                    actions=["cognito-idp:AdminAddUserToGroup"],
+                                    resources=[user_pool.user_pool_arn],
+                                )
+                            ]
+                        ),
+                        install_latest_aws_sdk=False,
+                        log_group=self._shared_custom_resource_log_group(),
+                    )
+                    demo_admin_membership.node.add_dependency(demo_admin_user)
+                    demo_admin_membership.node.add_dependency(ensure_admin_group)
+                    cdk.CfnOutput(
+                        self,
+                        "AdminUsername",
+                        value=DEMO_ADMIN_USERNAME,
+                        description=(
+                            "Demo console administrator created in the Cognito "
+                            "user pool; Cognito emailed its temporary password "
+                            "to admin_email"
+                        ),
+                    )
 
         if config.admin_ui and user_pool is None:
             # BYO issuer: the SPA's public client, falling back to the shared
