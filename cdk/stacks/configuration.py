@@ -27,6 +27,7 @@ CONFIG_DIR = CDK_DIR / "config"
 
 KNOWN_KEYS: frozenset[str] = frozenset({
     "adapter_layer_arn",
+    "admin_email",
     "admin_jwt_claim",
     "admin_jwt_value",
     "admin_ui",
@@ -69,6 +70,7 @@ _DEPLOYMENT_KEYS = KNOWN_KEYS
 # ``manage_invocation_logging`` has no default on purpose (explicit choice).
 DEFAULTS: Mapping[str, Any] = MappingProxyType({
     "adapter_layer_arn": "",
+    "admin_email": "",
     "admin_jwt_claim": "",
     "admin_jwt_value": "",
     "admin_ui": False,
@@ -186,6 +188,7 @@ class RateLimitConfig:
 @dataclass(frozen=True)
 class DeploymentConfig:
     adapter_layer_arn: str
+    admin_email: str
     admin_jwt_claim: str
     admin_jwt_value: str
     admin_ui: bool
@@ -480,6 +483,30 @@ class DeploymentConfig:
                 "admin_jwt_value because the browser never receives the "
                 "shared admin secret"
             )
+        admin_email = _string("admin_email", value("admin_email"))
+        if admin_email:
+            # The stack can only invite an administrator into the Cognito
+            # user pool it creates itself, and only group membership makes
+            # that user an administrator of the console.
+            if not admin_ui or jwt_issuer:
+                raise ValueError(
+                    "admin_email applies only when admin_ui=true and the "
+                    "stack manages the demo Cognito user pool (empty "
+                    "jwt_issuer); with your own identity provider, create "
+                    "the administrator there instead"
+                )
+            if admin_jwt_claim != "cognito:groups":
+                raise ValueError(
+                    "admin_email requires admin_jwt_claim=cognito:groups so "
+                    "the stack can add the administrator to the "
+                    "admin_jwt_value group; got "
+                    f"admin_jwt_claim={admin_jwt_claim!r}"
+                )
+            if not _EMAIL_ADDRESS.match(admin_email):
+                raise ValueError(
+                    "admin_email must be a single email address "
+                    f"(name@domain, no spaces); got {admin_email!r}"
+                )
         jwt_jwks_url = _string("jwt_jwks_url", value("jwt_jwks_url"))
         if jwt_issuer and not jwt_issuer.startswith("https://"):
             raise ValueError(
@@ -554,6 +581,7 @@ class DeploymentConfig:
             adapter_layer_arn=_string(
                 "adapter_layer_arn", value("adapter_layer_arn")
             ),
+            admin_email=admin_email,
             admin_jwt_claim=admin_jwt_claim,
             admin_jwt_value=admin_jwt_value,
             admin_ui=admin_ui,
@@ -718,6 +746,9 @@ def _model_pricing(raw: Any, base_dir: Path) -> ModelPricingConfig:
     return ModelPricingConfig(catalog_models, price_overrides, fallback)
 
 
+# Shape check only (one "@", no whitespace): Cognito validates the address
+# when it sends the invitation.
+_EMAIL_ADDRESS = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 _WORKLOAD_NAME = re.compile(r"^[a-z0-9][a-z0-9-]{0,47}$")
 # Role names allow [\w+=,.@-] and a path of [\w+=,.@/-]; wildcards and empty
 # segments are excluded so the enforcer's iam:PutRolePolicy/DeleteRolePolicy
@@ -1280,6 +1311,12 @@ KEY_DOCS: tuple[KeyDoc, ...] = (
     _doc(
         "admin_jwt_value", "string", "console",
         "Value (or group) of admin_jwt_claim that grants console access",
+    ),
+    _doc(
+        "admin_email", "string", "console",
+        "Email address of the demo console administrator the stack creates in "
+        "its Cognito user pool (user quota-admin, temporary password sent by "
+        "Cognito); demo Cognito with admin_jwt_claim=cognito:groups only",
     ),
     _doc(
         "admin_ui_client_id", "string", "console",
