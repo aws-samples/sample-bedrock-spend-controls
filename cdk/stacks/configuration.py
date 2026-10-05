@@ -1,20 +1,31 @@
-"""Validated deployment configuration for the Bedrock Spend Controls stack."""
+"""Validated deployment configuration for the Bedrock Spend Controls stack.
+
+``DeploymentConfig.from_mapping`` is the single validation path: the stack
+reaches it through ``from_node`` (CDK context plus the deployment file), and
+the installer tooling calls it directly, so ``cdk synth``, the preflight, and
+the setup wizard can never disagree on what is valid. ``KEY_DOCS`` describes
+every key for the wizard from the same source as the validation.
+"""
 
 from __future__ import annotations
 
+import functools
 import json
 import re
 import math
-from dataclasses import dataclass
+from collections.abc import Mapping
+from dataclasses import dataclass, field
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any
 
 from constructs import Node
 
 
 CDK_DIR = Path(__file__).resolve().parents[1]
+CONFIG_DIR = CDK_DIR / "config"
 
-_DEPLOYMENT_KEYS = {
+KNOWN_KEYS: frozenset[str] = frozenset({
     "adapter_layer_arn",
     "admin_jwt_claim",
     "admin_jwt_value",
@@ -51,9 +62,12 @@ _DEPLOYMENT_KEYS = {
     "vended_ttl_seconds",
     "warn_threshold",
     "workloads",
-}
+})
+_DEPLOYMENT_KEYS = KNOWN_KEYS
 
-_DEFAULTS = {
+# Read-only so the wizard and preflight can share it without copying;
+# ``manage_invocation_logging`` has no default on purpose (explicit choice).
+DEFAULTS: Mapping[str, Any] = MappingProxyType({
     "adapter_layer_arn": "",
     "admin_jwt_claim": "",
     "admin_jwt_value": "",
@@ -102,7 +116,11 @@ _DEFAULTS = {
     "vended_ttl_seconds": 900,
     "warn_threshold": 0.8,
     "workloads": "",
-}
+})
+_DEFAULTS = DEFAULTS
+
+# Keys whose value may be a relative file path (besides inline JSON).
+_FILE_KEYS = frozenset({"model_config", "workloads"})
 
 
 @dataclass(frozen=True)
@@ -232,19 +250,60 @@ class DeploymentConfig:
     ) -> "DeploymentConfig":
         """Build the configuration from CDK context and the deployment file.
 
+        ``deployment_config`` context names the file (or holds inline JSON);
+        every other known key present in context overrides the file's value.
+        ``-c`` values arrive as strings, which is why ``default_limits`` (an
+        object) can only come from the file. A relative ``model_config`` or
+        ``workloads`` path given as context resolves from ``cdk/``; one
+        inside the file resolves from the file's directory.
+
         ``account`` is the stack's resolved AWS account ID when the CDK
         environment is known at synth (``CDK_DEFAULT_ACCOUNT`` or an explicit
         ``env``); pass ``None`` for an environment-agnostic synth. When
         known, workload ``role_arn`` entries must belong to that account.
         """
-        raw_deployment = node.try_get_context("deployment_config")
-        deployment, deployment_dir = _load_deployment(raw_deployment)
+        deployment, deployment_dir = _load_deployment(
+            node.try_get_context("deployment_config")
+        )
+        values = dict(deployment)
+        for name in sorted(KNOWN_KEYS):
+            context_value = node.try_get_context(name)
+            if context_value is None:
+                continue
+            if name in _FILE_KEYS:
+                context_value = _anchor_context_path(name, context_value)
+            values[name] = context_value
+        return cls.from_mapping(
+            values, base_dir=deployment_dir, account=account
+        )
+
+    @classmethod
+    def from_mapping(
+        cls,
+        values: Mapping[str, Any],
+        *,
+        base_dir: Path,
+        account: str | None = None,
+    ) -> "DeploymentConfig":
+        """Validate deployment keys exactly as ``cdk synth`` does.
+
+        ``values`` holds the keys of a deployment file (the shape of
+        ``cdk/config/demo.json``), already merged with any overrides by the
+        caller: unknown keys are rejected and missing ones take ``DEFAULTS``.
+        Relative ``model_config`` and ``workloads`` file paths resolve from
+        ``base_dir`` first and the current directory second. ``account`` is
+        the AWS account the stack deploys to when known (workload
+        ``role_arn`` entries must belong to it); ``None`` checks format
+        alone. Validation stops at the first problem with a ``ValueError``.
+        """
+        unknown = sorted(set(values) - KNOWN_KEYS)
+        if unknown:
+            raise ValueError(
+                "Unknown deployment_config keys: " + ", ".join(unknown)
+            )
 
         def value(name: str) -> Any:
-            context_value = node.try_get_context(name)
-            if context_value is not None:
-                return context_value
-            return deployment.get(name, _DEFAULTS.get(name))
+            return values.get(name, DEFAULTS.get(name))
 
         manage_raw = value("manage_invocation_logging")
         manage_logging = (
@@ -278,22 +337,8 @@ class DeploymentConfig:
                 "already receives Bedrock model-invocation logs."
             )
 
-        model_source = value("model_config")
-        model_base = (
-            CDK_DIR
-            if node.try_get_context("model_config") is not None
-            else deployment_dir
-        )
-        model_pricing = _model_pricing(model_source, model_base)
-
-        workloads_base = (
-            CDK_DIR
-            if node.try_get_context("workloads") is not None
-            else deployment_dir
-        )
-        workloads = _workloads(
-            value("workloads"), workloads_base, account=account
-        )
+        model_pricing = _model_pricing(value("model_config"), base_dir)
+        workloads = _workloads(value("workloads"), base_dir, account=account)
 
         allowed_model_arns = _string_list(
             "allowed_model_arns", value("allowed_model_arns")
@@ -557,16 +602,48 @@ class DeploymentConfig:
         )
 
 
+def validate_mapping(
+    values: Mapping[str, Any], *, base_dir: Path, account: str | None = None
+) -> list[str]:
+    """Return the validation errors for ``values``; ``[]`` when it is valid.
+
+    Same arguments as ``DeploymentConfig.from_mapping``. Validation stops at
+    the first problem (the ``ValueError`` ``cdk synth`` would print), so the
+    list holds at most one message; callers re-run it after each fix.
+    """
+    try:
+        DeploymentConfig.from_mapping(values, base_dir=base_dir, account=account)
+    except ValueError as exc:
+        return [str(exc)]
+    return []
+
+
 def _load_deployment(raw: Any) -> tuple[dict[str, Any], Path]:
+    """Read the ``deployment_config`` context value: nothing, inline JSON, or
+    a file path. Returns the keys (unknown ones are rejected by
+    ``from_mapping``) and the directory the file's relative paths resolve
+    from (``cdk/`` when there is no file)."""
     if raw is None:
         return {}, CDK_DIR
     deployment, source_path = _mapping("deployment_config", raw, CDK_DIR)
-    unknown = sorted(set(deployment) - _DEPLOYMENT_KEYS)
-    if unknown:
-        raise ValueError(
-            "Unknown deployment_config keys: " + ", ".join(unknown)
-        )
     return deployment, source_path.parent if source_path else CDK_DIR
+
+
+def _anchor_context_path(name: str, raw: Any) -> Any:
+    """Pin a relative file path passed as ``-c`` context to ``cdk/``.
+
+    ``from_mapping`` resolves relative paths from the deployment file's
+    directory, but a context value has no file to be relative to, so it
+    keeps resolving from ``cdk/`` (then the current directory) by becoming
+    absolute before the merge. Inline JSON, empty, non-string, and absolute
+    values pass through untouched.
+    """
+    if not isinstance(raw, str):
+        return raw
+    text = raw.strip()
+    if not text or text.startswith("{") or Path(text).expanduser().is_absolute():
+        return raw
+    return str(_resolve_file(name, text, CDK_DIR))
 
 
 def _model_pricing(raw: Any, base_dir: Path) -> ModelPricingConfig:
@@ -773,11 +850,7 @@ def _mapping(
             raise ValueError(f"{name} JSON must be an object")
         return parsed, None
 
-    path = Path(text).expanduser()
-    candidates = [path] if path.is_absolute() else [base_dir / path, Path.cwd() / path]
-    resolved = next((candidate for candidate in candidates if candidate.is_file()), None)
-    if resolved is None:
-        raise ValueError(f"{name} file not found: {text}")
+    resolved = _resolve_file(name, text, base_dir)
     try:
         parsed = json.loads(resolved.read_text(encoding="utf-8"))
     except json.JSONDecodeError as exc:
@@ -785,6 +858,17 @@ def _mapping(
     if not isinstance(parsed, dict):
         raise ValueError(f"{name} file must contain a JSON object")
     return parsed, resolved
+
+
+def _resolve_file(name: str, text: str, base_dir: Path) -> Path:
+    """Locate a configuration file: as given when absolute, otherwise under
+    ``base_dir`` first and the current directory second."""
+    path = Path(text).expanduser()
+    candidates = [path] if path.is_absolute() else [base_dir / path, Path.cwd() / path]
+    resolved = next((candidate for candidate in candidates if candidate.is_file()), None)
+    if resolved is None:
+        raise ValueError(f"{name} file not found: {text}")
+    return resolved
 
 
 def _boolean(name: str, raw: Any) -> bool:
@@ -1064,9 +1148,308 @@ def _price(name: str, raw: Any, *, allow_image_model: bool = True) -> dict[str, 
     image_model = allow_image_model and _non_negative_float(
         f"{name}.per_image", raw.get("per_image", 0)
     ) > 0
-    for field in sorted(raw):
-        if field in _REQUIRED_PRICE_KEYS and not image_model:
-            price[field] = _positive_float(f"{name}.{field}", raw[field])
+    for dimension in sorted(raw):
+        label = f"{name}.{dimension}"
+        if dimension in _REQUIRED_PRICE_KEYS and not image_model:
+            price[dimension] = _positive_float(label, raw[dimension])
         else:
-            price[field] = _non_negative_float(f"{name}.{field}", raw[field])
+            price[dimension] = _non_negative_float(label, raw[dimension])
     return price
+
+
+# --- Key documentation for the installer and the setup wizard --------------
+#
+# One ``KeyDoc`` per key in KNOWN_KEYS, in the order the wizard asks. The
+# help lines condense docs/configuration.md; tests pin that the table there
+# lists exactly these keys with the same defaults.
+
+KEY_TYPES: frozenset[str] = frozenset(
+    {"bool", "int", "float", "string", "string_list", "object", "path"}
+)
+# Wizard order; every KeyDoc.section is one of these.
+KEY_SECTIONS: tuple[str, ...] = (
+    "identity",
+    "console",
+    "logging",
+    "models",
+    "access",
+    "limits",
+    "enforcement",
+    "retention",
+    "alerts",
+    "workloads",
+    "operations",
+)
+# The reference deployment files shipped in cdk/config/.
+PROFILES: tuple[str, ...] = ("demo", "production")
+
+
+@functools.cache
+def _profile_values(profile: str) -> Mapping[str, Any]:
+    """The shipped ``cdk/config/<profile>.json`` deployment file, read once."""
+    path = CONFIG_DIR / f"{profile}.json"
+    return MappingProxyType(json.loads(path.read_text(encoding="utf-8")))
+
+
+class _ProfileDefaults(Mapping[str, Any]):
+    """``{profile: value}`` for one key, read from the shipped profile files
+    on first access so the documentation can never drift from them. The
+    value is None when the profile leaves the key at its default."""
+
+    __slots__ = ("_key",)
+
+    def __init__(self, key: str) -> None:
+        self._key = key
+
+    def __getitem__(self, profile: str) -> Any:
+        if profile not in PROFILES:
+            raise KeyError(profile)
+        return _profile_values(profile).get(self._key)
+
+    def __iter__(self):
+        return iter(PROFILES)
+
+    def __len__(self) -> int:
+        return len(PROFILES)
+
+    def __repr__(self) -> str:
+        return repr(dict(self))
+
+
+@dataclass(frozen=True)
+class KeyDoc:
+    """One deployment key as the wizard presents it."""
+
+    name: str
+    type: str  # one of KEY_TYPES
+    default: Any  # DEFAULTS[name]; None for manage_invocation_logging
+    help: str  # one line, English, no trailing period
+    section: str  # one of KEY_SECTIONS
+    # {"demo": ..., "production": ...}; derived from ``name``, so it takes
+    # no part in equality or hashing.
+    profile_defaults: Mapping[str, Any] = field(compare=False)
+    advanced: bool = False  # asked only under "advanced"
+
+
+def _doc(
+    name: str, kind: str, section: str, text: str, *, advanced: bool = False
+) -> KeyDoc:
+    return KeyDoc(
+        name=name,
+        type=kind,
+        default=DEFAULTS.get(name),
+        help=text,
+        section=section,
+        profile_defaults=_ProfileDefaults(name),
+        advanced=advanced,
+    )
+
+
+KEY_DOCS: tuple[KeyDoc, ...] = (
+    # identity
+    _doc(
+        "jwt_issuer", "string", "identity",
+        "OIDC issuer URL (https://) of your identity provider; empty creates "
+        "the demo Cognito user pool",
+    ),
+    _doc(
+        "jwt_audience", "string", "identity",
+        "Comma-separated audiences; the first is the data-plane audience, "
+        "required with jwt_issuer",
+    ),
+    _doc(
+        "jwt_user_claim", "string", "identity",
+        "JWT claim whose value is the quota subject",
+    ),
+    _doc(
+        "jwt_jwks_url", "string", "identity",
+        "Explicit https:// JWKS URL when OIDC discovery is unavailable; "
+        "requires jwt_issuer",
+    ),
+    # console
+    _doc(
+        "admin_ui", "bool", "console",
+        "Host the admin console on CloudFront; requires admin_jwt_claim and "
+        "admin_jwt_value",
+    ),
+    _doc(
+        "admin_jwt_claim", "string", "console",
+        "JWT claim that authorizes browser administrators; set together with "
+        "admin_jwt_value",
+    ),
+    _doc(
+        "admin_jwt_value", "string", "console",
+        "Value (or group) of admin_jwt_claim that grants console access",
+    ),
+    _doc(
+        "admin_ui_client_id", "string", "console",
+        "Public OAuth client ID of the console SPA with your own jwt_issuer; "
+        "defaults to jwt_audience",
+    ),
+    _doc(
+        "admin_ui_connect_origins", "string_list", "console",
+        "Extra https:// origins (no trailing slash) the console may connect "
+        "to, added to its Content-Security-Policy",
+        advanced=True,
+    ),
+    # logging
+    _doc(
+        "manage_invocation_logging", "bool", "logging",
+        "Let the stack own Region-wide Bedrock invocation logging (true "
+        "overwrites the existing configuration); false requires "
+        "invocation_log_group_name",
+    ),
+    _doc(
+        "invocation_log_group_name", "string", "logging",
+        "Existing log group that already receives Bedrock invocation logs; "
+        "implies manage_invocation_logging=false",
+    ),
+    # models
+    _doc(
+        "allowed_model_arns", "string_list", "models",
+        "Bedrock IAM resource ARNs (foundation models or inference profiles) "
+        "vended sessions may invoke; '*' allows every model",
+    ),
+    _doc(
+        "model_config", "path", "models",
+        "Price catalog, overrides, and fallback price file",
+        advanced=True,
+    ),
+    # access
+    _doc(
+        "invoker_principal_arns", "string_list", "access",
+        "IAM principal ARNs allowed to call the broker Function URL, no "
+        "wildcards; empty keeps the account's default principals",
+    ),
+    _doc(
+        "auto_provision_users", "bool", "access",
+        "Create a quota row with default_limits on the first valid JWT",
+    ),
+    # limits
+    _doc(
+        "default_limits", "object", "limits",
+        "Default daily, weekly, and monthly limits (usd, input_tokens, "
+        "output_tokens, optional thresholds and rate) for new subjects",
+    ),
+    _doc(
+        "warn_threshold", "float", "limits",
+        "Fraction of a limit, greater than 0 and less than 1, at which the "
+        "default thresholds warn",
+    ),
+    # enforcement
+    _doc(
+        "permission_lease_seconds", "int", "enforcement",
+        "Deployment default for the runtime lease dial: 60, 300, or 900 "
+        "seconds",
+    ),
+    _doc(
+        "vended_ttl_seconds", "int", "enforcement",
+        "Lifetime of vended credentials, 900 to 3600 seconds (role-chaining "
+        "cap)",
+        advanced=True,
+    ),
+    _doc(
+        "refresh_overlap_seconds", "int", "enforcement",
+        "Seconds before the lease deadline at which clients refresh; less "
+        "than permission_lease_seconds",
+        advanced=True,
+    ),
+    _doc(
+        "refresh_jitter_seconds", "int", "enforcement",
+        "Random spread applied to the refresh point; less than "
+        "refresh_overlap_seconds",
+        advanced=True,
+    ),
+    _doc(
+        "vend_rate_limit_per_minute", "int", "enforcement",
+        "Broker calls per identity per minute, retries included, across "
+        "every replica serving that identity",
+        advanced=True,
+    ),
+    _doc(
+        "revocation_policy_shards", "int", "enforcement",
+        "Number of aws:SourceIdentity deny shards; fixed at 19",
+        advanced=True,
+    ),
+    _doc(
+        "revocation_reconcile_minutes", "int", "enforcement",
+        "Period of the revocation processor's repair schedule",
+        advanced=True,
+    ),
+    _doc(
+        "reserve_enforcement_concurrency", "bool", "enforcement",
+        "Pin the five enforcement workers at one reserved concurrent "
+        "execution each; false only when the Lambda concurrency quota cannot "
+        "spare five slots",
+        advanced=True,
+    ),
+    # retention
+    _doc(
+        "usage_retention_days", "int", "retention",
+        "Daily usage ledger retention in days, at least 31",
+    ),
+    _doc(
+        "retain_tables_on_delete", "bool", "retention",
+        "Retain the DynamoDB tables on stack deletion and enable deletion "
+        "protection",
+    ),
+    _doc(
+        "log_retention_days", "int", "retention",
+        "Retention of every Lambda log group, one of the CloudWatch Logs "
+        "retention values",
+        advanced=True,
+    ),
+    # alerts
+    _doc(
+        "alert_email", "string", "alerts",
+        "Email address subscribed to the SNS alerts topic",
+    ),
+    # workloads
+    _doc(
+        "workloads", "path", "workloads",
+        "Workload roster (file path or inline JSON) of directly-invoking "
+        "applications; empty disables workload mode",
+    ),
+    # operations
+    _doc(
+        "reconciliation_enabled", "bool", "operations",
+        "Deploy the daily ledger-vs-Cost-Explorer reconciliation",
+    ),
+    _doc(
+        "reconcile_lag_days", "int", "operations",
+        "Settled day each reconciliation run compares (today minus lag, "
+        "UTC), 1 to 14",
+        advanced=True,
+    ),
+    _doc(
+        "reconciliation_alarm_percent", "float", "operations",
+        "Ledger-vs-Cost-Explorer delta in percent (at most 100) that, over "
+        "two consecutive runs, raises the reconciliation_delta alarm",
+        advanced=True,
+    ),
+    _doc(
+        "reconciliation_service_names", "string_list", "operations",
+        "Cost Explorer SERVICE values summed as Bedrock spend",
+        advanced=True,
+    ),
+    _doc(
+        "snapstart", "bool", "operations",
+        "Enable Lambda SnapStart for the broker",
+        advanced=True,
+    ),
+    _doc(
+        "adapter_layer_arn", "string", "operations",
+        "Override the Lambda Web Adapter layer ARN; empty uses the regional "
+        "default",
+        advanced=True,
+    ),
+)
+
+_KEY_DOCS_BY_NAME: Mapping[str, KeyDoc] = MappingProxyType(
+    {doc.name: doc for doc in KEY_DOCS}
+)
+
+
+def describe_key(name: str) -> KeyDoc:
+    """The ``KeyDoc`` for one deployment key; ``KeyError`` when unknown."""
+    return _KEY_DOCS_BY_NAME[name]
