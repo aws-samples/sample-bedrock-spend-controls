@@ -792,6 +792,7 @@ replaces some resources; plan for the following.
 |---|---|---|
 | `deny-direct-bedrock-invocation-<region>` managed policy | Replaced (new name, new ARN) | Re-attach the new `DenyDirectBedrockPolicyArn` wherever the old policy was attached |
 | CloudWatch dashboard | Replaced as `bedrock-spend-controls-<region>`: dashboard names are account-wide, so the suffix lets one account run a stack per Region | Update bookmarks; the dashboard holds no data of its own |
+| CloudFront response headers policy and origin access control | Renamed `bedrock-spend-controls-admin-ui-<region>` (CloudFront names are account-wide); the origin access control is recreated | None; the distribution and its URL stay |
 | All CloudWatch alarms | Replaced with fixed names `<stack>-<key>`; alarm history resets | Update any external alarm subscriptions or dashboards that reference alarm names |
 | SSM price parameter | CloudFormation deletes the old one; the resolver writes the new compressed parameter (`ModelPricesParameterName`) | None; metering falls back to the conservative price (alarmed) only if the parameter is unreadable at a cold start |
 | Identity Pool authenticated role | Replaced by `AdminConsoleRole` with a rules mapping on `admin_jwt_claim` | Console users sign in again; non-admin logins no longer receive credentials |
@@ -801,7 +802,10 @@ replaces some resources; plan for the following.
 | `ModelPriceSnapshot` output | Now ends with `unresolved=<n>`: a catalog model the Region does not price is skipped at deploy instead of failing it ([pricing.md](docs/pricing.md#models-the-region-does-not-price)) | Expect `unresolved=0` where every catalog model is sold; otherwise pin the listed models in `price_overrides` or keep them out of `allowed_model_arns` |
 
 Not replaced: the DynamoDB tables, `BedrockUserRole`, and the invocation
-log group. The `EnableBedrockInvocationLogging` custom
+log group. One stack per Region per account is supported for the demo
+profile; a production profile with `admin_ui: true` and a bring-your-own
+issuer creates an IAM OIDC provider for that issuer, which is account-wide,
+so a second Region needs a different issuer or `admin_ui: false`. The `EnableBedrockInvocationLogging` custom
 resource now also runs on update, so a redeploy repairs the account-wide
 logging setting if something changed it. The workload enforcer renames the
 inline deny on workload roles automatically on its next run (the legacy

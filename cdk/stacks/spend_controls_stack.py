@@ -458,9 +458,15 @@ class SpendControlsStack(Stack):
                 removal_policy=RemovalPolicy.DESTROY,
                 auto_delete_objects=True,
             )
+            # CloudFront is a global service: policy and origin-access-control
+            # names are unique per account, not per Region, so they carry the
+            # Region to let one account run a stack per Region.
             ui_security_headers = cloudfront.ResponseHeadersPolicy(
                 self,
                 "AdminUiSecurityHeaders",
+                response_headers_policy_name=(
+                    f"bedrock-spend-controls-admin-ui-{self.region}"
+                ),
                 comment="Security headers for the Bedrock quota admin UI",
                 security_headers_behavior=cloudfront.ResponseSecurityHeadersBehavior(
                     content_security_policy=cloudfront.ResponseHeadersContentSecurityPolicy(
@@ -498,12 +504,21 @@ class SpendControlsStack(Stack):
                     ),
                 ),
             )
+            ui_origin_access_control = cloudfront.S3OriginAccessControl(
+                self,
+                "AdminUiOriginAccessControl",
+                origin_access_control_name=(
+                    f"bedrock-spend-controls-admin-ui-{self.region}"
+                ),
+                description="Bedrock Spend Controls admin console origin",
+            )
             ui_distribution = cloudfront.Distribution(
                 self, "AdminUiDistribution",
                 default_root_object="index.html",
                 default_behavior=cloudfront.BehaviorOptions(
                     origin=cloudfront_origins.S3BucketOrigin.with_origin_access_control(
-                        ui_bucket
+                        ui_bucket,
+                        origin_access_control=ui_origin_access_control,
                     ),
                     viewer_protocol_policy=(
                         cloudfront.ViewerProtocolPolicy.REDIRECT_TO_HTTPS

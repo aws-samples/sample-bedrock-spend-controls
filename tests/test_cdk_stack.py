@@ -2961,3 +2961,47 @@ def test_demo_profile_accepts_admin_email_context():
     assert len(_sdk_calls(template, "adminCreateUser")) == 1
     template.has_output("AdminUsername", {"Value": "quota-admin"})
     assert "Admin@Example.com" not in json.dumps(template.to_json())
+
+
+def test_account_global_resource_names_carry_the_region():
+    """CloudWatch dashboards, CloudFront policies and origin access controls,
+    and IAM managed policies are named per account, not per Region. Every
+    explicit name on such a resource must include the Region, or a second
+    stack in another Region of the same account fails with AlreadyExists
+    (seen live in us-west-2 after a us-east-2 install)."""
+    template = _template(
+        {
+            "manage_invocation_logging": True,
+            "admin_ui": True,
+            "admin_jwt_claim": "cognito:groups",
+            "admin_jwt_value": "quota-admins",
+        }
+    ).to_json()
+    name_keys = {
+        "AWS::CloudWatch::Dashboard": ("DashboardName",),
+        "AWS::CloudFront::ResponseHeadersPolicy": ("ResponseHeadersPolicyConfig", "Name"),
+        "AWS::CloudFront::OriginAccessControl": ("OriginAccessControlConfig", "Name"),
+        "AWS::CloudFront::CachePolicy": ("CachePolicyConfig", "Name"),
+        "AWS::CloudFront::OriginRequestPolicy": ("OriginRequestPolicyConfig", "Name"),
+        "AWS::CloudFront::Function": ("Name",),
+        "AWS::IAM::ManagedPolicy": ("ManagedPolicyName",),
+        "AWS::IAM::Role": ("RoleName",),
+    }
+    seen = 0
+    for logical_id, resource in template["Resources"].items():
+        keys = name_keys.get(resource["Type"])
+        if not keys:
+            continue
+        value = resource.get("Properties", {})
+        for key in keys:
+            value = value.get(key) if isinstance(value, dict) else None
+        if value is None:
+            continue  # CloudFormation generates a unique name
+        seen += 1
+        rendered = json.dumps(value)
+        assert "us-east-1" in rendered or '"Ref": "AWS::Region"' in rendered, (
+            f"{logical_id} ({resource['Type']}) has the fixed name {rendered}; "
+            "it must include the Region"
+        )
+    # The three resources the live failures were about are present and named.
+    assert seen >= 3
