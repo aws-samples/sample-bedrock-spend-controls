@@ -901,6 +901,18 @@ def test_install_verdict_ignores_what_the_installer_resolves(tmp_path, capsys):
     # Anything else failing still blocks.
     assert install_verdict(report(bootstrap="pass", invocation_logging="fail")) == ("fail", "clean", "pass")
     assert install_verdict(report(toolchain="pass")) == ("ok", "clean", "missing")
+    # The demo's deliberate "*" advisory does not prompt; any other model warning does.
+    from tools.preflight.verdict import render
+    unrestricted = {"ok": True, "results": [
+        {"name": "bedrock_model_access", "status": "warn", "title": "Bedrock model access",
+         "detail": "allowed_model_arns contains '*': vended sessions may call any model", "fix": "pin"},
+        {"name": "bootstrap", "status": "fail", "title": "CDK bootstrap", "detail": "missing", "fix": "bootstrap"}]}
+    assert install_verdict(unrestricted) == ("ok", "clean", "fail")
+    unrestricted["results"][0]["detail"] = "model X is not enabled"
+    assert install_verdict(unrestricted) == ("ok", "warn", "fail")
+    text = render(unrestricted)
+    assert "Installer verdict: OK (bootstrap: handled by the next phases); warnings need a look" in text
+    assert "Summary:" not in text and "FAIL  bootstrap" in text
 
     path = tmp_path / "preflight.json"
     path.write_text(json.dumps(fresh), encoding="utf-8")

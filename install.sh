@@ -409,6 +409,8 @@ if [ "$DRY_RUN" = 0 ]; then
   fi
   export CDK_DEFAULT_ACCOUNT="$ACCOUNT"
   say "  account:     $ACCOUNT"
+else
+  ACCOUNT="111122223333"  # placeholder: a dry run never contacts AWS
 fi
 
 # --- helpers shared by the phases -----------------------------------------------
@@ -513,13 +515,9 @@ else
     if [ "$PREFLIGHT_RC" -eq 2 ] || [ ! -s "$WORK_DIR/preflight.json" ]; then
       die "preflight could not run (usage or configuration error above)"
     fi
-    # Render the same table the text mode prints, from the JSON we keep.
-    (cd "$ROOT" && "$PY_CDK" -c 'import json, sys
-from tools.preflight.report import CheckResult, Report
-data = json.load(open(sys.argv[1], encoding="utf-8"))
-results = [CheckResult(status=r["status"], name=r["name"], title=r["title"],
-                       detail=r.get("detail", ""), fix=r.get("fix", "")) for r in data["results"]]
-print(Report(results, account=data.get("account"), region=data.get("region")).to_text())' "$WORK_DIR/preflight.json")
+    # Render the table with the installer's reading of it (a missing
+    # bootstrap or console build is handled by the next phases).
+    (cd "$ROOT" && "$PY_CDK" -m tools.preflight.verdict --render "$WORK_DIR/preflight.json")
     # A missing bootstrap or an unbuilt console are not failures here: the
     # next phases bootstrap and build (tools/preflight/verdict.py).
     read -r PREFLIGHT_VERDICT PREFLIGHT_WARNINGS BOOTSTRAP_STATUS <<EOF
@@ -558,7 +556,9 @@ else
   else
     say "preflight bootstrap check: $BOOTSTRAP_STATUS"
   fi
-  run_in "$ROOT/cdk" npx cdk bootstrap
+  # The CLI synthesizes the app even for bootstrap, so the deployment
+  # context must come along; the explicit environment avoids a lookup.
+  run_in "$ROOT/cdk" npx cdk bootstrap "aws://$ACCOUNT/$REGION" "${CDK_CONTEXT[@]}"
   end_phase OK
 fi
 
