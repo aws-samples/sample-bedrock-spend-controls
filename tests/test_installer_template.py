@@ -500,6 +500,15 @@ def test_build_role_is_scoped_to_the_cdk_bootstrap_and_read_only_elsewhere(templ
     assert f"parameter/cdk-bootstrap/{BOOTSTRAP_QUALIFIER}/*" in _sub_text(by_sid["BootstrapVersionParameter"]["Resource"])
     assert "kms:*" not in granted, "the default bootstrap uses the AWS managed key"
 
+    # Recovering from a failed first create is scoped to the deployed stack
+    # and its retained invocation log group (install.sh asks, --yes answers).
+    recover = by_sid["RecoverFailedCreate"]
+    assert _as_list(recover["Action"]) == ["cloudformation:DeleteStack"]
+    assert _sub_text(recover["Resource"]).endswith(f":stack/{STACK_NAME}/*")
+    orphan = by_sid["RecoverRetainedLogGroup"]
+    assert _as_list(orphan["Action"]) == ["logs:DeleteLogGroup"]
+    assert _sub_text(orphan["Resource"]).endswith(":log-group:/bedrock/spend-controls/model-invocations:*")
+
     # The build writes only to its own log group.
     logs = by_sid["WriteBuildLogs"]
     assert logs["Resource"] == {"Fn::GetAtt": ["InstallerLogGroup", "Arn"]}

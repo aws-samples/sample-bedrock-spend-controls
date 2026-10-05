@@ -177,6 +177,19 @@ Resources:
                   - ssm:ListTagsForResource
                   - ssm:RemoveTagsFromResource
                 Resource: !Sub arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/cdk-bootstrap/hnb659fds/*
+              # A first create that failed leaves the stack in
+              # ROLLBACK_COMPLETE and its retained invocation log group
+              # behind; install.sh deletes both (after the --yes the build
+              # passes) before creating the stack again. Scoped to that
+              # stack and that log group.
+              - Sid: RecoverFailedCreate
+                Effect: Allow
+                Action: cloudformation:DeleteStack
+                Resource: !Sub arn:${AWS::Partition}:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/BedrockSpendControls/*
+              - Sid: RecoverRetainedLogGroup
+                Effect: Allow
+                Action: logs:DeleteLogGroup
+                Resource: !Sub arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/bedrock/spend-controls/model-invocations:*
               # install.sh, the preflight and the smoke test read stack state.
               - Sid: ReadStacks
                 Effect: Allow

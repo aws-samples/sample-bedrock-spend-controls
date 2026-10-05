@@ -113,7 +113,11 @@ resources. Its policy is scoped to those names where AWS allows it:
   `cognito-idp:AdminCreateUser/AdminSetUserPassword/AdminDeleteUser` on the
   account's user pools, and `lambda:InvokeFunctionUrl` (IAM auth) on
   functions named `BedrockSpendControls-*`;
-- `logs:CreateLogStream` / `PutLogEvents` on the installer log group.
+- `logs:CreateLogStream` / `PutLogEvents` on the installer log group;
+- to retry after a failed first create: `cloudformation:DeleteStack` on
+  stack `BedrockSpendControls` only (a stack in `ROLLBACK_COMPLETE` cannot
+  be updated) and `logs:DeleteLogGroup` on the retained
+  `/bedrock/spend-controls/model-invocations` group only.
 
 The role trusts `codebuild.amazonaws.com` only from this account's CodeBuild
 projects (`aws:SourceAccount` / `aws:SourceArn`). Accounts whose existing CDK
