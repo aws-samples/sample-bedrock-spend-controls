@@ -13,3 +13,7 @@ httpx==0.28.1
 PyJWT[crypto]==2.15.0
 uvicorn==0.34.3
 pytest==9.1.1
+# deploy/installer.yaml: tests/test_installer_template.py lints the template
+# (the test skips when cfn-lint is missing) and parses it with PyYAML.
+cfn-lint==1.57.1
+PyYAML==6.0.3

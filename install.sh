@@ -409,6 +409,8 @@ if [ "$DRY_RUN" = 0 ]; then
   fi
   export CDK_DEFAULT_ACCOUNT="$ACCOUNT"
   say "  account:     $ACCOUNT"
+else
+  ACCOUNT="111122223333"  # placeholder: a dry run never contacts AWS
 fi
 
 # --- helpers shared by the phases -----------------------------------------------
@@ -453,6 +455,43 @@ print("true" if value is True or str(value).strip().lower() == "true" else "fals
 
 stack_exists() {
   aws cloudformation describe-stacks --stack-name "$STACK_NAME" >/dev/null 2>&1
+}
+
+stack_status() {
+  aws cloudformation describe-stacks --stack-name "$STACK_NAME" \
+    --query 'Stacks[0].StackStatus' --output text 2>/dev/null || true
+}
+
+# A stack whose first create failed sits in ROLLBACK_COMPLETE and cannot be
+# updated: CloudFormation requires deleting it before creating it again.
+recover_failed_stack() {
+  local status
+  status="$(stack_status)"
+  case "$status" in
+    ROLLBACK_COMPLETE|ROLLBACK_FAILED|CREATE_FAILED|DELETE_FAILED)
+      say "stack $STACK_NAME is in $status: a previous create failed and CloudFormation cannot update it"
+      say "(cdk deploy printed the failing resource; the log groups it kept may hold the reason)"
+      confirm "Delete the failed stack and create it again?"
+      run aws cloudformation delete-stack --stack-name "$STACK_NAME"
+      run aws cloudformation wait stack-delete-complete --stack-name "$STACK_NAME"
+      ;;
+  esac
+}
+
+# The stack RETAINs its invocation log group on delete and on rollback, so
+# a second create in the same Region fails with "already exists" unless
+# that orphan goes first. Only for a fresh create with stack-managed logging.
+remove_orphaned_log_group() {
+  local group="/bedrock/spend-controls/model-invocations" found=""
+  if stack_exists; then return 0; fi
+  if [ "$(config_flag manage_invocation_logging)" != true ]; then return 0; fi
+  found="$(aws logs describe-log-groups --log-group-name-prefix "$group" \
+    --query "logGroups[?logGroupName=='$group'].logGroupName" --output text 2>/dev/null || true)"
+  if [ "$found" != "$group" ]; then return 0; fi
+  say "log group $group exists without the stack (kept by an earlier install's rollback or destroy);"
+  say "CloudFormation cannot create it again while it is there"
+  confirm "Delete $group (its old invocation logs are lost) so the new stack can own it?"
+  run aws logs delete-log-group --log-group-name "$group"
 }
 
 # --- destroy ----------------------------------------------------------------------
@@ -513,13 +552,9 @@ else
     if [ "$PREFLIGHT_RC" -eq 2 ] || [ ! -s "$WORK_DIR/preflight.json" ]; then
       die "preflight could not run (usage or configuration error above)"
     fi
-    # Render the same table the text mode prints, from the JSON we keep.
-    (cd "$ROOT" && "$PY_CDK" -c 'import json, sys
-from tools.preflight.report import CheckResult, Report
-data = json.load(open(sys.argv[1], encoding="utf-8"))
-results = [CheckResult(status=r["status"], name=r["name"], title=r["title"],
-                       detail=r.get("detail", ""), fix=r.get("fix", "")) for r in data["results"]]
-print(Report(results, account=data.get("account"), region=data.get("region")).to_text())' "$WORK_DIR/preflight.json")
+    # Render the table with the installer's reading of it (a missing
+    # bootstrap or console build is handled by the next phases).
+    (cd "$ROOT" && "$PY_CDK" -m tools.preflight.verdict --render "$WORK_DIR/preflight.json")
     # A missing bootstrap or an unbuilt console are not failures here: the
     # next phases bootstrap and build (tools/preflight/verdict.py).
     read -r PREFLIGHT_VERDICT PREFLIGHT_WARNINGS BOOTSTRAP_STATUS <<EOF
@@ -558,7 +593,9 @@ else
   else
     say "preflight bootstrap check: $BOOTSTRAP_STATUS"
   fi
-  run_in "$ROOT/cdk" npx cdk bootstrap
+  # The CLI synthesizes the app even for bootstrap, so the deployment
+  # context must come along; the explicit environment avoids a lookup.
+  run_in "$ROOT/cdk" npx cdk bootstrap "aws://$ACCOUNT/$REGION" "${CDK_CONTEXT[@]}"
   end_phase OK
 fi
 
@@ -587,6 +624,13 @@ fi
 
 # 6. deploy
 begin_phase deploy
+if [ "$DRY_RUN" = 1 ]; then
+  say "(dry run) would delete a stack left in ROLLBACK_COMPLETE by a failed create, and an orphaned"
+  say "(dry run) /bedrock/spend-controls/model-invocations log group, after asking"
+else
+  recover_failed_stack
+  remove_orphaned_log_group
+fi
 run_in "$ROOT/cdk" npx cdk deploy --require-approval never "${CDK_CONTEXT[@]}"
 end_phase OK
 

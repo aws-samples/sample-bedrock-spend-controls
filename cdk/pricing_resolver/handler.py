@@ -132,7 +132,7 @@ def _catalog_price(pricing_client, region_code: str, catalog_model: str) -> dict
         if not candidates:
             continue
         if len(candidates) != 1:
-            raise ValueError(
+            raise UnresolvedPrice(
                 f"Expected one {inference_type} image price for "
                 f"{catalog_model} in {region_code}; found {sorted(candidates)}"
             )
@@ -149,7 +149,7 @@ def _catalog_price(pricing_client, region_code: str, catalog_model: str) -> dict
             price[key] = 0.0
         else:
             token_type = key.split("_per_")[0]
-            raise ValueError(
+            raise UnresolvedPrice(
                 f"Expected one standard on-demand {token_type} price for "
                 f"{catalog_model} in {region_code}; found {sorted(rates[key])}"
             )
@@ -159,13 +159,21 @@ def _catalog_price(pricing_client, region_code: str, catalog_model: str) -> dict
             price[key] = float(candidates.pop())
         elif len(candidates) > 1:
             # Ambiguity is a catalog defect, not something to average away.
-            raise ValueError(
+            raise UnresolvedPrice(
                 f"Expected at most one standard on-demand {key} price for "
                 f"{catalog_model} in {region_code}; found {sorted(candidates)}"
             )
     if per_image is not None:
         price["per_image"] = per_image
     return price
+
+
+class UnresolvedPrice(ValueError):
+    """The Price List has no single standard on-demand price for a catalog
+    model in the target Region: the model is not offered there, or the rows
+    are ambiguous. Deploy-time resolution skips such models (the usage
+    processor prices them with the conservative fallback and counts
+    FallbackPricedRequests) instead of failing the whole stack."""
 
 
 def _pinned_price(price: dict) -> dict:
@@ -182,13 +190,45 @@ def resolve_snapshot(
     region_code: str,
     catalog_models: dict[str, list[str]],
     pinned_prices: dict[str, dict],
+    *,
+    unresolved: list[dict] | None = None,
 ) -> dict:
+    """Resolve every catalog model's price in ``region_code``.
+
+    With ``unresolved`` given, a catalog model the Price List cannot price
+    in this Region (not offered there, or ambiguous rows) is skipped and
+    recorded in that list as ``{"catalog_model", "model_ids", "reason"}``
+    instead of raising, so one Regional gap does not block the deploy.
+    Without it (strict mode, used by tests and tooling) the
+    :class:`UnresolvedPrice` propagates.
+    """
     snapshot = {
         model_id: _pinned_price(price)
         for model_id, price in pinned_prices.items()
     }
     for catalog_model, model_ids in catalog_models.items():
-        price = _catalog_price(pricing_client, region_code, catalog_model)
+        try:
+            price = _catalog_price(pricing_client, region_code, catalog_model)
+        except UnresolvedPrice as exc:
+            if unresolved is None:
+                raise
+            unresolved.append(
+                {"catalog_model": catalog_model, "model_ids": list(model_ids), "reason": str(exc)}
+            )
+            print(
+                json.dumps(
+                    {
+                        "level": "warning",
+                        "message": "Catalog model not priced in this Region; "
+                        "its invocations use the fallback price",
+                        "catalog_model": catalog_model,
+                        "model_ids": list(model_ids),
+                        "region": region_code,
+                        "reason": str(exc),
+                    }
+                )
+            )
+            continue
         for model_id in model_ids:
             if model_id in snapshot:
                 raise ValueError(f"Duplicate model price mapping for {model_id}")
@@ -225,17 +265,19 @@ def conservative_fallback(snapshot: dict, configured: dict) -> dict:
     return fallback
 
 
-def _resolve(pricing_client, properties: dict) -> tuple[dict, dict]:
+def _resolve(pricing_client, properties: dict) -> tuple[dict, dict, list[dict]]:
     """Resolve (snapshot, fallback) from a CatalogModels/PinnedPrices dict.
 
     The same shape arrives as CloudFormation ResourceProperties at deploy
     time and as the EventBridge rule input on scheduled refreshes.
     """
+    unresolved: list[dict] = []
     snapshot = resolve_snapshot(
         pricing_client,
         properties["RegionCode"],
         properties["CatalogModels"],
         properties.get("PinnedPrices", {}),
+        unresolved=unresolved,
     )
     fallback = conservative_fallback(
         snapshot,
@@ -244,7 +286,7 @@ def _resolve(pricing_client, properties: dict) -> tuple[dict, dict]:
             {"input_per_mtok": 15.0, "output_per_mtok": 75.0},
         ),
     )
-    return snapshot, fallback
+    return snapshot, fallback, unresolved
 
 
 def _compact(value) -> str:
@@ -323,7 +365,8 @@ def decode_parameter_value(value: str) -> dict:
 
 
 def write_price_parameter(
-    ssm, parameter_name: str, snapshot: dict, fallback: dict
+    ssm, parameter_name: str, snapshot: dict, fallback: dict,
+    unresolved: list[dict] | None = None,
 ) -> dict:
     """Write ``{"models", "fallback", "resolved_at"}`` to Parameter Store.
 
@@ -337,13 +380,16 @@ def write_price_parameter(
     """
     stored, dropped = minimize_snapshot(snapshot)
     resolved_at = datetime.now(timezone.utc).isoformat()
-    document = _compact(
-        {
-            "models": stored,
-            "fallback": _compact_rates(fallback),
-            "resolved_at": resolved_at,
-        }
-    )
+    body = {
+        "models": stored,
+        "fallback": _compact_rates(fallback),
+        "resolved_at": resolved_at,
+    }
+    if unresolved:
+        # Catalog models the Price List could not price in this Region;
+        # their invocations are priced with the fallback and flagged.
+        body["unresolved"] = sorted(item["catalog_model"] for item in unresolved)
+    document = _compact(body)
     json_size = len(document.encode("utf-8"))
     value = encode_parameter_value(document)
     size = len(value.encode("utf-8"))
@@ -416,8 +462,8 @@ def handler(event, _context, *, pricing_client=None, ssm_client=None):
     pricing = pricing_client or boto3.client(
         "pricing", region_name=PRICING_API_REGION
     )
-    snapshot, fallback = _resolve(pricing, properties)
-    written = write_price_parameter(ssm, parameter_name, snapshot, fallback)
+    snapshot, fallback, unresolved = _resolve(pricing, properties)
+    written = write_price_parameter(ssm, parameter_name, snapshot, fallback, unresolved)
     print(
         json.dumps(
             {
@@ -441,8 +487,49 @@ def handler(event, _context, *, pricing_client=None, ssm_client=None):
             "ModelCount": str(written["models"]),
             "ResolvedAt": written["resolved_at"],
             "FallbackPriceJson": _compact(fallback),
+            "UnresolvedCount": str(len(unresolved)),
+            "UnresolvedModels": ",".join(
+                sorted(item["catalog_model"] for item in unresolved)
+            )[:1024],
         },
     }
+
+
+def _previously_priced(ssm, parameter_name: str) -> set[str]:
+    """Model IDs the live parameter prices today (empty when absent)."""
+    try:
+        value = ssm.get_parameter(Name=parameter_name)["Parameter"]["Value"]
+    except ClientError as exc:
+        if exc.response.get("Error", {}).get("Code") == "ParameterNotFound":
+            return set()
+        raise
+    try:
+        return set(decode_parameter_value(value).get("models", {}))
+    except ValueError:
+        return set()
+
+
+def _refuse_regression(ssm, parameter_name: str, unresolved: list[dict]) -> None:
+    """A daily refresh must not silently demote a priced model to the
+    fallback: if the Price List stops answering for a model the live table
+    already prices, keep the previous value and fail loudly (Lambda Errors)
+    instead of writing a table without it. A model that was never priced
+    (not offered in this Region) is skipped quietly, as at deploy time.
+    """
+    live = _previously_priced(ssm, parameter_name)
+    dropped = sorted(
+        model_id
+        for item in unresolved
+        for model_id in item["model_ids"]
+        if model_id in live
+    )
+    if dropped:
+        reasons = "; ".join(item["reason"] for item in unresolved)
+        raise ValueError(
+            "Refusing to refresh the price parameter: the Price List no longer "
+            f"prices {', '.join(dropped)}, which the live table prices today "
+            f"({reasons}). The previous value stays in place."
+        )
 
 
 def scheduled_handler(event, _context, *, pricing_client=None, ssm_client=None):
@@ -462,8 +549,10 @@ def scheduled_handler(event, _context, *, pricing_client=None, ssm_client=None):
         "pricing", region_name=PRICING_API_REGION
     )
     ssm = ssm_client or boto3.client("ssm")
-    snapshot, fallback = _resolve(pricing, event)
-    written = write_price_parameter(ssm, parameter_name, snapshot, fallback)
+    snapshot, fallback, unresolved = _resolve(pricing, event)
+    if unresolved:
+        _refuse_regression(ssm, parameter_name, unresolved)
+    written = write_price_parameter(ssm, parameter_name, snapshot, fallback, unresolved)
     print(
         json.dumps(
             {
