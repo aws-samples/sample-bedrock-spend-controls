@@ -339,3 +339,16 @@ wait one enforcement cycle (5 minutes) so the deny detaches, then delete it
 from `workloads.json` and redeploy. Removing a blocked workload first leaves
 its deny attached, because the enforcer no longer manages that role
 ([DEPLOYMENT.md](../DEPLOYMENT.md#per-workload-quotas)).
+
+## Removing the deployment
+
+`./install.sh --destroy --region <region> [--profile P] [--config <file>]`
+is the supported teardown: it asks for confirmation, runs `cdk destroy`
+with the same deployment context, deletes `.install-outputs.env`, and then
+lists what is retained on purpose, with the commands that remove each item:
+the Region's Bedrock model-invocation logging configuration, the log group
+`/bedrock/spend-controls/model-invocations`, the Bedrock logging role, and,
+with `retain_tables_on_delete: true`, the DynamoDB tables (deletion
+protection on). Remove those only through an explicit data-retention and
+logging-owner decision ([installer.md](installer.md#--destroy),
+[DEPLOYMENT.md](../DEPLOYMENT.md#clean-up)).
