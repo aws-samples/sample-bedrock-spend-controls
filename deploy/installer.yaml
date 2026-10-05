@@ -226,7 +226,9 @@ Resources:
               - Sid: SmokeTestAdminKey
                 Effect: Allow
                 Action: secretsmanager:GetSecretValue
-                Resource: !Sub arn:${AWS::Partition}:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:BedrockSpendControls*
+                # CloudFormation names a secret after its logical ID (the
+                # stack's AdminApiKey construct), not after the stack.
+                Resource: !Sub arn:${AWS::Partition}:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:AdminApiKey*
               - Sid: SmokeTestCognitoUser
                 Effect: Allow
                 Action:

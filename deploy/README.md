@@ -109,7 +109,7 @@ resources. Its policy is scoped to those names where AWS allows it:
   `sts:GetCallerIdentity` and the actions `tools/preflight` needs
   (`REQUIRED_ACTIONS` in `tools/preflight/checks.py`);
 - for the smoke test that `install.sh` runs after the deploy:
-  `secretsmanager:GetSecretValue` on secrets named `BedrockSpendControls*`,
+  `secretsmanager:GetSecretValue` on the admin key secret (`AdminApiKey*`),
   `cognito-idp:AdminCreateUser/AdminSetUserPassword/AdminDeleteUser` on the
   account's user pools, and `lambda:InvokeFunctionUrl` (IAM auth) on
   functions named `BedrockSpendControls-*`;

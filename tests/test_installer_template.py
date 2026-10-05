@@ -514,7 +514,10 @@ def test_build_role_is_scoped_to_the_cdk_bootstrap_and_read_only_elsewhere(templ
     assert logs["Resource"] == {"Fn::GetAtt": ["InstallerLogGroup", "Arn"]}
 
     # The smoke test touches the deployed stack's resources only.
-    assert _sub_text(by_sid["SmokeTestAdminKey"]["Resource"]).endswith(f":secret:{STACK_NAME}*")
+    # Secrets are named after their logical ID (AdminApiKey<hash>-<random>),
+    # not after the stack: the first live smoke test under CodeBuild failed
+    # on a BedrockSpendControls* pattern.
+    assert _sub_text(by_sid["SmokeTestAdminKey"]["Resource"]).endswith(":secret:AdminApiKey*")
     assert set(_as_list(by_sid["SmokeTestCognitoUser"]["Action"])) == {
         "cognito-idp:AdminCreateUser",
         "cognito-idp:AdminSetUserPassword",
