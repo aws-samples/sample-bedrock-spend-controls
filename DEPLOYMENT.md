@@ -27,6 +27,7 @@ shared or production account. Reference material lives in `docs/`:
 | Admin console | Hosted, Cognito group `quota-admins` | `admin_ui: true` with `admin_ui_client_id` against your IdP, or not hosted |
 | Direct Bedrock access | Demo deny policy optional | SCP, permissions boundary, or `DenyDirectBedrockPolicyArn` required |
 | Price fallback | Shipped default | Reviewed against the most expensive allowed model |
+| Installation | `install.sh` or the Launch Stack button ([installer reference](docs/installer.md)) | `setup.py` wizard, then `install.sh --config` or your own pipeline |
 
 The architectural decision to accept is the enforcement guarantee: the
 sample does not inspect inference requests. Every credential carries an
@@ -60,6 +61,65 @@ deny propagation)`; measure it in your account before relying on a number
     denies its in-flight sessions after IAM propagation.
 
 ## Demo / personal account
+
+> **`install.sh` performs steps 1–7 below; the manual steps remain for
+> reference.** From CloudShell or a terminal:
+>
+> ```bash
+> curl -fsSL https://raw.githubusercontent.com/aws-samples/sample-bedrock-spend-controls/main/install.sh \
+>   | bash -s -- --alert-email you@example.com --acknowledge-logging-overwrite
+> ```
+>
+> or, from a checkout, `./install.sh --alert-email you@example.com
+> --acknowledge-logging-overwrite`. Without a terminal at all, the
+> **Launch Stack** link in the [README](README.md#try-it-about-25-minutes-demo-account)
+> runs the same script from CodeBuild. Flags, phases, and troubleshooting:
+> [docs/installer.md](docs/installer.md).
+
+### 0. Preflight
+
+`tools/preflight` runs read-only checks that the deploy will succeed in this
+account and Region, using the CDK app's own configuration validator so the
+checks and `cdk synth` never disagree. `install.sh` runs it first; run it by
+hand from the repository root with the CDK Python environment:
+
+```bash
+cd sample-bedrock-spend-controls
+python3 -m venv .venv && .venv/bin/pip install -r requirements-dev.txt
+.venv/bin/python -m tools.preflight --config cdk/config/demo.json \
+  --profile "$AWS_PROFILE" --region "$AWS_REGION" --set alert_email=you@example.com
+```
+
+Twelve checks, each `PASS`, `WARN`, `FAIL`, or `SKIP` with a `fix` line:
+`toolchain` (Node.js 20+, npm, Python 3.12+, AWS CLI v2, git),
+`credentials` (who deploys, into which account and Region; an opt-in Region
+the account has not enabled is named here), `bootstrap` (`CDKToolkit`
+present and recent), `bedrock_model_access` (every allowed and workload
+model enabled, inference profiles expanded to their foundation models),
+`invocation_logging` (who owns the Region's logging setting),
+`lambda_concurrency` (room for the five reserved executions), `oidc_issuer`
+(your issuer's discovery and JWKS; skipped with demo Cognito),
+`invoker_principals` (the listed ARNs exist), `scp_bypass` (with
+`--app-role-arn`: an application role is denied `bedrock:InvokeModel`),
+`quotas_cost` (the monthly estimate), `region_support` (Bedrock, the Lambda
+Web Adapter layer, Cognito, CloudFront), and `admin_ui_build`
+(`admin-ui/dist` exists). Exit status 0 means no check failed (warnings
+allowed), 1 at least one failed, 2 a usage or configuration error; `--json`
+prints the report for scripts.
+
+The installer renders the same table followed by an `Installer verdict:
+OK|FAIL` line. A missing bootstrap or an unbuilt console does not fail the
+verdict (`handled by the next phases`): `install.sh` bootstraps and builds
+the console itself. Every call the checks make is read-only
+(`sts:GetCallerIdentity`, `cloudformation:DescribeStacks`,
+`ssm:GetParameter`, `bedrock:GetFoundationModelAvailability`,
+`bedrock:GetInferenceProfile`,
+`bedrock:GetModelInvocationLoggingConfiguration`, `logs:DescribeLogGroups`,
+`logs:FilterLogEvents`, `lambda:GetAccountSettings`,
+`lambda:GetLayerVersion`, `iam:GetRole`, `iam:GetUser`,
+`iam:SimulatePrincipalPolicy`), so a read-only role can run them; a denied
+call is a warning naming the action, not a failure. The check-by-check
+reference is in [docs/installer.md](docs/installer.md#toolspreflight).
 
 ### 1. Prerequisites
 
@@ -115,6 +175,21 @@ logging configuration ([ownership](docs/configuration.md#invocation-logging-owne
 Confirm the SNS subscription from the email AWS sends; until then warnings
 and block notifications are not delivered.
 
+#### Retrying a failed first deploy
+
+A first `cdk deploy` that fails leaves two things behind. The stack sits in
+`ROLLBACK_COMPLETE`, which CloudFormation cannot update: delete it before
+deploying again (`aws cloudformation delete-stack --stack-name
+BedrockSpendControls`, then `aws cloudformation wait stack-delete-complete
+--stack-name BedrockSpendControls`). And the stack retains its invocation
+log group `/bedrock/spend-controls/model-invocations` on rollback as on
+delete, so the next create fails with "already exists" until the group is
+deleted (`aws logs delete-log-group --log-group-name
+/bedrock/spend-controls/model-invocations`) or handed to the new stack with
+`manage_invocation_logging: false` and `invocation_log_group_name`.
+`install.sh` detects both states in its deploy phase and repairs them after
+asking (`--yes` answers for you).
+
 ### 4. Read outputs
 
 ```bash
@@ -132,29 +207,59 @@ export ADMIN_KEY=$(aws secretsmanager get-secret-value \
   --query SecretString --output text)
 ```
 
-Other outputs you will use: `AdminUiUrl`, `DemoUserPoolId`,
-`DemoUserPoolClientId`, `AdminIdentityPoolId`, `BedrockUserRoleArn`,
-`DenyDirectBedrockPolicyArn`, `EmergencyDenyPolicyArn`,
-`EmergencyKeySecretArn`, `AlertTopicArn`, `UsersTableName`,
-`UsageTableName`, `BrokerApiRoleArn`, `InvocationLogGroup`,
-`ModelPricesParameterName` (the SSM parameter holding the resolved price
-table, refreshed daily), `ModelPriceSnapshot` (a one-line digest of the form
-`ssm:<parameter name> sha256:<digest> models=<count>`; read the full table
-with `aws ssm get-parameter --name <ModelPricesParameterName>`; the value is
-`gz1:` followed by base64-encoded gzip of the JSON, see
-[pricing.md](docs/pricing.md#where-prices-come-from)), and
-`ModelFallbackPrice`.
+Other outputs you will use: `AdminUiUrl`, `AdminUsername` (with
+`admin_email`, step 5), `DemoUserPoolId`, `DemoUserPoolClientId`,
+`AdminIdentityPoolId`, `BedrockUserRoleArn`, `DenyDirectBedrockPolicyArn`,
+`EmergencyDenyPolicyArn`, `EmergencyKeySecretArn`, `AlertTopicArn`,
+`UsersTableName`, `UsageTableName`, `BrokerApiRoleArn`,
+`InvocationLogGroup`, `ModelPricesParameterName` (the SSM parameter holding
+the resolved price table, refreshed daily), `ModelPriceSnapshot` (a one-line
+digest of the form `ssm:<parameter name> sha256:<digest> models=<count>
+unresolved=<n>`, where `unresolved` counts the catalog models this Region
+does not price, see [pricing.md](docs/pricing.md#models-the-region-does-not-price);
+read the full table with `aws ssm get-parameter --name
+<ModelPricesParameterName>`; the value is `gz1:` followed by base64-encoded
+gzip of the JSON, see [pricing.md](docs/pricing.md#where-prices-come-from)),
+and `ModelFallbackPrice`.
 
 ### 5. Configure the demo administrator
 
 `config/demo.json` hosts the console, creates the Cognito group
 `quota-admins`, and authorizes that group (`admin_jwt_claim:
-cognito:groups`). Create an administrator and add it to the group:
+cognito:groups`).
 
 ```bash
 export USER_POOL_ID=$(aws cloudformation describe-stacks --stack-name "$STACK_NAME" \
   --query "Stacks[0].Outputs[?OutputKey=='DemoUserPoolId'].OutputValue | [0]" --output text)
+```
 
+**With `admin_email`** (`-c admin_email=you@example.com` on `cdk synth` and
+`cdk deploy`, `--admin-email` in `install.sh`, `AdminEmail` in the one-click
+installer, or the key in the deployment file) the stack creates the
+administrator itself: the Cognito user `quota-admin` with that address,
+added to the `admin_jwt_value` group. Cognito emails the temporary password
+from `no-reply@verificationemail.com`; the first sign-in replaces it, and
+the password never passes through the CLI, the template, or the logs. The
+`AdminUsername` output names the user. The key is accepted only with
+`admin_ui: true`, the stack-created Cognito pool (empty `jwt_issuer`), and
+`admin_jwt_claim: cognito:groups` ([configuration.md](docs/configuration.md#keys));
+the user is kept when the stack is deleted. Because the username is fixed,
+changing `admin_email` later and redeploying leaves the existing user and
+its address alone. To move the administrator to a new address, update it
+and, while the first sign-in is still pending, re-send the invitation:
+
+```bash
+aws cognito-idp admin-update-user-attributes --user-pool-id "$USER_POOL_ID" --username quota-admin \
+  --user-attributes Name=email,Value=new-admin@example.com Name=email_verified,Value=true
+aws cognito-idp admin-create-user --user-pool-id "$USER_POOL_ID" --username quota-admin \
+  --message-action RESEND
+```
+
+(or delete the user and redeploy).
+
+**Without `admin_email`**, create an administrator and add it to the group:
+
+```bash
 aws cognito-idp admin-create-user --user-pool-id "$USER_POOL_ID" --username quota-admin \
   --user-attributes Name=email,Value=admin@example.com Name=email_verified,Value=true \
   --message-action SUPPRESS
@@ -279,9 +384,37 @@ client per user) is in [docs/integration.md](docs/integration.md).
 
 ### 1. Create a private deployment file
 
-`config/production.json` is the template. Keep the private copy next to it
-so the relative `model_config` path stays valid; `config/*.local.json` is
-ignored by Git.
+**Run the wizard.** `setup.py` asks for every key of
+`config/production.json`, validates each answer exactly as `cdk synth`
+would, checks it against the account when credentials are available
+(issuer discovery and JWKS, model access in the Region, the existing
+invocation logging configuration, Lambda concurrency, invoker principals),
+refuses to keep the template's example values, and writes
+`config/production.local.json` (plus `config/workloads.json` when you add
+workloads). It ends with the monthly cost estimate and the tasks other
+teams must do: the console redirect URI to register, the token claims, the
+bypass-prevention SCP of step 5 filled in with the workload roles, models
+to enable, and the roles to grant `lambda:InvokeFunctionUrl`.
+
+```bash
+cd sample-bedrock-spend-controls
+python3 -m venv .venv && .venv/bin/pip install -r requirements-dev.txt
+.venv/bin/python setup.py --profile-template production \
+  --profile your-production-profile --region us-east-1 \
+  --save-answers ~/bedrock-spend-controls-answers.json
+```
+
+Enter keeps the value in brackets, `-` clears a value, Ctrl-C aborts
+without writing. `--save-answers` records the answers; `--answers FILE
+--yes` replays them without questions in another account or in CI, and
+running the wizard again on an existing output file edits it. `--deploy`
+runs the full preflight on the written file and then `install.sh --config`
+after showing the command. Reference:
+[docs/installer.md](docs/installer.md#setuppy-configuration-wizard).
+
+**Or copy the template** and edit it by hand. Keep the private copy next to
+it so the relative `model_config` path stays valid; `config/*.local.json`
+is ignored by Git.
 
 ```bash
 cd sample-bedrock-spend-controls/cdk
@@ -664,6 +797,7 @@ replaces some resources; plan for the following.
 | `QuotaPeriods` Lambda layer | New layer version | None |
 | Lambda log groups | Explicit log groups with `log_retention_days` (default 90) are created; the groups Lambda auto-created earlier remain | Delete the old `/aws/lambda/<function>` groups once you no longer need their history |
 | Usage-processor DLQ and 10 new alarms | Added | Subscribe the new alarms' runbooks ([docs/runbooks/README.md](docs/runbooks/README.md)) |
+| `ModelPriceSnapshot` output | Now ends with `unresolved=<n>`: a catalog model the Region does not price is skipped at deploy instead of failing it ([pricing.md](docs/pricing.md#models-the-region-does-not-price)) | Expect `unresolved=0` where every catalog model is sold; otherwise pin the listed models in `price_overrides` or keep them out of `allowed_model_arns` |
 
 Not replaced: the DynamoDB tables, `BedrockUserRole`, the invocation log
 group, and the dashboard. The `EnableBedrockInvocationLogging` custom
@@ -675,10 +809,15 @@ inline deny on workload roles automatically on its next run (the legacy
 ## Clean up
 
 ```bash
-cd sample-bedrock-spend-controls/cdk
-npx cdk destroy -c deployment_config=config/demo.json
+cd sample-bedrock-spend-controls
+./install.sh --destroy --region us-east-1     # asks, runs cdk destroy, lists what is retained
+# or, by hand:
+(cd cdk && npx cdk destroy -c deployment_config=config/demo.json)
 ```
 
+`install.sh --destroy` is the supported teardown
+([docs/installer.md](docs/installer.md#--destroy)); pass `--config
+<file>` for a deployment that did not use the demo file.
 With `retain_tables_on_delete: true` (as in `config/production.json`) the
 tables use `RETAIN`, carry deletion protection, and survive stack deletion.
 Stack-managed invocation logging resources are always retained because the

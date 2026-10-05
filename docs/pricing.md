@@ -20,9 +20,10 @@ in `cdk/pricing_resolver/handler.py`), so the shipped catalog fits well below
 the 8 KB advanced-parameter limit. Read it with
 `aws ssm get-parameter --name <ModelPricesParameterName> --query Parameter.Value --output text | cut -c5- | base64 -d | gunzip`.
 The `ModelPriceSnapshot` output is a digest only
-(`ssm:<name> sha256:<digest> models=<count>`); the custom resource returns
-`ParameterName`, `SnapshotDigest`, `ModelCount`, `ResolvedAt`, and
-`FallbackPriceJson`, never the table itself.
+(`ssm:<name> sha256:<digest> models=<count> unresolved=<n>`); the custom
+resource returns `ParameterName`, `SnapshotDigest`, `ModelCount`,
+`ResolvedAt`, `FallbackPriceJson`, `UnresolvedCount`, and
+`UnresolvedModels`, never the table itself.
 
 The usage processor reads the parameter with a 15-minute cache and keeps
 the last good value if a read fails. It has no built-in price table: if the
@@ -47,6 +48,31 @@ log line):
 3. `fallback_price` (`fallback`). Requests priced this way emit
    `FallbackPricedRequests` and raise the `pricing_fallback` alarm
    ([runbooks/alarms/pricing-fallback.md](runbooks/alarms/pricing-fallback.md)).
+
+### Models the Region does not price
+
+A `catalog_models` entry the Price List cannot price in the target Region
+(the model is not offered there, or its standard on-demand rows carry two
+different rates for one dimension) does not fail the deploy. The resolver
+skips it, logs one warning per model (`Catalog model not priced in this
+Region; its invocations use the fallback price`), lists the skipped Price
+List names under `unresolved` in the parameter document, and reports them
+to CloudFormation as `UnresolvedCount` and `UnresolvedModels`, so the
+`ModelPriceSnapshot` output ends with `unresolved=<n>`. An invocation of
+such a model is priced at the fallback (`PriceSource: fallback`), emits
+`FallbackPricedRequests`, and raises the `pricing_fallback` alarm: a skipped
+model that is actually called is never silent. Pin it in `price_overrides`
+with its published rate, or keep it out of `allowed_model_arns`.
+
+The daily refresh applies the same rule to a model that was never priced,
+but refuses to demote one: when the Price List stops answering for a model
+the live parameter already prices, `PriceRefreshFn` raises instead of
+writing a table without it (`_refuse_regression` in
+`cdk/pricing_resolver/handler.py`), the previous value stays in place, and
+the failure shows in the function's `Errors` metric
+([runbook](runbooks/components/pricing-resolver.md)). The refresher reads
+the live parameter for that comparison, which is why it holds
+`ssm:GetParameter` next to `ssm:PutParameter`.
 
 ## `cdk/config/model-pricing.json`
 
@@ -84,7 +110,9 @@ Validation at synthesis:
   its own price must appear with its exact ID; prefixes are not inferred for
   pinned entries.
 - An ambiguous catalog (two different rates for one dimension of one model)
-  fails the resolve rather than averaging.
+  is never averaged: at deploy and refresh time the model is treated as
+  unpriced in that Region ([above](#models-the-region-does-not-price)); the
+  strict resolver that tests and tooling use raises `UnresolvedPrice`.
 
 The shipped file is the reference for current values; do not copy prices
 from documentation. It carries 54 pins. Every Claude pin, including the

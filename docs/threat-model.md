@@ -18,7 +18,7 @@ generated from the JSON by `tools/threat_composer_export.py` for teams that
 work in that tool. `tests/test_threat_model.py` fails when the three
 disagree.
 
-Last updated: 2026-10-04.
+Last updated: 2026-10-05.
 
 ## What this system protects
 
@@ -40,7 +40,7 @@ changes are authorized and audited.
 | B4 | Invocation logs → usage processor → DynamoDB | CloudWatch Logs subscription; `identity.arn` and `modelId` from the record; transactional ledger writes | `usage_processor/handler.py` |
 | B5 | DynamoDB streams → enforcement processors → IAM policy versions | `REVOCATION#` sentinels and `CONFIG#EMERGENCY_STOP`; `CreatePolicyVersion` on pre-attached policies; `PutRolePolicy` on workload roles | `enforcement_dispatcher/`, `revocation_processor/`, `emergency_processor/`, `workload_enforcer/` |
 | B6 | Admin UI / API → admin mutations | Shared admin key or admin JWT claim (Identity Pool rules mapping on the same claim); separate break-glass key typed per action; `If-Match` + `Idempotency-Key` | `gateway/app/main.py:_require_admin`, `_require_emergency_admin`, `gateway/app/quota.py` admin mutations, admin-audit table |
-| B7 | Operator / account administrator → out-of-band IAM, SCP, logging config | Console/CLI with account privileges | Not controllable by the sample; `DenyDirectBedrockPolicy`, SCP guidance |
+| B7 | Operator / account administrator → out-of-band IAM, SCP, logging config | Console/CLI with account privileges | Not controllable by the sample; `DenyDirectBedrockPolicy`, SCP guidance; the installer's single-use `BuildRole` (`deploy/installer.yaml`) |
 
 ## Data flow diagram
 
@@ -86,6 +86,7 @@ from it.
 | AS-10 | Reconciliation is opt-in. When enabled it reads Cost Explorer for the settled day (reconcile_lag_days) and the cost-allocation tag has been activated at the payer account; Cost Explorer data is account-wide by nature. | T-29 |
 | AS-11 | This is educational sample code, not a managed service: an adopter runs their own security review and adapts invoker_principal_arns, allowed_model_arns, the SCP, and alerting before production use. | T-26, T-27, T-24 |
 | AS-12 | A SESSION# map row cannot be needed after the STS credential it describes has expired (at most 3 600 s), so a usage_retention_days TTL with a 31-day floor only loses attribution for records delivered days late. | T-15 |
+| AS-13 | The installer tooling (install.sh, deploy/installer.yaml, setup.py) is fetched from the repository over HTTPS at a reviewed tag or commit and runs with the operator's deploy credentials; the operator extends it the same trust as the CDK app and the pinned npm and pip dependencies the deploy installs. | T-32, T-33 |
 
 ## Data flows
 
@@ -110,6 +111,7 @@ from it.
 | DF-17 | B7 | Spend reconciliation Lambda (opt-in, daily) → AWS Cost Explorer, Usage table | ce:GetCostAndUsage (resource *), ledger read, RECONCILE# write | aggregate and per-workload-tag Bedrock cost for the settled day | A-10, A-3 |
 | DF-18 | B7 | Operator → CloudFormation / CDK | Deploy with account privileges | IAM roles, boundary, deny policies, logging configuration, SSM price snapshot and roster | A-6, A-8, A-9 |
 | DF-19 | outside | SNS topic → Operator alert endpoint | SNS subscription (alert_email) | warnings, blocks, component failures | — |
+| DF-20 | B7 | Operator → Installer stack (`deploy/installer.yaml`) → CodeBuild → `cdk bootstrap` / `cdk deploy` | CloudFormation create-stack with CAPABILITY_IAM; CodeBuild service role (`BuildRole` or `ExistingBuildRoleArn`); git clone of the repository at `GitRef` | the build role's permissions, the `install.sh` run, stack outputs, and the admin key the smoke test reads | A-6, A-5 |
 
 ## Threats
 
@@ -678,18 +680,77 @@ an unregistered row (`gateway/app/main.py:_workload_registry`,
 dependency).** Residual: a console label can lie to an admin who has
 already been compromised at the account level.
 
+**T-32 · Elevation · Installer CodeBuild role is broad.** Priority **Medium**.
+> A compromised installer build running in CodeBuild with the installer
+> stack's BuildRole (a malicious GitRef, a tampered repository, or a
+> poisoned npm or pip dependency pulled during the build) can use the role's
+> bootstrap-scoped CloudFormation, IAM, S3, and SSM permissions and the CDK
+> bootstrap roles it may assume, and read the admin key the smoke test
+> fetches, which leads to arbitrary resources created in the account through
+> the CDK deploy roles and disclosure of the routine admin key, resulting in
+> reduced integrity and confidentiality of enforcement IAM policies and
+> administrative secrets.
+
+`deploy/installer.yaml` creates a CodeBuild service role that can run `cdk
+bootstrap` (`cloudformation:*` on `CDKToolkit`, `iam:*`, `s3:*`, `ecr:*`, and
+SSM on the `cdk-hnb659fds-*` bootstrap names), assume the CDK bootstrap
+roles that `cdk deploy` uses, and read `BedrockSpendControls*` secrets for
+the smoke test. Whatever runs in the build runs with it.
+*Mitigation:* accepted as a single-use role. The deploy itself is performed
+by the CDK bootstrap roles (the CloudFormation execution role creates the
+stack); the role's write permissions are scoped to the bootstrap names and
+its smoke-test grants to `BedrockSpendControls-*` resources; it trusts
+`codebuild.amazonaws.com` only from this account's projects
+(`aws:SourceAccount` / `aws:SourceArn`); the project runs one build at a
+time; and the role is deleted with the installer stack once the build has
+succeeded. `ExistingBuildRoleArn` lets an account supply its own, tighter
+role, and `GitRef` pins a reviewed tag (`deploy/installer.yaml` `BuildRole`,
+`InstallerProject`; `deploy/README.md` "Resources and IAM footprint";
+`tests/test_installer_template.py`). **Status: Accepted** — while the
+installer stack exists, any build started from it runs with these
+permissions; delete the stack after the install and review the `GitRef` it
+clones.
+
+**T-33 · Tampering / Elevation · `curl | bash` installation.** Priority **Medium**.
+> An external actor able to alter the install.sh an operator fetches (a
+> compromised repository branch, a look-alike URL, or an intercepted
+> download) while the operator pipes it into bash with deploy credentials
+> can execute arbitrary commands on the operator's machine and in the target
+> account with the operator's AWS credentials, which leads to a tampered
+> deployment, resources created or changed outside the reviewed stack, and
+> exposure of the credentials and admin key the install handles, resulting
+> in reduced integrity and confidentiality of enforcement IAM policies and
+> administrative secrets.
+
+The documented one-line install pipes `install.sh` from
+`raw.githubusercontent.com` into `bash`. The script clones the repository
+and re-executes itself from the checkout, so what runs is whatever the
+fetched branch contains at that moment.
+*Mitigation:* accepted with the usual precautions, stated next to the
+one-liner in the README and `docs/installer.md`: pin a release tag
+(`GIT_REF=<tag>`, or `GitRef` in the one-click installer) instead of `main`,
+or clone the repository and read `install.sh` before running it. The script
+is fetched over HTTPS, prints the commands it runs (`+` lines), and asks its
+questions on the terminal rather than stdin, so a piped script cannot answer
+its own confirmations; the one-click installer clones from GitHub inside
+CodeBuild instead of piping (`install.sh`; `deploy/installer.yaml`
+`BuildSpec`; `tests/test_install_sh.py`). The same trust is already placed
+in the CDK app and the npm and pip dependencies the deploy installs.
+**Status: Accepted** — an unpinned `main` can change between review and
+execution; a pinned tag or a read checkout removes that window.
+
 ## Summary
 
 | Status | Count | IDs |
 |---|---|---|
 | Mitigated | 20 | T-03, T-04, T-05, T-06, T-07, T-08 (vended sessions), T-09, T-10 (vended sessions), T-13*, T-14, T-17*, T-18, T-20, T-21, T-23, T-25, T-28, T-29, T-30, T-31 |
-| Accepted | 11 | T-01, T-02, T-11, T-12, T-15, T-16*, T-19, T-22, T-24, T-26, T-27 |
+| Accepted | 13 | T-01, T-02, T-11, T-12, T-15, T-16*, T-19, T-22, T-24, T-26, T-27, T-32, T-33 |
 | Open | 0 | — |
 
 \* bounded rather than eliminated.
 
 Priority: **High** T-05, T-06, T-07, T-12, T-18, T-19, T-21, T-26, T-27
-(9); **Medium** 14; **Low** 8. Every High is either Mitigated or one of the
+(9); **Medium** 16; **Low** 8. Every High is either Mitigated or one of the
 structural accepts below.
 
 The two structural accepts to keep in front of any adopter: **the sample
