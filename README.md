@@ -102,7 +102,7 @@ the seven trust boundaries used by the threat model, rendered as
 | **Production** | 1 to 3 days | A shared account with your OIDC IdP, centrally managed invocation logging, exact model ARNs, and an SCP | `python setup.py --profile-template production`, then `install.sh --config` or your own pipeline |
 | **Manual** | the same install, step by step | Reviewing every command before it runs, or adapting the steps to your tooling | The command block below and [DEPLOYMENT.md](DEPLOYMENT.md) |
 
-### Try it (about 25 minutes, demo account)
+### Try it 
 
 **From the console, without a terminal.** Download
 [`deploy/installer.yaml`](https://raw.githubusercontent.com/aws-samples/sample-bedrock-spend-controls/main/deploy/installer.yaml),
@@ -137,7 +137,7 @@ CloudFront, auto-provisions quota users with a `$1/day` default, and ends
 with a smoke test that makes one small Bedrock call. Use a personal or
 sandbox account. Reference for both tools: [docs/installer.md](docs/installer.md).
 
-### Production (1 to 3 days, shared account, your IdP)
+### Production 
 
 ```bash
 python3 -m venv .venv && .venv/bin/pip install -r requirements-dev.txt
