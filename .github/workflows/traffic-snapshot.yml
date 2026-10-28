@@ -1,8 +1,13 @@
 # GitHub keeps repository traffic (clones, views, referrers, paths) for 14
 # days only. This workflow snapshots it weekly into the `traffic-stats`
 # branch so the history survives; the branch holds data files only and is
-# never merged. Requires no secrets: GITHUB_TOKEN with `contents: write`
-# can read the traffic API for a repository the workflow runs in.
+# never merged.
+#
+# The traffic API requires push or admin access by a user; the workflow's own
+# GITHUB_TOKEN is an installation token and GitHub answers it with 403, so
+# the fetch step reads the repository secret TRAFFIC_TOKEN: a fine-grained
+# personal access token scoped to this repository with the "Administration:
+# read" permission (nothing else). Commits still use GITHUB_TOKEN.
 name: Traffic snapshot
 
 on:
@@ -38,10 +43,14 @@ jobs:
 
       - name: Fetch traffic from the GitHub API
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ secrets.TRAFFIC_TOKEN }}
           REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
+          if [ -z "$GH_TOKEN" ]; then
+            echo "::error::Repository secret TRAFFIC_TOKEN is not set; see the header comment of this workflow."
+            exit 1
+          fi
           mkdir -p traffic
           stamp="$(date -u +%Y-%m-%d)"
           for kind in clones views; do
